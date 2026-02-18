@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  VERSION: ${{ github.event.release.tag_name }}
+
 jobs:
   build-wheels:
     name: Build wheels - ${{ matrix.os }} ${{ matrix.target }}
@@ -31,6 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set version from tag
+        run: |
+          V="${VERSION#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml
+          sed -i.bak "s/^version = \".*\"/version = \"$V\"/" crates/btlightning-py/pyproject.toml
+          rm -f crates/btlightning/Cargo.toml.bak crates/btlightning-py/Cargo.toml.bak crates/btlightning-py/pyproject.toml.bak
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -54,6 +64,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set version from tag
+        run: |
+          V="${VERSION#v}"
+          sed -i "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml crates/btlightning-py/pyproject.toml
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -100,6 +115,11 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set version from tag
+        run: |
+          V="${VERSION#v}"
+          sed -i "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
