@@ -1,28 +1,32 @@
+use crate::error::{LightningError, Result};
 use crate::types::{HandshakeRequest, HandshakeResponse, SynapsePacket, SynapseResponse};
-use pyo3::prelude::*;
+use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
-use serde_json;
+use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-
-use base64::{prelude::BASE64_STANDARD, Engine};
-use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use tracing::{debug, error, info, warn};
 
 const MAX_SIGNATURE_AGE: u64 = 300;
 
+pub trait SynapseHandler: Send + Sync {
+    fn handle(
+        &self,
+        synapse_type: &str,
+        data: HashMap<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatorConnection {
-    #[allow(dead_code)]
     pub validator_hotkey: String,
     pub connection_id: String,
-    #[allow(dead_code)]
     pub established_at: u64,
     pub last_activity: u64,
     pub verified: bool,
@@ -68,7 +72,7 @@ pub struct LightningServer {
     host: String,
     port: u16,
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-    synapse_handlers: Arc<RwLock<HashMap<String, PyObject>>>,
+    synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     endpoint: Option<Endpoint>,
 }
 
@@ -85,19 +89,23 @@ impl LightningServer {
         }
     }
 
+    pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
+        self.miner_keypair_bytes = Some(keypair_bytes);
+    }
+
     pub async fn register_synapse_handler(
         &self,
         synapse_type: String,
-        handler: PyObject,
-    ) -> PyResult<()> {
+        handler: Arc<dyn SynapseHandler>,
+    ) -> Result<()> {
         let mut handlers = self.synapse_handlers.write().await;
         handlers.insert(synapse_type.clone(), handler);
-        info!("📝 Registered synapse handler for: {}", synapse_type);
+        info!("Registered synapse handler for: {}", synapse_type);
         Ok(())
     }
 
     fn create_self_signed_cert(
-    ) -> Result<(Vec<Certificate>, PrivateKey), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(Vec<Certificate>, PrivateKey), Box<dyn std::error::Error>> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let cert_der = cert.serialize_der()?;
         let priv_key = cert.serialize_private_key_der();
@@ -105,36 +113,22 @@ impl LightningServer {
         Ok((vec![Certificate(cert_der)], PrivateKey(priv_key)))
     }
 
-    pub async fn start(&mut self) -> PyResult<()> {
-        info!(
-            "🚀 Starting Lightning QUIC server on {}:{}",
-            self.host, self.port
-        );
+    pub async fn start(&mut self) -> Result<()> {
+        info!("Starting Lightning QUIC server on {}:{}", self.host, self.port);
         let (certs, key) = Self::create_self_signed_cert().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to create certificate: {}",
-                e
-            ))
+            LightningError::Config(format!("Failed to create certificate: {}", e))
         })?;
 
         let mut server_config = RustlsServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to configure TLS: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
 
         server_config.alpn_protocols = vec![b"lightning-quic".to_vec()];
         let mut transport_config = TransportConfig::default();
         let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150)).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to set idle timeout: {}",
-                e
-            ))
+            LightningError::Config(format!("Failed to set idle timeout: {}", e))
         })?;
         transport_config.max_idle_timeout(Some(idle_timeout));
         transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
@@ -143,30 +137,25 @@ impl LightningServer {
         server_config.transport_config(Arc::new(transport_config));
         let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid address: {}", e))
-            })?;
+            .map_err(|e| LightningError::Config(format!("Invalid address: {}", e)))?;
 
         let endpoint = Endpoint::server(server_config, addr).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to create QUIC endpoint: {}",
-                e
-            ))
+            LightningError::Config(format!("Failed to create QUIC endpoint: {}", e))
         })?;
 
-        info!("✅ QUIC endpoint created, listening on {}", addr);
+        info!("QUIC endpoint created, listening on {}", addr);
         self.endpoint = Some(endpoint);
 
         Ok(())
     }
 
-    pub async fn serve_forever(&mut self) -> PyResult<()> {
+    pub async fn serve_forever(&mut self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
             while let Some(conn) = endpoint.accept().await {
                 let connections = self.connections.clone();
                 let synapse_handlers = self.synapse_handlers.clone();
                 let miner_hotkey = self.miner_hotkey.clone();
-                let miner_keypair = self.miner_keypair_bytes.clone();
+                let miner_keypair = self.miner_keypair_bytes;
 
                 tokio::spawn(async move {
                     match conn.await {
@@ -181,7 +170,7 @@ impl LightningServer {
                             .await;
                         }
                         Err(e) => {
-                            error!("❌ Connection failed: {}", e);
+                            error!("Connection failed: {}", e);
                         }
                     }
                 });
@@ -193,7 +182,7 @@ impl LightningServer {
     async fn handle_connection(
         connection: Connection,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, PyObject>>>,
+        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
@@ -206,7 +195,7 @@ impl LightningServer {
                     let connections_clone = connections.clone();
                     let handlers_clone = synapse_handlers.clone();
                     let miner_hotkey_clone = miner_hotkey.clone();
-                    let miner_keypair_clone = miner_keypair.clone();
+                    let miner_keypair_clone = miner_keypair;
 
                     tokio::spawn(async move {
                         Self::handle_stream(
@@ -222,7 +211,7 @@ impl LightningServer {
                     });
                 }
                 Err(e) => {
-                    error!("❌ Stream error: {}", e);
+                    error!("Stream error: {}", e);
                     break;
                 }
             }
@@ -234,7 +223,7 @@ impl LightningServer {
         mut recv: RecvStream,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, PyObject>>>,
+        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
@@ -275,10 +264,10 @@ impl LightningServer {
                     return;
                 }
 
-                warn!("⚠️ Unknown message format received");
+                warn!("Unknown message format received");
             }
             Err(e) => {
-                error!("❌ Failed to read stream: {}", e);
+                error!("Failed to read stream: {}", e);
             }
         }
     }
@@ -312,7 +301,7 @@ impl LightningServer {
             connections_guard.insert(request.validator_hotkey.clone(), validator_conn);
 
             info!(
-                "✅ Handshake successful, established connection: {}",
+                "Handshake successful, established connection: {}",
                 connection_id
             );
 
@@ -328,7 +317,7 @@ impl LightningServer {
                 connection_id,
             }
         } else {
-            error!("❌ Handshake failed: invalid signature");
+            error!("Handshake failed: invalid signature");
             HandshakeResponse {
                 miner_hotkey: miner_hotkey.clone(),
                 timestamp: SystemTime::now()
@@ -351,7 +340,7 @@ impl LightningServer {
             && (current_time - request.timestamp) > MAX_SIGNATURE_AGE
         {
             error!(
-                "❌ Signature timestamp too old: {} (current: {})",
+                "Signature timestamp too old: {} (current: {})",
                 request.timestamp, current_time
             );
             return false;
@@ -359,7 +348,7 @@ impl LightningServer {
 
         if request.timestamp > current_time + 60 {
             error!(
-                "❌ Signature timestamp too far in future: {} (current: {})",
+                "Signature timestamp too far in future: {} (current: {})",
                 request.timestamp, current_time
             );
             return false;
@@ -374,7 +363,7 @@ impl LightningServer {
             Ok(public_key) => match BASE64_STANDARD.decode(&request.signature) {
                 Ok(signature_bytes) => {
                     if signature_bytes.len() != 64 {
-                        error!("❌ Invalid signature length: {}", signature_bytes.len());
+                        error!("Invalid signature length: {}", signature_bytes.len());
                         return false;
                     }
 
@@ -382,25 +371,16 @@ impl LightningServer {
                     signature_array.copy_from_slice(&signature_bytes);
                     let signature = sr25519::Signature::from_raw(signature_array);
 
-                    let message_bytes = expected_message.as_bytes();
-
-                    let verification_result =
-                        sr25519::Pair::verify(&signature, message_bytes, &public_key);
-
-                    if verification_result {
-                        true
-                    } else {
-                        false
-                    }
+                    sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
                 }
                 Err(e) => {
-                    error!("❌ Failed to decode base64 signature: {}", e);
+                    error!("Failed to decode base64 signature: {}", e);
                     false
                 }
             },
             Err(e) => {
                 error!(
-                    "❌ Invalid SS58 address {}: {}",
+                    "Invalid SS58 address {}: {}",
                     request.validator_hotkey, e
                 );
                 false
@@ -426,13 +406,11 @@ impl LightningServer {
             Some(keypair_seed) => {
                 let pair = sr25519::Pair::from_seed(keypair_seed);
                 let signature = pair.sign(message.as_bytes());
-                let signature_bytes = signature.0;
-                BASE64_STANDARD.encode(signature_bytes)
+                BASE64_STANDARD.encode(signature.0)
             }
             None => {
-                warn!("⚠️ No miner keypair configured, using dummy signature");
-                let dummy_bytes = &message.as_bytes()[..8];
-                BASE64_STANDARD.encode(dummy_bytes)
+                warn!("No miner keypair configured, using empty signature");
+                String::new()
             }
         }
     }
@@ -441,9 +419,9 @@ impl LightningServer {
         packet: SynapsePacket,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, PyObject>>>,
+        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     ) -> SynapseResponse {
-        debug!("📦 Processing {} synapse packet", packet.synapse_type);
+        debug!("Processing {} synapse packet", packet.synapse_type);
 
         let validator_hotkey = {
             let connections_guard = connections.read().await;
@@ -455,7 +433,7 @@ impl LightningServer {
                 .map(|(hotkey, _)| hotkey.clone())
                 .unwrap_or_else(|| {
                     warn!(
-                        "⚠️ No validator found for connection from {}",
+                        "No validator found for connection from {}",
                         connection.remote_address()
                     );
                     "unknown_validator".to_string()
@@ -467,7 +445,7 @@ impl LightningServer {
             if let Some(connection) = connections_guard.get_mut(&validator_hotkey) {
                 if !connection.verified {
                     error!(
-                        "❌ Connection not verified for validator: {}",
+                        "Connection not verified for validator: {}",
                         validator_hotkey
                     );
                     return SynapseResponse {
@@ -482,12 +460,12 @@ impl LightningServer {
                 }
                 connection.update_activity();
                 debug!(
-                    "✅ Connection verified and activity updated for validator: {}",
+                    "Connection verified and activity updated for validator: {}",
                     validator_hotkey
                 );
             } else {
                 warn!(
-                    "⚠️ No connection found for validator {}, allowing request to proceed",
+                    "No connection found for validator {}, allowing request to proceed",
                     validator_hotkey
                 );
             }
@@ -495,64 +473,7 @@ impl LightningServer {
 
         let handlers = synapse_handlers.read().await;
         if let Some(handler) = handlers.get(&packet.synapse_type) {
-            match pyo3::Python::with_gil(|py| -> PyResult<HashMap<String, serde_json::Value>> {
-                let py_dict = pyo3::types::PyDict::new(py);
-
-                for (key, value) in &packet.data {
-                    let py_value = match value {
-                        serde_json::Value::String(s) => s.to_object(py),
-                        serde_json::Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
-                                i.to_object(py)
-                            } else if let Some(f) = n.as_f64() {
-                                f.to_object(py)
-                            } else {
-                                n.to_string().to_object(py)
-                            }
-                        }
-                        serde_json::Value::Bool(b) => b.to_object(py),
-                        serde_json::Value::Array(arr) => {
-                            let py_list = pyo3::types::PyList::empty(py);
-                            for item in arr {
-                                let item_str = serde_json::to_string(item).unwrap_or_default();
-                                py_list.append(item_str)?;
-                            }
-                            py_list.to_object(py)
-                        }
-                        serde_json::Value::Object(_) => serde_json::to_string(value)
-                            .unwrap_or_default()
-                            .to_object(py),
-                        serde_json::Value::Null => py.None(),
-                    };
-                    py_dict.set_item(key, py_value)?;
-                }
-
-                let result = handler.call1(py, (py_dict,))?;
-
-                let result_dict: &pyo3::types::PyDict = result.extract(py)?;
-                let mut response_data = HashMap::new();
-
-                for (key, value) in result_dict.iter() {
-                    let key_str: String = key.extract()?;
-                    let value_json = if let Ok(s) = value.extract::<String>() {
-                        serde_json::Value::String(s)
-                    } else if let Ok(b) = value.extract::<bool>() {
-                        serde_json::Value::Bool(b)
-                    } else if let Ok(i) = value.extract::<i64>() {
-                        serde_json::Value::Number(serde_json::Number::from(i))
-                    } else if let Ok(f) = value.extract::<f64>() {
-                        serde_json::Number::from_f64(f)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    } else {
-                        let s: String = value.str()?.extract()?;
-                        serde_json::Value::String(s)
-                    };
-                    response_data.insert(key_str, value_json);
-                }
-
-                Ok(response_data)
-            }) {
+            match handler.handle(&packet.synapse_type, packet.data) {
                 Ok(response_data) => SynapseResponse {
                     success: true,
                     data: response_data,
@@ -563,29 +484,21 @@ impl LightningServer {
                     error: None,
                 },
                 Err(e) => {
-                    error!("❌ Python handler error for {}: {}", packet.synapse_type, e);
-                    error!("❌ Python error details: {:?}", e);
-
-                    let mut error_data = HashMap::new();
-                    error_data.insert(
-                        "error".to_string(),
-                        serde_json::Value::String(format!("Python handler error: {}", e)),
-                    );
-
+                    error!("Handler error for {}: {}", packet.synapse_type, e);
                     SynapseResponse {
                         success: false,
-                        data: error_data,
+                        data: HashMap::new(),
                         timestamp: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs(),
-                        error: Some(format!("Python handler error: {}", e)),
+                        error: Some(e.to_string()),
                     }
                 }
             }
         } else {
             error!(
-                "❌ No handler registered for synapse type: {}",
+                "No handler registered for synapse type: {}",
                 packet.synapse_type
             );
             SynapseResponse {
@@ -603,7 +516,7 @@ impl LightningServer {
         }
     }
 
-    pub async fn get_connection_stats(&self) -> PyResult<HashMap<String, String>> {
+    pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
         let connections = self.connections.read().await;
         let mut stats = HashMap::new();
 
@@ -632,7 +545,7 @@ impl LightningServer {
         Ok(stats)
     }
 
-    pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> PyResult<()> {
+    pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> Result<()> {
         let mut connections = self.connections.write().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -650,7 +563,7 @@ impl LightningServer {
             if let Some(connection) = connections.remove(&validator) {
                 connection.connection.close(0u32.into(), b"cleanup");
                 info!(
-                    "🧹 Cleaned up stale connection from validator: {}",
+                    "Cleaned up stale connection from validator: {}",
                     validator
                 );
             }
@@ -659,7 +572,7 @@ impl LightningServer {
         Ok(())
     }
 
-    pub async fn stop(&self) -> PyResult<()> {
+    pub async fn stop(&self) -> Result<()> {
         let mut connections = self.connections.write().await;
         for (_, connection) in connections.drain() {
             connection.connection.close(0u32.into(), b"server_shutdown");
@@ -669,7 +582,7 @@ impl LightningServer {
             endpoint.close(0u32.into(), b"server_shutdown");
         }
 
-        info!("🔌 Lightning QUIC server stopped, all connections closed");
+        info!("Lightning QUIC server stopped, all connections closed");
         Ok(())
     }
 }

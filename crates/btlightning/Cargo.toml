@@ -1,0 +1,25 @@
+[package]
+name = "btlightning"
+version = "0.1.0"
+authors = ["Inference Labs Inc"]
+description = "QUIC transport layer for Bittensor"
+license = "MIT"
+repository = "https://github.com/inference-labs-inc/lightning"
+edition = "2021"
+
+[lib]
+name = "btlightning"
+
+[dependencies]
+quinn = "0.10"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-pemfile = "1.0"
+rcgen = "0.12"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+base64 = "0.21"
+sp-core = "21.0"
+socket2 = "0.5"

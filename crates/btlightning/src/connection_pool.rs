@@ -7,9 +7,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct Connection {
     pub id: String,
-    #[allow(dead_code)]
     pub endpoint: String,
-    #[allow(dead_code)]
     pub created_at: u64,
 }
 
@@ -43,7 +41,7 @@ impl ConnectionPool {
         let mut connections = self.connections.write().await;
         let connection = Connection::new(connection_id, endpoint.to_string());
         connections.insert(endpoint.to_string(), connection);
-        info!("🔗 Added persistent connection to pool: {}", endpoint);
+        info!("Added persistent connection to pool: {}", endpoint);
     }
 
     pub async fn get_connection(&self, endpoint: &str) -> Option<String> {
@@ -53,8 +51,8 @@ impl ConnectionPool {
 
     pub async fn remove_connection(&mut self, endpoint: &str) {
         let mut connections = self.connections.write().await;
-        if let Some(_connection) = connections.remove(endpoint) {
-            info!("🔌 Removed connection from pool: {}", endpoint);
+        if connections.remove(endpoint).is_some() {
+            info!("Removed connection from pool: {}", endpoint);
         }
     }
 
@@ -66,6 +64,6 @@ impl ConnectionPool {
     pub async fn close_all(&mut self) {
         let mut connections = self.connections.write().await;
         connections.clear();
-        info!("🔌 Closed all connections in pool");
+        info!("Closed all connections in pool");
     }
 }

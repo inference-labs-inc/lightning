@@ -3,10 +3,10 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "lightning"
-version = "0.0.1"
-description = "Dendrite - but lightning fast"
-readme = "README.md"
+name = "btlightning"
+version = "0.1.0"
+description = "QUIC transport layer for Bittensor"
+readme = "../../README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "Inference Labs Inc" }]
@@ -18,6 +18,6 @@ classifiers = [
 
 [tool.maturin]
 python-source = "python"
-module-name = "lightning"
+module-name = "btlightning._native"
 features = ["pyo3/extension-module"]
 bindings = "pyo3"

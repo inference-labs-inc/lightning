@@ -1,27 +1,17 @@
-use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[pyclass]
 pub struct QuicAxonInfo {
-    #[pyo3(get, set)]
     pub hotkey: String,
-    #[pyo3(get, set)]
     pub ip: String,
-    #[pyo3(get, set)]
     pub port: u16,
-    #[pyo3(get, set)]
     pub protocol: u8,
-    #[pyo3(get, set)]
     pub placeholder1: u8,
-    #[pyo3(get, set)]
     pub placeholder2: u8,
 }
 
-#[pymethods]
 impl QuicAxonInfo {
-    #[new]
     pub fn new(
         hotkey: String,
         ip: String,

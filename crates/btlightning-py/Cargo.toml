@@ -1,0 +1,22 @@
+[package]
+name = "btlightning-py"
+version = "0.1.0"
+authors = ["Inference Labs Inc"]
+description = "Python bindings for btlightning QUIC transport"
+license = "MIT"
+repository = "https://github.com/inference-labs-inc/lightning"
+edition = "2021"
+
+[lib]
+name = "btlightning"
+crate-type = ["cdylib"]
+
+[dependencies]
+btlightning = { path = "../btlightning" }
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+tokio = { version = "1.0", features = ["full"] }
+serde_json = "1.0"
+
+[build-dependencies]
+pyo3-build-config = "0.20"
