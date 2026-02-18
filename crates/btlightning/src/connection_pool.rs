@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -27,43 +25,38 @@ impl Connection {
 
 #[derive(Debug)]
 pub struct ConnectionPool {
-    connections: Arc<RwLock<HashMap<String, Connection>>>,
+    connections: HashMap<String, Connection>,
 }
 
 impl ConnectionPool {
     pub fn new() -> Self {
         Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: HashMap::new(),
         }
     }
 
-    pub async fn add_connection(&mut self, endpoint: &str, connection_id: String) {
-        let mut connections = self.connections.write().await;
+    pub fn add_connection(&mut self, endpoint: &str, connection_id: String) {
         let connection = Connection::new(connection_id, endpoint.to_string());
-        connections.insert(endpoint.to_string(), connection);
+        self.connections.insert(endpoint.to_string(), connection);
         info!("Added persistent connection to pool: {}", endpoint);
     }
 
-    pub async fn get_connection(&self, endpoint: &str) -> Option<String> {
-        let connections = self.connections.read().await;
-        connections.get(endpoint).map(|c| c.id.clone())
+    pub fn get_connection(&self, endpoint: &str) -> Option<String> {
+        self.connections.get(endpoint).map(|c| c.id.clone())
     }
 
-    pub async fn remove_connection(&mut self, endpoint: &str) {
-        let mut connections = self.connections.write().await;
-        if connections.remove(endpoint).is_some() {
+    pub fn remove_connection(&mut self, endpoint: &str) {
+        if self.connections.remove(endpoint).is_some() {
             info!("Removed connection from pool: {}", endpoint);
         }
     }
 
-    pub async fn connection_count(&self) -> usize {
-        let connections = self.connections.read().await;
-        connections.len()
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
     }
 
-    pub async fn close_all(&mut self) {
-        let mut connections = self.connections.write().await;
-        connections.clear();
+    pub fn close_all(&mut self) {
+        self.connections.clear();
         info!("Closed all connections in pool");
     }
 }

@@ -243,6 +243,7 @@ name = "btlightning"
 version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
+ "memchr",
  "quinn",
  "rand 0.8.5",
  "rcgen",

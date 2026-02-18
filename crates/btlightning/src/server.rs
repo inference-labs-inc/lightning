@@ -67,6 +67,7 @@ pub struct LightningServer {
     host: String,
     port: u16,
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+    addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     endpoint: Option<Endpoint>,
@@ -80,6 +81,7 @@ impl LightningServer {
             host,
             port,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
             synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
             used_nonces: Arc::new(RwLock::new(HashMap::new())),
             endpoint: None,
@@ -161,6 +163,7 @@ impl LightningServer {
 
             while let Some(conn) = endpoint.accept().await {
                 let connections = self.connections.clone();
+                let addr_to_hotkey = self.addr_to_hotkey.clone();
                 let synapse_handlers = self.synapse_handlers.clone();
                 let used_nonces = self.used_nonces.clone();
                 let miner_hotkey = self.miner_hotkey.clone();
@@ -172,6 +175,7 @@ impl LightningServer {
                             Self::handle_connection(
                                 connection,
                                 connections,
+                                addr_to_hotkey,
                                 synapse_handlers,
                                 used_nonces,
                                 miner_hotkey,
@@ -192,6 +196,7 @@ impl LightningServer {
     async fn handle_connection(
         connection: Connection,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
@@ -204,6 +209,7 @@ impl LightningServer {
                 Ok((send, recv)) => {
                     let conn_clone = connection.clone();
                     let connections_clone = connections.clone();
+                    let addr_to_hotkey_clone = addr_to_hotkey.clone();
                     let handlers_clone = synapse_handlers.clone();
                     let nonces_clone = used_nonces.clone();
                     let miner_hotkey_clone = miner_hotkey.clone();
@@ -215,6 +221,7 @@ impl LightningServer {
                             recv,
                             conn_clone,
                             connections_clone,
+                            addr_to_hotkey_clone,
                             handlers_clone,
                             nonces_clone,
                             miner_hotkey_clone,
@@ -236,6 +243,7 @@ impl LightningServer {
         mut recv: RecvStream,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
@@ -243,43 +251,51 @@ impl LightningServer {
     ) {
         match recv.read_to_end(MAX_RESPONSE_SIZE).await {
             Ok(buffer) => {
-                let message = String::from_utf8_lossy(&buffer);
+                if memchr::memmem::find(&buffer, b"\"synapse_type\"").is_some() {
+                    match serde_json::from_slice::<SynapsePacket>(&buffer) {
+                        Ok(synapse_packet) => {
+                            let response = Self::process_synapse_packet(
+                                synapse_packet,
+                                connection.clone(),
+                                connections,
+                                addr_to_hotkey,
+                                synapse_handlers,
+                            )
+                            .await;
 
-                if let Ok(handshake_req) = serde_json::from_str::<HandshakeRequest>(&message) {
-                    let response = Self::process_handshake(
-                        handshake_req,
-                        connection.clone(),
-                        connections,
-                        used_nonces,
-                        miner_hotkey,
-                        miner_keypair,
-                    )
-                    .await;
-
-                    if let Ok(response_json) = serde_json::to_string(&response) {
-                        let _ = send.write_all(response_json.as_bytes()).await;
-                        let _ = send.finish().await;
+                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                let _ = send.write_all(&response_bytes).await;
+                                let _ = send.finish().await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse synapse packet: {}", e);
+                        }
                     }
-                    return;
-                }
+                } else {
+                    match serde_json::from_slice::<HandshakeRequest>(&buffer) {
+                        Ok(handshake_req) => {
+                            let response = Self::process_handshake(
+                                handshake_req,
+                                connection.clone(),
+                                connections,
+                                addr_to_hotkey,
+                                used_nonces,
+                                miner_hotkey,
+                                miner_keypair,
+                            )
+                            .await;
 
-                if let Ok(synapse_packet) = serde_json::from_str::<SynapsePacket>(&message) {
-                    let response = Self::process_synapse_packet(
-                        synapse_packet,
-                        connection.clone(),
-                        connections,
-                        synapse_handlers,
-                    )
-                    .await;
-
-                    if let Ok(response_json) = serde_json::to_string(&response) {
-                        let _ = send.write_all(response_json.as_bytes()).await;
-                        let _ = send.finish().await;
+                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                let _ = send.write_all(&response_bytes).await;
+                                let _ = send.finish().await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Unknown message format received: {}", e);
+                        }
                     }
-                    return;
                 }
-
-                warn!("Unknown message format received");
             }
             Err(e) => {
                 error!("Failed to read stream: {}", e);
@@ -291,6 +307,7 @@ impl LightningServer {
         request: HandshakeRequest,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
@@ -309,6 +326,7 @@ impl LightningServer {
                     .as_millis()
             );
 
+            let remote_addr = connection.remote_address();
             let mut connections_guard = connections.write().await;
             let mut validator_conn = ValidatorConnection::new(
                 request.validator_hotkey.clone(),
@@ -317,6 +335,11 @@ impl LightningServer {
             );
             validator_conn.verify();
             connections_guard.insert(request.validator_hotkey.clone(), validator_conn);
+            drop(connections_guard);
+
+            let mut addr_index = addr_to_hotkey.write().await;
+            addr_index.insert(remote_addr, request.validator_hotkey.clone());
+            drop(addr_index);
 
             info!(
                 "Handshake successful, established connection: {}",
@@ -366,49 +389,51 @@ impl LightningServer {
             return false;
         }
 
-        {
-            let nonces = used_nonces.read().await;
-            if nonces.contains_key(&request.nonce) {
-                error!("Nonce already used: {}", request.nonce);
-                return false;
-            }
-        }
-
         let expected_message = format!(
             "handshake:{}:{}:{}",
             request.validator_hotkey, request.timestamp, request.nonce
         );
 
-        let valid = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
-            Ok(public_key) => match BASE64_STANDARD.decode(&request.signature) {
-                Ok(signature_bytes) => {
-                    if signature_bytes.len() != 64 {
-                        error!("Invalid signature length: {}", signature_bytes.len());
-                        return false;
-                    }
-
-                    let mut signature_array = [0u8; 64];
-                    signature_array.copy_from_slice(&signature_bytes);
-                    let signature = sr25519::Signature::from_raw(signature_array);
-
-                    sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
-                }
-                Err(e) => {
-                    error!("Failed to decode base64 signature: {}", e);
-                    false
-                }
-            },
+        let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
+            Ok(pk) => pk,
             Err(e) => {
                 error!(
                     "Invalid SS58 address {}: {}",
                     request.validator_hotkey, e
                 );
-                false
+                return false;
             }
         };
 
+        let signature_bytes = match BASE64_STANDARD.decode(&request.signature) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to decode base64 signature: {}", e);
+                return false;
+            }
+        };
+
+        if signature_bytes.len() != 64 {
+            error!("Invalid signature length: {}", signature_bytes.len());
+            return false;
+        }
+
+        let mut signature_array = [0u8; 64];
+        signature_array.copy_from_slice(&signature_bytes);
+        let signature = sr25519::Signature::from_raw(signature_array);
+
+        let valid = tokio::task::spawn_blocking(move || {
+            sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
+        })
+        .await
+        .unwrap_or(false);
+
         if valid {
             let mut nonces = used_nonces.write().await;
+            if nonces.contains_key(&request.nonce) {
+                error!("Nonce already used: {}", request.nonce);
+                return false;
+            }
             nonces.insert(request.nonce.clone(), current_time);
         }
 
@@ -442,18 +467,16 @@ impl LightningServer {
         packet: SynapsePacket,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     ) -> SynapseResponse {
         debug!("Processing {} synapse packet", packet.synapse_type);
 
         let validator_hotkey = {
-            let connections_guard = connections.read().await;
-            connections_guard
-                .iter()
-                .find(|(_, validator_conn)| {
-                    validator_conn.connection.remote_address() == connection.remote_address()
-                })
-                .map(|(hotkey, _)| hotkey.clone())
+            let addr_index = addr_to_hotkey.read().await;
+            addr_index
+                .get(&connection.remote_address())
+                .cloned()
                 .unwrap_or_else(|| {
                     warn!(
                         "No validator found for connection from {}",
@@ -563,18 +586,20 @@ impl LightningServer {
         let mut to_remove = Vec::new();
         for (validator, connection) in connections.iter() {
             if now.saturating_sub(connection.last_activity) > max_idle_seconds {
-                to_remove.push(validator.clone());
+                to_remove.push((validator.clone(), connection.connection.remote_address()));
             }
         }
 
-        for validator in to_remove {
-            if let Some(connection) = connections.remove(&validator) {
+        let mut addr_index = self.addr_to_hotkey.write().await;
+        for (validator, remote_addr) in &to_remove {
+            if let Some(connection) = connections.remove(validator) {
                 connection.connection.close(0u32.into(), b"cleanup");
                 info!(
                     "Cleaned up stale connection from validator: {}",
                     validator
                 );
             }
+            addr_index.remove(remote_addr);
         }
 
         Ok(())
@@ -588,9 +613,11 @@ impl LightningServer {
 
     pub async fn stop(&self) -> Result<()> {
         let mut connections = self.connections.write().await;
+        let mut addr_index = self.addr_to_hotkey.write().await;
         for (_, connection) in connections.drain() {
             connection.connection.close(0u32.into(), b"server_shutdown");
         }
+        addr_index.clear();
 
         if let Some(endpoint) = &self.endpoint {
             endpoint.close(0u32.into(), b"server_shutdown");

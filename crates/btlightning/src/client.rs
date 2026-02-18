@@ -61,15 +61,13 @@ impl LightningClient {
                     let connection_id =
                         format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
 
-                    pool.add_connection(&miner_key, connection_id.clone())
-                        .await;
+                    pool.add_connection(&miner_key, connection_id.clone());
                     active_miners.insert(miner_key.clone(), miner);
-                    connections.insert(miner_key.clone(), connection);
-
                     info!(
                         "Established persistent QUIC connection to miner: {}",
                         miner_key
                     );
+                    connections.insert(miner_key, connection);
                 }
                 Err(e) => {
                     error!("Failed to connect to miner {}: {}", miner_key, e);
@@ -161,11 +159,11 @@ impl LightningClient {
             LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
         })?;
 
-        let request_json = serde_json::to_string(&request).map_err(|e| {
+        let request_bytes = serde_json::to_vec(&request).map_err(|e| {
             LightningError::Serialization(format!("Failed to serialize handshake: {}", e))
         })?;
 
-        send.write_all(request_json.as_bytes()).await.map_err(|e| {
+        send.write_all(&request_bytes).await.map_err(|e| {
             LightningError::Transport(format!("Failed to send handshake packet: {}", e))
         })?;
         send.finish().await.map_err(|e| {
@@ -179,11 +177,7 @@ impl LightningClient {
                 LightningError::Transport(format!("Failed to read handshake response: {}", e))
             })?;
 
-        let response_str = String::from_utf8(buffer).map_err(|e| {
-            LightningError::Serialization(format!("Invalid UTF-8 in response: {}", e))
-        })?;
-
-        let response: HandshakeResponse = serde_json::from_str(&response_str).map_err(|e| {
+        let response: HandshakeResponse = serde_json::from_slice(&buffer).map_err(|e| {
             LightningError::Serialization(format!("Failed to parse handshake response: {}", e))
         })?;
 
@@ -241,11 +235,11 @@ impl LightningClient {
             timestamp: unix_timestamp_secs(),
         };
 
-        let packet_json = serde_json::to_string(&synapse_packet).map_err(|e| {
+        let packet_bytes = serde_json::to_vec(&synapse_packet).map_err(|e| {
             LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
         })?;
 
-        send.write_all(packet_json.as_bytes()).await.map_err(|e| {
+        send.write_all(&packet_bytes).await.map_err(|e| {
             LightningError::Transport(format!("Failed to send synapse packet: {}", e))
         })?;
         send.finish().await.map_err(|e| {
@@ -256,12 +250,8 @@ impl LightningClient {
             LightningError::Transport(format!("Failed to read response: {}", e))
         })?;
 
-        let response_str = String::from_utf8(buffer).map_err(|e| {
-            LightningError::Serialization(format!("Invalid UTF-8 in response: {}", e))
-        })?;
-
         let synapse_response: crate::types::SynapseResponse =
-            serde_json::from_str(&response_str).map_err(|e| {
+            serde_json::from_slice(&buffer).map_err(|e| {
                 LightningError::Serialization(format!(
                     "Failed to parse synapse response: {}",
                     e
@@ -294,7 +284,7 @@ impl LightningClient {
                     if let Some(connection) = connections.remove(&key) {
                         connection.close(0u32.into(), b"miner_deregistered");
                     }
-                    pool.remove_connection(&key).await;
+                    pool.remove_connection(&key);
                     active_miners.remove(&key);
                 }
             }
@@ -323,7 +313,7 @@ impl LightningClient {
                         let connection_id =
                             format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
 
-                        pool.add_connection(&key, connection_id).await;
+                        pool.add_connection(&key, connection_id);
                         active_miners.insert(key.clone(), miner);
                         connections.insert(key, connection);
                     }
@@ -345,7 +335,7 @@ impl LightningClient {
         let mut stats = HashMap::new();
         stats.insert(
             "total_connections".to_string(),
-            pool.connection_count().await.to_string(),
+            pool.connection_count().to_string(),
         );
         stats.insert("active_miners".to_string(), active_miners.len().to_string());
         stats.insert(
@@ -354,7 +344,7 @@ impl LightningClient {
         );
 
         for (key, _) in active_miners.iter() {
-            if let Some(connection_id) = pool.get_connection(key).await {
+            if let Some(connection_id) = pool.get_connection(key) {
                 stats.insert(format!("connection_{}", key), connection_id);
             }
         }
@@ -371,7 +361,7 @@ impl LightningClient {
             connection.close(0u32.into(), b"client_shutdown");
         }
 
-        pool.close_all().await;
+        pool.close_all();
         active_miners.clear();
 
         info!("All Lightning QUIC connections closed");
