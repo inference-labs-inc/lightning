@@ -153,7 +153,7 @@ impl LightningServer {
         Ok(())
     }
 
-    pub async fn serve_forever(&mut self) -> Result<()> {
+    pub async fn serve_forever(&self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
             let nonces_for_cleanup = self.used_nonces.clone();
             tokio::spawn(async move {
@@ -268,9 +268,14 @@ impl LightningServer {
                             )
                             .await;
 
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = send.write_all(&response_bytes).await;
-                                let _ = send.finish().await;
+                            match serde_json::to_vec(&response) {
+                                Ok(response_bytes) => {
+                                    let _ = send.write_all(&response_bytes).await;
+                                    let _ = send.finish().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize SynapseResponse: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -281,9 +286,14 @@ impl LightningServer {
                                 timestamp: unix_timestamp_secs(),
                                 error: Some(e.to_string()),
                             };
-                            if let Ok(bytes) = serde_json::to_vec(&err_response) {
-                                let _ = send.write_all(&bytes).await;
-                                let _ = send.finish().await;
+                            match serde_json::to_vec(&err_response) {
+                                Ok(bytes) => {
+                                    let _ = send.write_all(&bytes).await;
+                                    let _ = send.finish().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize SynapseResponse error: {}", e);
+                                }
                             }
                         }
                     }
@@ -301,9 +311,14 @@ impl LightningServer {
                             )
                             .await;
 
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = send.write_all(&response_bytes).await;
-                                let _ = send.finish().await;
+                            match serde_json::to_vec(&response) {
+                                Ok(response_bytes) => {
+                                    let _ = send.write_all(&response_bytes).await;
+                                    let _ = send.finish().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize HandshakeResponse: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -315,9 +330,14 @@ impl LightningServer {
                                 accepted: false,
                                 connection_id: String::new(),
                             };
-                            if let Ok(bytes) = serde_json::to_vec(&err_response) {
-                                let _ = send.write_all(&bytes).await;
-                                let _ = send.finish().await;
+                            match serde_json::to_vec(&err_response) {
+                                Ok(bytes) => {
+                                    let _ = send.write_all(&bytes).await;
+                                    let _ = send.finish().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize HandshakeResponse error: {}", e);
+                                }
                             }
                         }
                     }
@@ -361,7 +381,12 @@ impl LightningServer {
                 connection.clone(),
             );
             validator_conn.verify();
-            connections_guard.insert(request.validator_hotkey.clone(), validator_conn);
+            if let Some(prev_conn) = connections_guard.insert(request.validator_hotkey.clone(), validator_conn) {
+                let prev_addr = prev_conn.connection.remote_address();
+                if prev_addr != remote_addr {
+                    addr_index.remove(&prev_addr);
+                }
+            }
             addr_index.insert(remote_addr, request.validator_hotkey.clone());
             drop(addr_index);
             drop(connections_guard);

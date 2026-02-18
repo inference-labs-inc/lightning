@@ -183,33 +183,31 @@ impl RustLightning {
             })
             .map_err(to_pyerr)?;
 
-        Python::with_gil(|py| {
-            let result_dict = pyo3::types::PyDict::new(py);
-            result_dict.set_item("success", response.success)?;
-            result_dict.set_item("latency_ms", response.latency_ms)?;
+        let result_dict = pyo3::types::PyDict::new(py);
+        result_dict.set_item("success", response.success)?;
+        result_dict.set_item("latency_ms", response.latency_ms)?;
 
-            for (key, value) in response.data {
-                let py_value = match value {
-                    serde_json::Value::String(s) => s.into_py(py),
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            i.into_py(py)
-                        } else if let Some(f) = n.as_f64() {
-                            f.into_py(py)
-                        } else {
-                            n.to_string().into_py(py)
-                        }
+        for (key, value) in response.data {
+            let py_value = match value {
+                serde_json::Value::String(s) => s.into_py(py),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        i.into_py(py)
+                    } else if let Some(f) = n.as_f64() {
+                        f.into_py(py)
+                    } else {
+                        n.to_string().into_py(py)
                     }
-                    serde_json::Value::Bool(b) => b.into_py(py),
-                    _ => serde_json::to_string(&value)
-                        .unwrap_or_default()
-                        .into_py(py),
-                };
-                result_dict.set_item(key, py_value)?;
-            }
+                }
+                serde_json::Value::Bool(b) => b.into_py(py),
+                _ => serde_json::to_string(&value)
+                    .unwrap_or_default()
+                    .into_py(py),
+            };
+            result_dict.set_item(key, py_value)?;
+        }
 
-            Ok(result_dict.into())
-        })
+        Ok(result_dict.into())
     }
 
     pub fn update_miner_registry(
@@ -243,13 +241,11 @@ impl RustLightning {
             })
             .map_err(to_pyerr)?;
 
-        Python::with_gil(|py| {
-            let result_dict = pyo3::types::PyDict::new(py);
-            for (key, value) in stats {
-                result_dict.set_item(key, value)?;
-            }
-            Ok(result_dict.into())
-        })
+        let result_dict = pyo3::types::PyDict::new(py);
+        for (key, value) in stats {
+            result_dict.set_item(key, value)?;
+        }
+        Ok(result_dict.into())
     }
 
     pub fn close_all_connections(&self, py: Python<'_>) -> PyResult<()> {
@@ -324,7 +320,7 @@ impl RustLightningServer {
         let runtime = Arc::clone(&self.runtime);
         py.allow_threads(|| {
             runtime.block_on(async {
-                let mut server = self.server.write().await;
+                let server = self.server.read().await;
                 server.serve_forever().await
             })
         })
@@ -342,13 +338,11 @@ impl RustLightningServer {
             })
             .map_err(to_pyerr)?;
 
-        Python::with_gil(|py| {
-            let result_dict = pyo3::types::PyDict::new(py);
-            for (key, value) in stats {
-                result_dict.set_item(key, value)?;
-            }
-            Ok(result_dict.into())
-        })
+        let result_dict = pyo3::types::PyDict::new(py);
+        for (key, value) in stats {
+            result_dict.set_item(key, value)?;
+        }
+        Ok(result_dict.into())
     }
 
     pub fn cleanup_stale_connections(

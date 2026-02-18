@@ -374,11 +374,15 @@ impl LightningClient {
                 match join_result {
                     Ok((key, miner, result)) => match result {
                         Ok(connection) => {
-                            let connection_id =
-                                format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
-                            pool.add_connection(&key, connection_id);
-                            active_miners.insert(key.clone(), miner);
-                            connections.insert(key, connection);
+                            if active_miners.contains_key(&key) {
+                                connection.close(0u32.into(), b"duplicate");
+                            } else {
+                                let connection_id =
+                                    format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
+                                pool.add_connection(&key, connection_id);
+                                active_miners.insert(key.clone(), miner);
+                                connections.insert(key, connection);
+                            }
                         }
                         Err(e) => {
                             error!("Failed to connect to new miner {}: {}", key, e);
@@ -521,14 +525,16 @@ async fn send_synapse_packet(
     })?;
 
     let synapse_packet = SynapsePacket {
-        synapse_type: request.synapse_type.clone(),
-        data: request.data.clone(),
+        synapse_type: request.synapse_type,
+        data: request.data,
         timestamp: unix_timestamp_secs(),
     };
 
     let packet_bytes = serde_json::to_vec(&synapse_packet).map_err(|e| {
         LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
     })?;
+
+    let start = Instant::now();
 
     send.write_all(&packet_bytes).await.map_err(|e| {
         LightningError::Transport(format!("Failed to send synapse packet: {}", e))
@@ -541,6 +547,8 @@ async fn send_synapse_packet(
         LightningError::Transport(format!("Failed to read response: {}", e))
     })?;
 
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
     let synapse_response: crate::types::SynapseResponse =
         serde_json::from_slice(&buffer).map_err(|e| {
             LightningError::Serialization(format!(
@@ -552,7 +560,7 @@ async fn send_synapse_packet(
     Ok(QuicResponse {
         success: synapse_response.success,
         data: synapse_response.data,
-        latency_ms: 0.0,
+        latency_ms,
     })
 }
 
