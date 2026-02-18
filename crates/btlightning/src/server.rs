@@ -6,14 +6,23 @@ use quinn::{
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::client::MAX_RESPONSE_SIZE;
+
 const MAX_SIGNATURE_AGE: u64 = 300;
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
 
 pub trait SynapseHandler: Send + Sync {
     fn handle(
@@ -39,10 +48,7 @@ impl ValidatorConnection {
         connection_id: String,
         conn: Arc<quinn::Connection>,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_timestamp_secs();
         Self {
             validator_hotkey,
             connection_id,
@@ -59,10 +65,7 @@ impl ValidatorConnection {
     }
 
     pub fn update_activity(&mut self) {
-        self.last_activity = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        self.last_activity = unix_timestamp_secs();
     }
 }
 
@@ -73,6 +76,7 @@ pub struct LightningServer {
     port: u16,
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+    used_nonces: Arc<RwLock<HashSet<String>>>,
     endpoint: Option<Endpoint>,
 }
 
@@ -85,6 +89,7 @@ impl LightningServer {
             port,
             connections: Arc::new(RwLock::new(HashMap::new())),
             synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+            used_nonces: Arc::new(RwLock::new(HashSet::new())),
             endpoint: None,
         }
     }
@@ -154,6 +159,7 @@ impl LightningServer {
             while let Some(conn) = endpoint.accept().await {
                 let connections = self.connections.clone();
                 let synapse_handlers = self.synapse_handlers.clone();
+                let used_nonces = self.used_nonces.clone();
                 let miner_hotkey = self.miner_hotkey.clone();
                 let miner_keypair = self.miner_keypair_bytes;
 
@@ -164,6 +170,7 @@ impl LightningServer {
                                 connection,
                                 connections,
                                 synapse_handlers,
+                                used_nonces,
                                 miner_hotkey,
                                 miner_keypair,
                             )
@@ -183,6 +190,7 @@ impl LightningServer {
         connection: Connection,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+        used_nonces: Arc<RwLock<HashSet<String>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
@@ -194,6 +202,7 @@ impl LightningServer {
                     let conn_clone = connection.clone();
                     let connections_clone = connections.clone();
                     let handlers_clone = synapse_handlers.clone();
+                    let nonces_clone = used_nonces.clone();
                     let miner_hotkey_clone = miner_hotkey.clone();
                     let miner_keypair_clone = miner_keypair;
 
@@ -204,6 +213,7 @@ impl LightningServer {
                             conn_clone,
                             connections_clone,
                             handlers_clone,
+                            nonces_clone,
                             miner_hotkey_clone,
                             miner_keypair_clone,
                         )
@@ -224,10 +234,11 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+        used_nonces: Arc<RwLock<HashSet<String>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
-        match recv.read_to_end(1024 * 1024).await {
+        match recv.read_to_end(MAX_RESPONSE_SIZE).await {
             Ok(buffer) => {
                 let message = String::from_utf8_lossy(&buffer);
 
@@ -236,6 +247,7 @@ impl LightningServer {
                         handshake_req,
                         connection.clone(),
                         connections,
+                        used_nonces,
                         miner_hotkey,
                         miner_keypair,
                     )
@@ -276,18 +288,21 @@ impl LightningServer {
         request: HandshakeRequest,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
+        used_nonces: Arc<RwLock<HashSet<String>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) -> HandshakeResponse {
-        let is_valid = Self::verify_validator_signature(&request).await;
+        let is_valid =
+            Self::verify_validator_signature(&request, used_nonces).await;
 
         if is_valid {
+            let now = unix_timestamp_secs();
             let connection_id = format!(
                 "conn_{}_{}",
                 request.validator_hotkey,
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or(Duration::ZERO)
                     .as_millis()
             );
 
@@ -307,12 +322,8 @@ impl LightningServer {
 
             HandshakeResponse {
                 miner_hotkey: miner_hotkey.clone(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                signature: Self::sign_handshake_response(&request, &miner_hotkey, &miner_keypair)
-                    .await,
+                timestamp: now,
+                signature: Self::sign_handshake_response(&request, &miner_keypair),
                 accepted: true,
                 connection_id,
             }
@@ -320,10 +331,7 @@ impl LightningServer {
             error!("Handshake failed: invalid signature");
             HandshakeResponse {
                 miner_hotkey: miner_hotkey.clone(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: unix_timestamp_secs(),
                 signature: String::new(),
                 accepted: false,
                 connection_id: String::new(),
@@ -331,11 +339,12 @@ impl LightningServer {
         }
     }
 
-    async fn verify_validator_signature(request: &HandshakeRequest) -> bool {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    async fn verify_validator_signature(
+        request: &HandshakeRequest,
+        used_nonces: Arc<RwLock<HashSet<String>>>,
+    ) -> bool {
+        let current_time = unix_timestamp_secs();
+
         if current_time > request.timestamp
             && (current_time - request.timestamp) > MAX_SIGNATURE_AGE
         {
@@ -354,9 +363,17 @@ impl LightningServer {
             return false;
         }
 
+        {
+            let mut nonces = used_nonces.write().await;
+            if !nonces.insert(request.nonce.clone()) {
+                error!("Nonce already used: {}", request.nonce);
+                return false;
+            }
+        }
+
         let expected_message = format!(
-            "handshake:{}:{}",
-            request.validator_hotkey, request.timestamp
+            "handshake:{}:{}:{}",
+            request.validator_hotkey, request.timestamp, request.nonce
         );
 
         match sr25519::Public::from_ss58check(&request.validator_hotkey) {
@@ -388,15 +405,11 @@ impl LightningServer {
         }
     }
 
-    async fn sign_handshake_response(
+    fn sign_handshake_response(
         request: &HandshakeRequest,
-        _miner_hotkey: &str,
         miner_keypair: &Option<[u8; 32]>,
     ) -> String {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = unix_timestamp_secs();
         let message = format!(
             "handshake_response:{}:{}",
             request.validator_hotkey, timestamp
@@ -451,10 +464,7 @@ impl LightningServer {
                     return SynapseResponse {
                         success: false,
                         data: HashMap::new(),
-                        timestamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
+                        timestamp: unix_timestamp_secs(),
                         error: Some("Connection not verified".to_string()),
                     };
                 }
@@ -477,10 +487,7 @@ impl LightningServer {
                 Ok(response_data) => SynapseResponse {
                     success: true,
                     data: response_data,
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                    timestamp: unix_timestamp_secs(),
                     error: None,
                 },
                 Err(e) => {
@@ -488,10 +495,7 @@ impl LightningServer {
                     SynapseResponse {
                         success: false,
                         data: HashMap::new(),
-                        timestamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
+                        timestamp: unix_timestamp_secs(),
                         error: Some(e.to_string()),
                     }
                 }
@@ -504,10 +508,7 @@ impl LightningServer {
             SynapseResponse {
                 success: false,
                 data: HashMap::new(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: unix_timestamp_secs(),
                 error: Some(format!(
                     "No handler for synapse type: {}",
                     packet.synapse_type
@@ -547,10 +548,7 @@ impl LightningServer {
 
     pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> Result<()> {
         let mut connections = self.connections.write().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_timestamp_secs();
 
         let mut to_remove = Vec::new();
         for (validator, connection) in connections.iter() {
@@ -570,6 +568,11 @@ impl LightningServer {
         }
 
         Ok(())
+    }
+
+    pub async fn cleanup_expired_nonces(&self) {
+        let mut nonces = self.used_nonces.write().await;
+        nonces.clear();
     }
 
     pub async fn stop(&self) -> Result<()> {

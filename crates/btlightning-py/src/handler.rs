@@ -1,16 +1,17 @@
 use btlightning::{LightningError, Result, SynapseHandler};
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 pub struct PythonSynapseHandler {
-    callback: PyObject,
+    callback: Mutex<PyObject>,
 }
-
-unsafe impl Sync for PythonSynapseHandler {}
 
 impl PythonSynapseHandler {
     pub fn new(callback: PyObject) -> Self {
-        Self { callback }
+        Self {
+            callback: Mutex::new(callback),
+        }
     }
 }
 
@@ -20,6 +21,10 @@ impl SynapseHandler for PythonSynapseHandler {
         _synapse_type: &str,
         data: HashMap<String, serde_json::Value>,
     ) -> Result<HashMap<String, serde_json::Value>> {
+        let callback = self
+            .callback
+            .lock()
+            .map_err(|e| LightningError::Handler(format!("lock poisoned: {}", e)))?;
         Python::with_gil(|py| {
             let py_dict = pyo3::types::PyDict::new(py);
 
@@ -30,7 +35,7 @@ impl SynapseHandler for PythonSynapseHandler {
                     .map_err(|e| LightningError::Handler(e.to_string()))?;
             }
 
-            let result = self.callback.call1(py, (py_dict,)).map_err(|e| {
+            let result = callback.call1(py, (py_dict,)).map_err(|e| {
                 LightningError::Handler(format!("Python handler error: {}", e))
             })?;
 
