@@ -4,31 +4,16 @@ use crate::signing::Signer;
 use crate::types::{
     HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket,
 };
+use crate::util::{unix_timestamp_millis, unix_timestamp_secs, MAX_RESPONSE_SIZE};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use rustls::ClientConfig as RustlsClientConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
-
-pub const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs()
-}
-
-fn unix_timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
-}
 
 pub struct LightningClient {
     wallet_hotkey: String,
@@ -59,13 +44,19 @@ impl LightningClient {
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
 
-        let mut active_miners = self.active_miners.write().await;
-        let mut pool = self.connection_pool.write().await;
-
+        let mut results = Vec::new();
         for miner in miners {
             let miner_key = format!("{}:{}", miner.ip, miner.port);
+            let result = self.establish_connection_with_handshake(&miner).await;
+            results.push((miner_key, miner, result));
+        }
 
-            match self.establish_connection_with_handshake(&miner).await {
+        let mut active_miners = self.active_miners.write().await;
+        let mut pool = self.connection_pool.write().await;
+        let mut connections = self.established_connections.write().await;
+
+        for (miner_key, miner, result) in results {
+            match result {
                 Ok(connection) => {
                     let connection_id =
                         format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
@@ -73,8 +64,6 @@ impl LightningClient {
                     pool.add_connection(&miner_key, connection_id.clone())
                         .await;
                     active_miners.insert(miner_key.clone(), miner);
-
-                    let mut connections = self.established_connections.write().await;
                     connections.insert(miner_key.clone(), connection);
 
                     info!(
@@ -292,26 +281,44 @@ impl LightningClient {
             .map(|m| (format!("{}:{}", m.ip, m.port), m.clone()))
             .collect();
 
-        let mut active_miners = self.active_miners.write().await;
-        let mut pool = self.connection_pool.write().await;
-        let mut connections = self.established_connections.write().await;
+        let new_miner_keys: Vec<(String, QuicAxonInfo)>;
+        {
+            let mut active_miners = self.active_miners.write().await;
+            let mut pool = self.connection_pool.write().await;
+            let mut connections = self.established_connections.write().await;
 
-        let active_keys: Vec<String> = active_miners.keys().cloned().collect();
-        for key in active_keys {
-            if !current_miners.contains_key(&key) {
-                info!("Miner deregistered, closing QUIC connection: {}", key);
-                if let Some(connection) = connections.remove(&key) {
-                    connection.close(0u32.into(), b"miner_deregistered");
+            let active_keys: Vec<String> = active_miners.keys().cloned().collect();
+            for key in active_keys {
+                if !current_miners.contains_key(&key) {
+                    info!("Miner deregistered, closing QUIC connection: {}", key);
+                    if let Some(connection) = connections.remove(&key) {
+                        connection.close(0u32.into(), b"miner_deregistered");
+                    }
+                    pool.remove_connection(&key).await;
+                    active_miners.remove(&key);
                 }
-                pool.remove_connection(&key).await;
-                active_miners.remove(&key);
             }
+
+            new_miner_keys = current_miners
+                .into_iter()
+                .filter(|(key, _)| !active_miners.contains_key(key))
+                .collect();
         }
 
-        for (key, miner) in current_miners {
-            if !active_miners.contains_key(&key) {
-                info!("New miner detected, establishing QUIC connection: {}", key);
-                match self.establish_connection_with_handshake(&miner).await {
+        let mut results = Vec::new();
+        for (key, miner) in new_miner_keys {
+            info!("New miner detected, establishing QUIC connection: {}", key);
+            let result = self.establish_connection_with_handshake(&miner).await;
+            results.push((key, miner, result));
+        }
+
+        if !results.is_empty() {
+            let mut active_miners = self.active_miners.write().await;
+            let mut pool = self.connection_pool.write().await;
+            let mut connections = self.established_connections.write().await;
+
+            for (key, miner, result) in results {
+                match result {
                     Ok(connection) => {
                         let connection_id =
                             format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());

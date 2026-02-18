@@ -1,5 +1,6 @@
 use crate::error::{LightningError, Result};
 use crate::types::{HandshakeRequest, HandshakeResponse, SynapsePacket, SynapseResponse};
+use crate::util::{unix_timestamp_secs, MAX_RESPONSE_SIZE};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
@@ -13,16 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::client::MAX_RESPONSE_SIZE;
-
 const MAX_SIGNATURE_AGE: u64 = 300;
-
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs()
-}
 
 pub trait SynapseHandler: Send + Sync {
     fn handle(
@@ -156,6 +148,17 @@ impl LightningServer {
 
     pub async fn serve_forever(&mut self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
+            let nonces_for_cleanup = self.used_nonces.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let mut nonces = nonces_for_cleanup.write().await;
+                    let cutoff = unix_timestamp_secs().saturating_sub(MAX_SIGNATURE_AGE);
+                    nonces.retain(|_, ts| *ts > cutoff);
+                }
+            });
+
             while let Some(conn) = endpoint.accept().await {
                 let connections = self.connections.clone();
                 let synapse_handlers = self.synapse_handlers.clone();
@@ -323,7 +326,7 @@ impl LightningServer {
             HandshakeResponse {
                 miner_hotkey: miner_hotkey.clone(),
                 timestamp: now,
-                signature: Self::sign_handshake_response(&request, &miner_keypair),
+                signature: Self::sign_handshake_response(&request, &miner_keypair, now),
                 accepted: true,
                 connection_id,
             }
@@ -415,8 +418,8 @@ impl LightningServer {
     fn sign_handshake_response(
         request: &HandshakeRequest,
         miner_keypair: &Option<[u8; 32]>,
+        timestamp: u64,
     ) -> String {
-        let timestamp = unix_timestamp_secs();
         let message = format!(
             "handshake_response:{}:{}",
             request.validator_hotkey, timestamp
@@ -559,7 +562,7 @@ impl LightningServer {
 
         let mut to_remove = Vec::new();
         for (validator, connection) in connections.iter() {
-            if now - connection.last_activity > max_idle_seconds {
+            if now.saturating_sub(connection.last_activity) > max_idle_seconds {
                 to_remove.push(validator.clone());
             }
         }

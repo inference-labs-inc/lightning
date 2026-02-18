@@ -4,6 +4,7 @@ pub mod error;
 pub mod server;
 pub mod signing;
 pub mod types;
+pub mod util;
 
 pub use client::LightningClient;
 pub use error::{LightningError, Result};
