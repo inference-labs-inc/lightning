@@ -21,8 +21,8 @@ impl Signer for PythonSigner {
             .lock()
             .map_err(|e| LightningError::Signing(format!("lock poisoned: {}", e)))?;
         Python::with_gil(|py| {
-            let message_str = std::str::from_utf8(message)
-                .map_err(|e| LightningError::Signing(e.to_string()))?;
+            let message_str =
+                std::str::from_utf8(message).map_err(|e| LightningError::Signing(e.to_string()))?;
             let result = callback.call1(py, (message_str,)).map_err(|e| {
                 LightningError::Signing(format!("Python signer call failed: {}", e))
             })?;

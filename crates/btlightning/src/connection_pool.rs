@@ -23,16 +23,14 @@ impl Connection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ConnectionPool {
     connections: HashMap<String, Connection>,
 }
 
 impl ConnectionPool {
     pub fn new() -> Self {
-        Self {
-            connections: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn add_connection(&mut self, endpoint: &str, connection_id: String) {

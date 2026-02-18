@@ -163,9 +163,9 @@ impl LightningClient {
         let mut client_config = ClientConfig::new(Arc::new(tls_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e| {
-            LightningError::Config(format!("Failed to parse bind address: {}", e))
-        })?;
+        let bind_addr: SocketAddr = "0.0.0.0:0"
+            .parse()
+            .map_err(|e| LightningError::Config(format!("Failed to parse bind address: {}", e)))?;
         let mut endpoint = Endpoint::client(bind_addr).map_err(|e| {
             LightningError::Connection(format!("Failed to create QUIC endpoint: {}", e))
         })?;
@@ -192,7 +192,10 @@ impl LightningClient {
             Some(conn) if conn.close_reason().is_none() => {
                 send_synapse_packet(&conn, request).await
             }
-            _ => self.try_reconnect_and_query(&miner_key, &axon_info, request).await,
+            _ => {
+                self.try_reconnect_and_query(&miner_key, &axon_info, request)
+                    .await
+            }
         }
     }
 
@@ -268,13 +271,12 @@ impl LightningClient {
             }
             Err(e) => {
                 let mut states = self.reconnect_states.write().await;
-                let state =
-                    states
-                        .entry(miner_key.to_string())
-                        .or_insert_with(|| ReconnectState {
-                            attempts: 0,
-                            next_retry_at: Instant::now(),
-                        });
+                let state = states
+                    .entry(miner_key.to_string())
+                    .or_insert_with(|| ReconnectState {
+                        attempts: 0,
+                        next_retry_at: Instant::now(),
+                    });
                 state.attempts += 1;
                 let shift = state.attempts.min(20);
                 let backoff = (self.config.reconnect_initial_backoff * 2u32.pow(shift))
@@ -315,7 +317,7 @@ impl LightningClient {
                 }
             }
 
-            for (key, _) in &current_miners {
+            for key in current_miners.keys() {
                 if reconnect_states.remove(key).is_some() {
                     info!("Registry refresh reset reconnection backoff for {}", key);
                 }
@@ -331,9 +333,7 @@ impl LightningClient {
             let endpoint = self
                 .endpoint
                 .as_ref()
-                .ok_or_else(|| {
-                    LightningError::Connection("QUIC endpoint not initialized".into())
-                })?
+                .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?
                 .clone();
             let wallet_hotkey = self.wallet_hotkey.clone();
             let signer = self
@@ -377,8 +377,12 @@ impl LightningClient {
                             if active_miners.contains_key(&key) {
                                 connection.close(0u32.into(), b"duplicate");
                             } else {
-                                let connection_id =
-                                    format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
+                                let connection_id = format!(
+                                    "{}:{}:{}",
+                                    miner.ip,
+                                    miner.port,
+                                    unix_timestamp_millis()
+                                );
                                 pool.add_connection(&key, connection_id);
                                 active_miners.insert(key.clone(), miner);
                                 connections.insert(key, connection);
@@ -456,9 +460,7 @@ async fn connect_and_handshake(
         .connect(addr, &miner.ip)
         .map_err(|e| LightningError::Connection(format!("Connection failed: {}", e)))?
         .await
-        .map_err(|e| {
-            LightningError::Connection(format!("Connection handshake failed: {}", e))
-        })?;
+        .map_err(|e| LightningError::Connection(format!("Connection handshake failed: {}", e)))?;
 
     let nonce = generate_nonce();
     let timestamp = unix_timestamp_secs();
@@ -502,12 +504,9 @@ async fn send_handshake(
         LightningError::Transport(format!("Failed to finish sending handshake: {}", e))
     })?;
 
-    let buffer = recv
-        .read_to_end(MAX_RESPONSE_SIZE)
-        .await
-        .map_err(|e| {
-            LightningError::Transport(format!("Failed to read handshake response: {}", e))
-        })?;
+    let buffer = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| {
+        LightningError::Transport(format!("Failed to read handshake response: {}", e))
+    })?;
 
     let response: HandshakeResponse = serde_json::from_slice(&buffer).map_err(|e| {
         LightningError::Serialization(format!("Failed to parse handshake response: {}", e))
@@ -520,9 +519,10 @@ async fn send_synapse_packet(
     connection: &Connection,
     request: QuicRequest,
 ) -> Result<QuicResponse> {
-    let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
-        LightningError::Connection(format!("Failed to open stream: {}", e))
-    })?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| LightningError::Connection(format!("Failed to open stream: {}", e)))?;
 
     let synapse_packet = SynapsePacket {
         synapse_type: request.synapse_type,
@@ -536,25 +536,23 @@ async fn send_synapse_packet(
 
     let start = Instant::now();
 
-    send.write_all(&packet_bytes).await.map_err(|e| {
-        LightningError::Transport(format!("Failed to send synapse packet: {}", e))
-    })?;
-    send.finish().await.map_err(|e| {
-        LightningError::Transport(format!("Failed to finish sending: {}", e))
-    })?;
+    send.write_all(&packet_bytes)
+        .await
+        .map_err(|e| LightningError::Transport(format!("Failed to send synapse packet: {}", e)))?;
+    send.finish()
+        .await
+        .map_err(|e| LightningError::Transport(format!("Failed to finish sending: {}", e)))?;
 
-    let buffer = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| {
-        LightningError::Transport(format!("Failed to read response: {}", e))
-    })?;
+    let buffer = recv
+        .read_to_end(MAX_RESPONSE_SIZE)
+        .await
+        .map_err(|e| LightningError::Transport(format!("Failed to read response: {}", e)))?;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let synapse_response: crate::types::SynapseResponse =
         serde_json::from_slice(&buffer).map_err(|e| {
-            LightningError::Serialization(format!(
-                "Failed to parse synapse response: {}",
-                e
-            ))
+            LightningError::Serialization(format!("Failed to parse synapse response: {}", e))
         })?;
 
     Ok(QuicResponse {

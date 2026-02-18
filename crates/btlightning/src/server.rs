@@ -118,10 +118,12 @@ impl LightningServer {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting Lightning QUIC server on {}:{}", self.host, self.port);
-        let (certs, key) = Self::create_self_signed_cert().map_err(|e| {
-            LightningError::Config(format!("Failed to create certificate: {}", e))
-        })?;
+        info!(
+            "Starting Lightning QUIC server on {}:{}",
+            self.host, self.port
+        );
+        let (certs, key) = Self::create_self_signed_cert()
+            .map_err(|e| LightningError::Config(format!("Failed to create certificate: {}", e)))?;
 
         let mut server_config = RustlsServerConfig::builder()
             .with_safe_defaults()
@@ -131,9 +133,8 @@ impl LightningServer {
 
         server_config.alpn_protocols = vec![b"lightning-quic".to_vec()];
         let mut transport_config = TransportConfig::default();
-        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150)).map_err(|e| {
-            LightningError::Config(format!("Failed to set idle timeout: {}", e))
-        })?;
+        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150))
+            .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
         transport_config.max_idle_timeout(Some(idle_timeout));
         transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
 
@@ -243,6 +244,7 @@ impl LightningServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_stream(
         mut send: SendStream,
         mut recv: RecvStream,
@@ -358,8 +360,7 @@ impl LightningServer {
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) -> HandshakeResponse {
-        let is_valid =
-            Self::verify_validator_signature(&request, used_nonces).await;
+        let is_valid = Self::verify_validator_signature(&request, used_nonces).await;
 
         if is_valid {
             let now = unix_timestamp_secs();
@@ -381,7 +382,9 @@ impl LightningServer {
                 connection.clone(),
             );
             validator_conn.verify();
-            if let Some(prev_conn) = connections_guard.insert(request.validator_hotkey.clone(), validator_conn) {
+            if let Some(prev_conn) =
+                connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
+            {
                 let prev_addr = prev_conn.connection.remote_address();
                 if prev_addr != remote_addr {
                     addr_index.remove(&prev_addr);
@@ -447,10 +450,7 @@ impl LightningServer {
         let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
             Ok(pk) => pk,
             Err(e) => {
-                error!(
-                    "Invalid SS58 address {}: {}",
-                    request.validator_hotkey, e
-                );
+                error!("Invalid SS58 address {}: {}", request.validator_hotkey, e);
                 return false;
             }
         };
@@ -562,10 +562,7 @@ impl LightningServer {
                     validator_hotkey
                 );
             } else {
-                error!(
-                    "No connection found for validator {}",
-                    validator_hotkey
-                );
+                error!("No connection found for validator {}", validator_hotkey);
                 return SynapseResponse {
                     success: false,
                     data: HashMap::new(),
@@ -655,10 +652,7 @@ impl LightningServer {
         for (validator, remote_addr) in &to_remove {
             if let Some(connection) = connections.remove(validator) {
                 connection.connection.close(0u32.into(), b"cleanup");
-                info!(
-                    "Cleaned up stale connection from validator: {}",
-                    validator
-                );
+                info!("Cleaned up stale connection from validator: {}", validator);
             }
             addr_index.remove(remote_addr);
         }

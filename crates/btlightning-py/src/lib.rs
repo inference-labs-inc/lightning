@@ -99,7 +99,9 @@ impl RustLightning {
         py.allow_threads(|| {
             runtime.block_on(async {
                 let mut client = self.client.write().await;
-                client.set_signer(Box::new(btlightning::Sr25519Signer::from_seed(keypair_seed)));
+                client.set_signer(Box::new(btlightning::Sr25519Signer::from_seed(
+                    keypair_seed,
+                )));
             })
         });
         Ok(())
@@ -116,11 +118,7 @@ impl RustLightning {
         Ok(())
     }
 
-    pub fn initialize_connections(
-        &self,
-        py: Python<'_>,
-        miners: Vec<PyObject>,
-    ) -> PyResult<()> {
+    pub fn initialize_connections(&self, py: Python<'_>, miners: Vec<PyObject>) -> PyResult<()> {
         let mut quic_miners = Vec::new();
         for miner_obj in miners {
             quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
@@ -210,11 +208,7 @@ impl RustLightning {
         Ok(result_dict.into())
     }
 
-    pub fn update_miner_registry(
-        &self,
-        py: Python<'_>,
-        miners: Vec<PyObject>,
-    ) -> PyResult<()> {
+    pub fn update_miner_registry(&self, py: Python<'_>, miners: Vec<PyObject>) -> PyResult<()> {
         let mut quic_miners = Vec::new();
         for miner_obj in miners {
             quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
@@ -295,11 +289,12 @@ impl RustLightningServer {
         py.allow_threads(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
-                server.register_synapse_handler(
-                    synapse_type,
-                    Arc::new(PythonSynapseHandler::new(handler)),
-                )
-                .await
+                server
+                    .register_synapse_handler(
+                        synapse_type,
+                        Arc::new(PythonSynapseHandler::new(handler)),
+                    )
+                    .await
             })
         })
         .map_err(to_pyerr)
@@ -345,11 +340,7 @@ impl RustLightningServer {
         Ok(result_dict.into())
     }
 
-    pub fn cleanup_stale_connections(
-        &self,
-        py: Python<'_>,
-        max_idle_seconds: u64,
-    ) -> PyResult<()> {
+    pub fn cleanup_stale_connections(&self, py: Python<'_>, max_idle_seconds: u64) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
         py.allow_threads(|| {
             runtime.block_on(async {
@@ -372,10 +363,7 @@ impl RustLightningServer {
     }
 }
 
-fn extract_quic_axon_info(
-    py: Python,
-    miner_obj: &PyObject,
-) -> PyResult<btlightning::QuicAxonInfo> {
+fn extract_quic_axon_info(py: Python, miner_obj: &PyObject) -> PyResult<btlightning::QuicAxonInfo> {
     let miner_dict = miner_obj.extract::<HashMap<String, PyObject>>(py)?;
 
     let hotkey = miner_dict
