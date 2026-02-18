@@ -24,12 +24,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
+            zig: false
           - os: ubuntu-latest
             target: aarch64
+            zig: true
           - os: macos-14
             target: x86_64
+            zig: false
           - os: macos-14
             target: aarch64
+            zig: false
 
     steps:
       - uses: actions/checkout@v6
@@ -38,15 +42,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install aarch64 cross-compilation toolchain
-        if: matrix.target == 'aarch64' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist ${{ matrix.zig && '--zig' || '' }}
           container: "off"
           working-directory: crates/btlightning-py
 
