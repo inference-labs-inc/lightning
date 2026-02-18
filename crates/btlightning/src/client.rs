@@ -4,13 +4,14 @@ use crate::signing::Signer;
 use crate::types::{
     HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket,
 };
+use crate::util::{unix_timestamp_millis, unix_timestamp_secs, MAX_RESPONSE_SIZE};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
-use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
+use rustls::ClientConfig as RustlsClientConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -43,29 +44,26 @@ impl LightningClient {
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
 
-        let mut active_miners = self.active_miners.write().await;
-        let mut pool = self.connection_pool.write().await;
-
+        let mut results = Vec::new();
         for miner in miners {
             let miner_key = format!("{}:{}", miner.ip, miner.port);
+            let result = self.establish_connection_with_handshake(&miner).await;
+            results.push((miner_key, miner, result));
+        }
 
-            match self.establish_connection_with_handshake(&miner).await {
+        let mut active_miners = self.active_miners.write().await;
+        let mut pool = self.connection_pool.write().await;
+        let mut connections = self.established_connections.write().await;
+
+        for (miner_key, miner, result) in results {
+            match result {
                 Ok(connection) => {
-                    let connection_id = format!(
-                        "{}:{}:{}",
-                        miner.ip,
-                        miner.port,
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis()
-                    );
+                    let connection_id =
+                        format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
 
                     pool.add_connection(&miner_key, connection_id.clone())
                         .await;
                     active_miners.insert(miner_key.clone(), miner);
-
-                    let mut connections = self.established_connections.write().await;
                     connections.insert(miner_key.clone(), connection);
 
                     info!(
@@ -83,8 +81,6 @@ impl LightningClient {
     }
 
     pub async fn create_endpoint(&mut self) -> Result<()> {
-        let _root_store = RootCertStore::empty();
-
         let mut tls_config = RustlsClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCertVerifier))
@@ -102,7 +98,12 @@ impl LightningClient {
         let mut client_config = ClientConfig::new(Arc::new(tls_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        let bind_addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e| {
+            LightningError::Config(format!("Failed to parse bind address: {}", e))
+        })?;
+        let mut endpoint = Endpoint::client(bind_addr).map_err(|e| {
+            LightningError::Connection(format!("Failed to create QUIC endpoint: {}", e))
+        })?;
         endpoint.set_default_client_config(client_config);
         self.endpoint = Some(endpoint);
 
@@ -113,41 +114,41 @@ impl LightningClient {
     async fn establish_connection_with_handshake(
         &self,
         miner: &QuicAxonInfo,
-    ) -> std::result::Result<Connection, String> {
-        if let Some(endpoint) = &self.endpoint {
-            let addr: SocketAddr = format!("{}:{}", miner.ip, miner.port)
-                .parse()
-                .map_err(|e| format!("Invalid address: {}", e))?;
+    ) -> Result<Connection> {
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?;
 
-            let server_name = &miner.ip;
-            let connection = endpoint
-                .connect(addr, server_name)
-                .map_err(|e| format!("Connection failed: {}", e))?
-                .await
-                .map_err(|e| format!("Connection handshake failed: {}", e))?;
+        let addr: SocketAddr = format!("{}:{}", miner.ip, miner.port)
+            .parse()
+            .map_err(|e| LightningError::Connection(format!("Invalid address: {}", e)))?;
 
-            let handshake_request = HandshakeRequest {
-                validator_hotkey: self.wallet_hotkey.clone(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                signature: self.sign_handshake_message(miner).await?,
-            };
+        let connection = endpoint
+            .connect(addr, &miner.ip)
+            .map_err(|e| LightningError::Connection(format!("Connection failed: {}", e)))?
+            .await
+            .map_err(|e| {
+                LightningError::Connection(format!("Connection handshake failed: {}", e))
+            })?;
 
-            match self.send_handshake(&connection, handshake_request).await {
-                Ok(response) => {
-                    if response.accepted {
-                        info!("Handshake successful with miner {}", miner.hotkey);
-                        Ok(connection)
-                    } else {
-                        Err("Handshake rejected by miner".to_string())
-                    }
-                }
-                Err(e) => Err(format!("Handshake failed: {}", e)),
-            }
+        let nonce = generate_nonce();
+        let timestamp = unix_timestamp_secs();
+        let handshake_request = HandshakeRequest {
+            validator_hotkey: self.wallet_hotkey.clone(),
+            timestamp,
+            nonce: nonce.clone(),
+            signature: self.sign_handshake_message(&nonce, timestamp)?,
+        };
+
+        let response = self.send_handshake(&connection, handshake_request).await?;
+        if response.accepted {
+            info!("Handshake successful with miner {}", miner.hotkey);
+            Ok(connection)
         } else {
-            Err("QUIC endpoint not initialized".to_string())
+            Err(LightningError::Handshake(
+                "Handshake rejected by miner".into(),
+            ))
         }
     }
 
@@ -155,71 +156,49 @@ impl LightningClient {
         &self,
         connection: &Connection,
         request: HandshakeRequest,
-    ) -> std::result::Result<HandshakeResponse, String> {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
+    ) -> Result<HandshakeResponse> {
+        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+            LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
+        })?;
 
-        let handshake_data = serde_json::to_value(&request)
-            .map_err(|e| format!("Failed to serialize handshake data: {}", e))?;
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            LightningError::Serialization(format!("Failed to serialize handshake: {}", e))
+        })?;
 
-        let synapse_packet = SynapsePacket {
-            synapse_type: "Handshake".to_string(),
-            data: handshake_data
-                .as_object()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .collect(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        };
-
-        let packet_json = serde_json::to_string(&synapse_packet)
-            .map_err(|e| format!("Failed to serialize synapse packet: {}", e))?;
-
-        send.write_all(packet_json.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to send handshake packet: {}", e))?;
-        send.finish()
-            .await
-            .map_err(|e| format!("Failed to finish sending handshake: {}", e))?;
+        send.write_all(request_json.as_bytes()).await.map_err(|e| {
+            LightningError::Transport(format!("Failed to send handshake packet: {}", e))
+        })?;
+        send.finish().await.map_err(|e| {
+            LightningError::Transport(format!("Failed to finish sending handshake: {}", e))
+        })?;
 
         let buffer = recv
-            .read_to_end(1024 * 1024)
+            .read_to_end(MAX_RESPONSE_SIZE)
             .await
-            .map_err(|e| format!("Failed to read handshake response: {}", e))?;
+            .map_err(|e| {
+                LightningError::Transport(format!("Failed to read handshake response: {}", e))
+            })?;
 
-        let response_str =
-            String::from_utf8(buffer).map_err(|e| format!("Invalid UTF-8 in response: {}", e))?;
+        let response_str = String::from_utf8(buffer).map_err(|e| {
+            LightningError::Serialization(format!("Invalid UTF-8 in response: {}", e))
+        })?;
 
-        let response: HandshakeResponse = serde_json::from_str(&response_str)
-            .map_err(|e| format!("Failed to parse handshake response: {}", e))?;
+        let response: HandshakeResponse = serde_json::from_str(&response_str).map_err(|e| {
+            LightningError::Serialization(format!("Failed to parse handshake response: {}", e))
+        })?;
 
         Ok(response)
     }
 
-    async fn sign_handshake_message(
-        &self,
-        _miner: &QuicAxonInfo,
-    ) -> std::result::Result<String, String> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let message = format!("handshake:{}:{}", self.wallet_hotkey, timestamp);
+    fn sign_handshake_message(&self, nonce: &str, timestamp: u64) -> Result<String> {
+        let message = format!("handshake:{}:{}:{}", self.wallet_hotkey, timestamp, nonce);
 
         match &self.signer {
             Some(signer) => {
-                let signature_bytes = signer
-                    .sign(message.as_bytes())
-                    .map_err(|e| format!("Signing failed: {}", e))?;
+                let signature_bytes = signer.sign(message.as_bytes())?;
                 Ok(BASE64_STANDARD.encode(&signature_bytes))
             }
-            None => Err("No signer configured".to_string()),
+            None => Err(LightningError::Signing("No signer configured".into())),
         }
     }
 
@@ -232,8 +211,13 @@ impl LightningClient {
 
         let connections = self.established_connections.read().await;
         if let Some(connection) = connections.get(&miner_key) {
-            self.send_synapse_packet(connection, &axon_info, request)
-                .await
+            if connection.close_reason().is_some() {
+                return Err(LightningError::Connection(format!(
+                    "Connection to miner {} is closed",
+                    miner_key
+                )));
+            }
+            self.send_synapse_packet(connection, request).await
         } else {
             Err(LightningError::Connection(format!(
                 "No persistent QUIC connection to miner: {}",
@@ -245,7 +229,6 @@ impl LightningClient {
     async fn send_synapse_packet(
         &self,
         connection: &Connection,
-        _axon_info: &QuicAxonInfo,
         request: QuicRequest,
     ) -> Result<QuicResponse> {
         let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
@@ -255,10 +238,7 @@ impl LightningClient {
         let synapse_packet = SynapsePacket {
             synapse_type: request.synapse_type.clone(),
             data: request.data.clone(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: unix_timestamp_secs(),
         };
 
         let packet_json = serde_json::to_string(&synapse_packet).map_err(|e| {
@@ -272,7 +252,7 @@ impl LightningClient {
             LightningError::Transport(format!("Failed to finish sending: {}", e))
         })?;
 
-        let buffer = recv.read_to_end(1024 * 1024).await.map_err(|e| {
+        let buffer = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| {
             LightningError::Transport(format!("Failed to read response: {}", e))
         })?;
 
@@ -301,36 +281,47 @@ impl LightningClient {
             .map(|m| (format!("{}:{}", m.ip, m.port), m.clone()))
             .collect();
 
-        let mut active_miners = self.active_miners.write().await;
-        let mut pool = self.connection_pool.write().await;
-        let mut connections = self.established_connections.write().await;
+        let new_miner_keys: Vec<(String, QuicAxonInfo)>;
+        {
+            let mut active_miners = self.active_miners.write().await;
+            let mut pool = self.connection_pool.write().await;
+            let mut connections = self.established_connections.write().await;
 
-        let active_keys: Vec<String> = active_miners.keys().cloned().collect();
-        for key in active_keys {
-            if !current_miners.contains_key(&key) {
-                info!("Miner deregistered, closing QUIC connection: {}", key);
-                if let Some(connection) = connections.remove(&key) {
-                    connection.close(0u32.into(), b"miner_deregistered");
+            let active_keys: Vec<String> = active_miners.keys().cloned().collect();
+            for key in active_keys {
+                if !current_miners.contains_key(&key) {
+                    info!("Miner deregistered, closing QUIC connection: {}", key);
+                    if let Some(connection) = connections.remove(&key) {
+                        connection.close(0u32.into(), b"miner_deregistered");
+                    }
+                    pool.remove_connection(&key).await;
+                    active_miners.remove(&key);
                 }
-                pool.remove_connection(&key).await;
-                active_miners.remove(&key);
             }
+
+            new_miner_keys = current_miners
+                .into_iter()
+                .filter(|(key, _)| !active_miners.contains_key(key))
+                .collect();
         }
 
-        for (key, miner) in current_miners {
-            if !active_miners.contains_key(&key) {
-                info!("New miner detected, establishing QUIC connection: {}", key);
-                match self.establish_connection_with_handshake(&miner).await {
+        let mut results = Vec::new();
+        for (key, miner) in new_miner_keys {
+            info!("New miner detected, establishing QUIC connection: {}", key);
+            let result = self.establish_connection_with_handshake(&miner).await;
+            results.push((key, miner, result));
+        }
+
+        if !results.is_empty() {
+            let mut active_miners = self.active_miners.write().await;
+            let mut pool = self.connection_pool.write().await;
+            let mut connections = self.established_connections.write().await;
+
+            for (key, miner, result) in results {
+                match result {
                     Ok(connection) => {
-                        let connection_id = format!(
-                            "{}:{}:{}",
-                            miner.ip,
-                            miner.port,
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis()
-                        );
+                        let connection_id =
+                            format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
 
                         pool.add_connection(&key, connection_id).await;
                         active_miners.insert(key.clone(), miner);
@@ -386,6 +377,12 @@ impl LightningClient {
         info!("All Lightning QUIC connections closed");
         Ok(())
     }
+}
+
+fn generate_nonce() -> String {
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
 struct AcceptAnyCertVerifier;

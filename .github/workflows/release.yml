@@ -40,7 +40,6 @@ jobs:
           sed -i.bak "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml
           sed -i.bak "s/^version = \".*\"/version = \"$V\"/" crates/btlightning-py/pyproject.toml
           rm -f crates/btlightning/Cargo.toml.bak crates/btlightning-py/Cargo.toml.bak crates/btlightning-py/pyproject.toml.bak
-          cp README.md crates/btlightning-py/README.md
 
       - uses: actions/setup-python@v6
         with:
@@ -70,7 +69,6 @@ jobs:
         run: |
           V="${VERSION#v}"
           sed -i "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml crates/btlightning-py/pyproject.toml
-          cp README.md crates/btlightning-py/README.md
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1

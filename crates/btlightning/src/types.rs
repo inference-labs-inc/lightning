@@ -54,6 +54,7 @@ pub struct QuicResponse {
 pub struct HandshakeRequest {
     pub validator_hotkey: String,
     pub timestamp: u64,
+    pub nonce: String,
     pub signature: String,
 }
 
