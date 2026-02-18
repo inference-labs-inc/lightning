@@ -61,7 +61,7 @@ impl LightningClient {
                     let connection_id =
                         format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
 
-                    pool.add_connection(&miner_key, connection_id.clone());
+                    pool.add_connection(&miner_key, connection_id);
                     active_miners.insert(miner_key.clone(), miner);
                     info!(
                         "Established persistent QUIC connection to miner: {}",

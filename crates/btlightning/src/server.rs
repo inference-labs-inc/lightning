@@ -9,10 +9,15 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+fn synapse_finder() -> &'static memchr::memmem::Finder<'static> {
+    static FINDER: OnceLock<memchr::memmem::Finder<'static>> = OnceLock::new();
+    FINDER.get_or_init(|| memchr::memmem::Finder::new(b"\"synapse_type\""))
+}
 
 const MAX_SIGNATURE_AGE: u64 = 300;
 
@@ -251,7 +256,7 @@ impl LightningServer {
     ) {
         match recv.read_to_end(MAX_RESPONSE_SIZE).await {
             Ok(buffer) => {
-                if memchr::memmem::find(&buffer, b"\"synapse_type\"").is_some() {
+                if synapse_finder().find(&buffer).is_some() {
                     match serde_json::from_slice::<SynapsePacket>(&buffer) {
                         Ok(synapse_packet) => {
                             let response = Self::process_synapse_packet(
@@ -270,6 +275,16 @@ impl LightningServer {
                         }
                         Err(e) => {
                             warn!("Failed to parse synapse packet: {}", e);
+                            let err_response = SynapseResponse {
+                                success: false,
+                                data: HashMap::new(),
+                                timestamp: unix_timestamp_secs(),
+                                error: Some(e.to_string()),
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&err_response) {
+                                let _ = send.write_all(&bytes).await;
+                                let _ = send.finish().await;
+                            }
                         }
                     }
                 } else {
@@ -293,6 +308,17 @@ impl LightningServer {
                         }
                         Err(e) => {
                             warn!("Unknown message format received: {}", e);
+                            let err_response = HandshakeResponse {
+                                miner_hotkey,
+                                timestamp: unix_timestamp_secs(),
+                                signature: String::new(),
+                                accepted: false,
+                                connection_id: String::new(),
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&err_response) {
+                                let _ = send.write_all(&bytes).await;
+                                let _ = send.finish().await;
+                            }
                         }
                     }
                 }
@@ -328,6 +354,7 @@ impl LightningServer {
 
             let remote_addr = connection.remote_address();
             let mut connections_guard = connections.write().await;
+            let mut addr_index = addr_to_hotkey.write().await;
             let mut validator_conn = ValidatorConnection::new(
                 request.validator_hotkey.clone(),
                 connection_id.clone(),
@@ -335,11 +362,9 @@ impl LightningServer {
             );
             validator_conn.verify();
             connections_guard.insert(request.validator_hotkey.clone(), validator_conn);
-            drop(connections_guard);
-
-            let mut addr_index = addr_to_hotkey.write().await;
             addr_index.insert(remote_addr, request.validator_hotkey.clone());
             drop(addr_index);
+            drop(connections_guard);
 
             info!(
                 "Handshake successful, established connection: {}",
@@ -474,16 +499,21 @@ impl LightningServer {
 
         let validator_hotkey = {
             let addr_index = addr_to_hotkey.read().await;
-            addr_index
-                .get(&connection.remote_address())
-                .cloned()
-                .unwrap_or_else(|| {
-                    warn!(
-                        "No validator found for connection from {}",
+            match addr_index.get(&connection.remote_address()).cloned() {
+                Some(hotkey) => hotkey,
+                None => {
+                    error!(
+                        "Unknown or unauthenticated connection from {}",
                         connection.remote_address()
                     );
-                    "unknown_validator".to_string()
-                })
+                    return SynapseResponse {
+                        success: false,
+                        data: HashMap::new(),
+                        timestamp: unix_timestamp_secs(),
+                        error: Some("Unknown or unauthenticated validator".to_string()),
+                    };
+                }
+            }
         };
 
         {
@@ -507,10 +537,16 @@ impl LightningServer {
                     validator_hotkey
                 );
             } else {
-                warn!(
-                    "No connection found for validator {}, allowing request to proceed",
+                error!(
+                    "No connection found for validator {}",
                     validator_hotkey
                 );
+                return SynapseResponse {
+                    success: false,
+                    data: HashMap::new(),
+                    timestamp: unix_timestamp_secs(),
+                    error: Some("Unknown or unauthenticated validator".to_string()),
+                };
             }
         }
 
