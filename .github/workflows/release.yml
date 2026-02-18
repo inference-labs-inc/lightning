@@ -18,10 +18,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-            container: messense/manylinux2014-cross:x86_64
           - os: ubuntu-latest
             target: aarch64
-            container: messense/manylinux2014-cross:aarch64
           - os: macos-14
             target: x86_64
           - os: macos-14
@@ -39,7 +37,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          container: ${{ matrix.container || '' }}
+          container: "off"
           working-directory: crates/btlightning-py
 
       - name: Upload wheels
