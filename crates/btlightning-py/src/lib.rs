@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 mod handler;
@@ -40,7 +41,24 @@ pub struct RustLightning {
 #[pymethods]
 impl RustLightning {
     #[new]
-    pub fn new(wallet_hotkey: String) -> PyResult<Self> {
+    #[pyo3(signature = (
+        wallet_hotkey,
+        connect_timeout_secs=None,
+        idle_timeout_secs=None,
+        keep_alive_interval_secs=None,
+        reconnect_initial_backoff_secs=None,
+        reconnect_max_backoff_secs=None,
+        reconnect_max_retries=None,
+    ))]
+    pub fn new(
+        wallet_hotkey: String,
+        connect_timeout_secs: Option<u64>,
+        idle_timeout_secs: Option<u64>,
+        keep_alive_interval_secs: Option<u64>,
+        reconnect_initial_backoff_secs: Option<u64>,
+        reconnect_max_backoff_secs: Option<u64>,
+        reconnect_max_retries: Option<u32>,
+    ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Failed to create async runtime: {}",
@@ -48,7 +66,27 @@ impl RustLightning {
             ))
         })?);
 
-        let client = btlightning::LightningClient::new(wallet_hotkey);
+        let mut config = btlightning::ClientConfig_::default();
+        if let Some(v) = connect_timeout_secs {
+            config.connect_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = idle_timeout_secs {
+            config.idle_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = keep_alive_interval_secs {
+            config.keep_alive_interval = Duration::from_secs(v);
+        }
+        if let Some(v) = reconnect_initial_backoff_secs {
+            config.reconnect_initial_backoff = Duration::from_secs(v);
+        }
+        if let Some(v) = reconnect_max_backoff_secs {
+            config.reconnect_max_backoff = Duration::from_secs(v);
+        }
+        if let Some(v) = reconnect_max_retries {
+            config.reconnect_max_retries = v;
+        }
+
+        let client = btlightning::LightningClient::with_config(wallet_hotkey, config);
 
         Ok(Self {
             client: RwLock::new(client),

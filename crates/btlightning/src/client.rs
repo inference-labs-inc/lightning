@@ -13,27 +13,61 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tokio::time::Instant;
+use tracing::{error, info, warn};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub struct ClientConfig_ {
+    pub connect_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub keep_alive_interval: Duration,
+    pub reconnect_initial_backoff: Duration,
+    pub reconnect_max_backoff: Duration,
+    pub reconnect_max_retries: u32,
+}
+
+impl Default for ClientConfig_ {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(150),
+            keep_alive_interval: Duration::from_secs(30),
+            reconnect_initial_backoff: Duration::from_secs(1),
+            reconnect_max_backoff: Duration::from_secs(60),
+            reconnect_max_retries: 5,
+        }
+    }
+}
+
+struct ReconnectState {
+    attempts: u32,
+    next_retry_at: Instant,
+}
 
 pub struct LightningClient {
+    config: ClientConfig_,
     wallet_hotkey: String,
     signer: Option<Arc<dyn Signer>>,
     connection_pool: Arc<RwLock<ConnectionPool>>,
     active_miners: Arc<RwLock<HashMap<String, QuicAxonInfo>>>,
     established_connections: Arc<RwLock<HashMap<String, Connection>>>,
+    reconnect_states: Arc<RwLock<HashMap<String, ReconnectState>>>,
     endpoint: Option<Endpoint>,
 }
 
 impl LightningClient {
     pub fn new(wallet_hotkey: String) -> Self {
+        Self::with_config(wallet_hotkey, ClientConfig_::default())
+    }
+
+    pub fn with_config(wallet_hotkey: String, config: ClientConfig_) -> Self {
         Self {
+            config,
             wallet_hotkey,
             signer: None,
             connection_pool: Arc::new(RwLock::new(ConnectionPool::new())),
             active_miners: Arc::new(RwLock::new(HashMap::new())),
             established_connections: Arc::new(RwLock::new(HashMap::new())),
+            reconnect_states: Arc::new(RwLock::new(HashMap::new())),
             endpoint: None,
         }
     }
@@ -57,6 +91,7 @@ impl LightningClient {
             .as_ref()
             .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
             .clone();
+        let timeout = self.config.connect_timeout;
 
         let mut set = tokio::task::JoinSet::new();
         for miner in miners {
@@ -65,11 +100,9 @@ impl LightningClient {
             let s = signer.clone();
             set.spawn(async move {
                 let miner_key = format!("{}:{}", miner.ip, miner.port);
-                let result = tokio::time::timeout(
-                    CONNECT_TIMEOUT,
-                    connect_and_handshake(ep, miner.clone(), wh, s),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(timeout, connect_and_handshake(ep, miner.clone(), wh, s))
+                        .await;
                 let result = match result {
                     Ok(r) => r,
                     Err(_) => Err(LightningError::Connection(format!(
@@ -122,10 +155,10 @@ impl LightningClient {
 
         let mut transport_config = TransportConfig::default();
 
-        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150))
+        let idle_timeout = IdleTimeout::try_from(self.config.idle_timeout)
             .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
         transport_config.max_idle_timeout(Some(idle_timeout));
-        transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
+        transport_config.keep_alive_interval(Some(self.config.keep_alive_interval));
 
         let mut client_config = ClientConfig::new(Arc::new(tls_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -152,26 +185,108 @@ impl LightningClient {
 
         let connection = {
             let connections = self.established_connections.read().await;
-            match connections.get(&miner_key) {
-                Some(conn) => {
-                    if conn.close_reason().is_some() {
-                        return Err(LightningError::Connection(format!(
-                            "Connection to miner {} is closed",
-                            miner_key
-                        )));
-                    }
-                    conn.clone()
-                }
-                None => {
+            connections.get(&miner_key).cloned()
+        };
+
+        match connection {
+            Some(conn) if conn.close_reason().is_none() => {
+                send_synapse_packet(&conn, request).await
+            }
+            _ => self.try_reconnect_and_query(&miner_key, &axon_info, request).await,
+        }
+    }
+
+    async fn try_reconnect_and_query(
+        &self,
+        miner_key: &str,
+        axon_info: &QuicAxonInfo,
+        request: QuicRequest,
+    ) -> Result<QuicResponse> {
+        {
+            let states = self.reconnect_states.read().await;
+            if let Some(state) = states.get(miner_key) {
+                if state.attempts >= self.config.reconnect_max_retries {
                     return Err(LightningError::Connection(format!(
-                        "No persistent QUIC connection to miner: {}",
-                        miner_key
+                        "Reconnection attempts exhausted for {} ({}/{}), awaiting registry refresh",
+                        miner_key, state.attempts, self.config.reconnect_max_retries
+                    )));
+                }
+                if Instant::now() < state.next_retry_at {
+                    return Err(LightningError::Connection(format!(
+                        "Reconnection to {} in backoff, next retry in {:?}",
+                        miner_key,
+                        state.next_retry_at - Instant::now()
                     )));
                 }
             }
+        }
+
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?
+            .clone();
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
+            .clone();
+
+        warn!("Connection to {} dead, attempting reconnection", miner_key);
+
+        let reconnect_result = tokio::time::timeout(
+            self.config.connect_timeout,
+            connect_and_handshake(
+                endpoint,
+                axon_info.clone(),
+                self.wallet_hotkey.clone(),
+                signer,
+            ),
+        )
+        .await;
+
+        let reconnect_result = match reconnect_result {
+            Ok(r) => r,
+            Err(_) => Err(LightningError::Connection(format!(
+                "Reconnection to {} timed out",
+                miner_key
+            ))),
         };
 
-        send_synapse_packet(&connection, request).await
+        match reconnect_result {
+            Ok(connection) => {
+                {
+                    let mut connections = self.established_connections.write().await;
+                    connections.insert(miner_key.to_string(), connection.clone());
+                }
+                {
+                    let mut states = self.reconnect_states.write().await;
+                    states.remove(miner_key);
+                }
+                info!("Reconnected to miner {}", miner_key);
+                send_synapse_packet(&connection, request).await
+            }
+            Err(e) => {
+                let mut states = self.reconnect_states.write().await;
+                let state =
+                    states
+                        .entry(miner_key.to_string())
+                        .or_insert_with(|| ReconnectState {
+                            attempts: 0,
+                            next_retry_at: Instant::now(),
+                        });
+                state.attempts += 1;
+                let shift = state.attempts.min(20);
+                let backoff = (self.config.reconnect_initial_backoff * 2u32.pow(shift))
+                    .min(self.config.reconnect_max_backoff);
+                state.next_retry_at = Instant::now() + backoff;
+                error!(
+                    "Reconnection to {} failed (attempt {}/{}), next retry in {:?}: {}",
+                    miner_key, state.attempts, self.config.reconnect_max_retries, backoff, e
+                );
+                Err(e)
+            }
+        }
     }
 
     pub async fn update_miner_registry(&self, miners: Vec<QuicAxonInfo>) -> Result<()> {
@@ -185,6 +300,7 @@ impl LightningClient {
             let mut active_miners = self.active_miners.write().await;
             let mut pool = self.connection_pool.write().await;
             let mut connections = self.established_connections.write().await;
+            let mut reconnect_states = self.reconnect_states.write().await;
 
             let active_keys: Vec<String> = active_miners.keys().cloned().collect();
             for key in active_keys {
@@ -195,6 +311,13 @@ impl LightningClient {
                     }
                     pool.remove_connection(&key);
                     active_miners.remove(&key);
+                    reconnect_states.remove(&key);
+                }
+            }
+
+            for (key, _) in &current_miners {
+                if reconnect_states.remove(key).is_some() {
+                    info!("Registry refresh reset reconnection backoff for {}", key);
                 }
             }
 
@@ -218,6 +341,7 @@ impl LightningClient {
                 .as_ref()
                 .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
                 .clone();
+            let timeout = self.config.connect_timeout;
 
             let mut set = tokio::task::JoinSet::new();
             for (key, miner) in new_miner_keys {
@@ -227,7 +351,7 @@ impl LightningClient {
                 let s = signer.clone();
                 set.spawn(async move {
                     let result = tokio::time::timeout(
-                        CONNECT_TIMEOUT,
+                        timeout,
                         connect_and_handshake(ep, miner.clone(), wh, s),
                     )
                     .await;
@@ -299,6 +423,7 @@ impl LightningClient {
         let mut pool = self.connection_pool.write().await;
         let mut active_miners = self.active_miners.write().await;
         let mut connections = self.established_connections.write().await;
+        let mut reconnect_states = self.reconnect_states.write().await;
 
         for (_, connection) in connections.drain() {
             connection.close(0u32.into(), b"client_shutdown");
@@ -306,6 +431,7 @@ impl LightningClient {
 
         pool.close_all();
         active_miners.clear();
+        reconnect_states.clear();
 
         info!("All Lightning QUIC connections closed");
         Ok(())

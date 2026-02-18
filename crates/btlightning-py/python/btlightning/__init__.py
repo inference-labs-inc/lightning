@@ -10,8 +10,25 @@ LIGHTNING_AVAILABLE = True
 
 
 class Lightning:
-    def __init__(self, wallet_hotkey: str):
-        self._rust_client = RustLightning(wallet_hotkey)
+    def __init__(
+        self,
+        wallet_hotkey: str,
+        connect_timeout_secs: Optional[int] = None,
+        idle_timeout_secs: Optional[int] = None,
+        keep_alive_interval_secs: Optional[int] = None,
+        reconnect_initial_backoff_secs: Optional[int] = None,
+        reconnect_max_backoff_secs: Optional[int] = None,
+        reconnect_max_retries: Optional[int] = None,
+    ):
+        self._rust_client = RustLightning(
+            wallet_hotkey,
+            connect_timeout_secs=connect_timeout_secs,
+            idle_timeout_secs=idle_timeout_secs,
+            keep_alive_interval_secs=keep_alive_interval_secs,
+            reconnect_initial_backoff_secs=reconnect_initial_backoff_secs,
+            reconnect_max_backoff_secs=reconnect_max_backoff_secs,
+            reconnect_max_retries=reconnect_max_retries,
+        )
         self.wallet_hotkey = wallet_hotkey
 
     def set_validator_keypair(self, keypair_seed: bytes) -> None:
