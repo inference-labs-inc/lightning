@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 mod handler;
 mod signer;
@@ -33,7 +33,7 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
 
 #[pyclass]
 pub struct RustLightning {
-    client: Mutex<btlightning::LightningClient>,
+    client: RwLock<btlightning::LightningClient>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -51,88 +51,101 @@ impl RustLightning {
         let client = btlightning::LightningClient::new(wallet_hotkey);
 
         Ok(Self {
-            client: Mutex::new(client),
+            client: RwLock::new(client),
             runtime,
         })
     }
 
-    pub fn set_validator_keypair(&self, keypair_seed: [u8; 32]) -> PyResult<()> {
+    pub fn set_validator_keypair(&self, py: Python<'_>, keypair_seed: [u8; 32]) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let mut client = self.client.lock().await;
-            client.set_signer(Box::new(btlightning::Sr25519Signer::from_seed(keypair_seed)));
-            Ok(())
-        })
-    }
-
-    pub fn set_python_signer(&self, signer_callback: PyObject) -> PyResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let mut client = self.client.lock().await;
-            client.set_signer(Box::new(PythonSigner::new(signer_callback)));
-            Ok(())
-        })
-    }
-
-    pub fn initialize_connections(&self, miners: Vec<PyObject>) -> PyResult<()> {
-        pyo3::Python::with_gil(|py| {
-            let mut quic_miners = Vec::new();
-
-            for miner_obj in miners {
-                quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
-            }
-
-            let runtime = Arc::clone(&self.runtime);
+        py.allow_threads(|| {
             runtime.block_on(async {
-                let mut client = self.client.lock().await;
-                client
-                    .initialize_connections(quic_miners)
-                    .await
-                    .map_err(to_pyerr)
+                let mut client = self.client.write().await;
+                client.set_signer(Box::new(btlightning::Sr25519Signer::from_seed(keypair_seed)));
+            })
+        });
+        Ok(())
+    }
+
+    pub fn set_python_signer(&self, py: Python<'_>, signer_callback: PyObject) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut client = self.client.write().await;
+                client.set_signer(Box::new(PythonSigner::new(signer_callback)));
+            })
+        });
+        Ok(())
+    }
+
+    pub fn initialize_connections(
+        &self,
+        py: Python<'_>,
+        miners: Vec<PyObject>,
+    ) -> PyResult<()> {
+        let mut quic_miners = Vec::new();
+        for miner_obj in miners {
+            quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
+        }
+
+        let runtime = Arc::clone(&self.runtime);
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut client = self.client.write().await;
+                client.initialize_connections(quic_miners).await
             })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn query_axon(&self, axon_data: PyObject, request_data: PyObject) -> PyResult<PyObject> {
-        Python::with_gil(|py| {
-            let request_dict = request_data.extract::<HashMap<String, PyObject>>(py)?;
+    pub fn query_axon(
+        &self,
+        py: Python<'_>,
+        axon_data: PyObject,
+        request_data: PyObject,
+    ) -> PyResult<PyObject> {
+        let request_dict = request_data.extract::<HashMap<String, PyObject>>(py)?;
+        let axon_info = extract_quic_axon_info(py, &axon_data)?;
 
-            let axon_info = extract_quic_axon_info(py, &axon_data)?;
+        let synapse_type = request_dict
+            .get("synapse_type")
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Missing 'synapse_type' field")
+            })?
+            .extract::<String>(py)?;
 
-            let synapse_type = request_dict
-                .get("synapse_type")
-                .ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyKeyError, _>("Missing 'synapse_type' field")
-                })?
-                .extract::<String>(py)?;
-
-            let mut data = HashMap::new();
-            if let Some(data_obj) = request_dict.get("data") {
-                let data_dict = data_obj.extract::<HashMap<String, PyObject>>(py)?;
-                let json_module = py.import("json")?;
-                for (key, value) in data_dict {
-                    let json_str = json_module
-                        .call_method1("dumps", (value,))?
-                        .extract::<String>()?;
-                    let json_value: serde_json::Value =
-                        serde_json::from_str(&json_str).map_err(|e| {
-                            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                                "Failed to parse JSON from Python: {}",
-                                e
-                            ))
-                        })?;
-                    data.insert(key, json_value);
-                }
+        let mut data = HashMap::new();
+        if let Some(data_obj) = request_dict.get("data") {
+            let data_dict = data_obj.extract::<HashMap<String, PyObject>>(py)?;
+            let json_module = py.import("json")?;
+            for (key, value) in data_dict {
+                let json_str = json_module
+                    .call_method1("dumps", (value,))?
+                    .extract::<String>()?;
+                let json_value: serde_json::Value =
+                    serde_json::from_str(&json_str).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Failed to parse JSON from Python: {}",
+                            e
+                        ))
+                    })?;
+                data.insert(key, json_value);
             }
+        }
 
-            let request = btlightning::QuicRequest::new(synapse_type, data);
+        let request = btlightning::QuicRequest::new(synapse_type, data);
 
-            let runtime = Arc::clone(&self.runtime);
-            let response = runtime.block_on(async {
-                let client = self.client.lock().await;
-                client.query_axon(axon_info, request).await.map_err(to_pyerr)
-            })?;
+        let runtime = Arc::clone(&self.runtime);
+        let response = py
+            .allow_threads(|| {
+                runtime.block_on(async {
+                    let client = self.client.read().await;
+                    client.query_axon(axon_info, request).await
+                })
+            })
+            .map_err(to_pyerr)?;
 
+        Python::with_gil(|py| {
             let result_dict = pyo3::types::PyDict::new(py);
             result_dict.set_item("success", response.success)?;
             result_dict.set_item("latency_ms", response.latency_ms)?;
@@ -161,54 +174,61 @@ impl RustLightning {
         })
     }
 
-    pub fn update_miner_registry(&self, miners: Vec<PyObject>) -> PyResult<()> {
-        pyo3::Python::with_gil(|py| {
-            let mut quic_miners = Vec::new();
+    pub fn update_miner_registry(
+        &self,
+        py: Python<'_>,
+        miners: Vec<PyObject>,
+    ) -> PyResult<()> {
+        let mut quic_miners = Vec::new();
+        for miner_obj in miners {
+            quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
+        }
 
-            for miner_obj in miners {
-                quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
-            }
-
-            let runtime = Arc::clone(&self.runtime);
+        let runtime = Arc::clone(&self.runtime);
+        py.allow_threads(|| {
             runtime.block_on(async {
-                let mut client = self.client.lock().await;
-                client
-                    .update_miner_registry(quic_miners)
-                    .await
-                    .map_err(to_pyerr)
+                let client = self.client.read().await;
+                client.update_miner_registry(quic_miners).await
             })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn get_connection_stats(&self) -> PyResult<PyObject> {
-        Python::with_gil(|py| {
-            let runtime = Arc::clone(&self.runtime);
-            let stats = runtime.block_on(async {
-                let client = self.client.lock().await;
-                client.get_connection_stats().await.map_err(to_pyerr)
-            })?;
+    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let runtime = Arc::clone(&self.runtime);
+        let stats = py
+            .allow_threads(|| {
+                runtime.block_on(async {
+                    let client = self.client.read().await;
+                    client.get_connection_stats().await
+                })
+            })
+            .map_err(to_pyerr)?;
 
+        Python::with_gil(|py| {
             let result_dict = pyo3::types::PyDict::new(py);
             for (key, value) in stats {
                 result_dict.set_item(key, value)?;
             }
-
             Ok(result_dict.into())
         })
     }
 
-    pub fn close_all_connections(&self) -> PyResult<()> {
+    pub fn close_all_connections(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let client = self.client.lock().await;
-            client.close_all_connections().await.map_err(to_pyerr)
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let client = self.client.read().await;
+                client.close_all_connections().await
+            })
         })
+        .map_err(to_pyerr)
     }
 }
 
 #[pyclass]
 pub struct RustLightningServer {
-    server: Mutex<btlightning::LightningServer>,
+    server: RwLock<btlightning::LightningServer>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -226,79 +246,97 @@ impl RustLightningServer {
         let server = btlightning::LightningServer::new(miner_hotkey, host, port);
 
         Ok(Self {
-            server: Mutex::new(server),
+            server: RwLock::new(server),
             runtime,
         })
     }
 
     pub fn register_synapse_handler(
         &self,
+        py: Python<'_>,
         synapse_type: String,
         handler: PyObject,
     ) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let server = self.server.lock().await;
-            server
-                .register_synapse_handler(
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let server = self.server.read().await;
+                server.register_synapse_handler(
                     synapse_type,
                     Arc::new(PythonSynapseHandler::new(handler)),
                 )
                 .await
-                .map_err(to_pyerr)
+            })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn start(&self) -> PyResult<()> {
+    pub fn start(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let mut server = self.server.lock().await;
-            server.start().await.map_err(to_pyerr)
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut server = self.server.write().await;
+                server.start().await
+            })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn serve_forever(&self) -> PyResult<()> {
+    pub fn serve_forever(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let mut server = self.server.lock().await;
-            server.serve_forever().await.map_err(to_pyerr)
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut server = self.server.write().await;
+                server.serve_forever().await
+            })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn get_connection_stats(&self) -> PyResult<PyObject> {
+    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let runtime = Arc::clone(&self.runtime);
+        let stats = py
+            .allow_threads(|| {
+                runtime.block_on(async {
+                    let server = self.server.read().await;
+                    server.get_connection_stats().await
+                })
+            })
+            .map_err(to_pyerr)?;
+
         Python::with_gil(|py| {
-            let runtime = Arc::clone(&self.runtime);
-            let stats = runtime.block_on(async {
-                let server = self.server.lock().await;
-                server.get_connection_stats().await.map_err(to_pyerr)
-            })?;
-
             let result_dict = pyo3::types::PyDict::new(py);
             for (key, value) in stats {
                 result_dict.set_item(key, value)?;
             }
-
             Ok(result_dict.into())
         })
     }
 
-    pub fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> PyResult<()> {
+    pub fn cleanup_stale_connections(
+        &self,
+        py: Python<'_>,
+        max_idle_seconds: u64,
+    ) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let server = self.server.lock().await;
-            server
-                .cleanup_stale_connections(max_idle_seconds)
-                .await
-                .map_err(to_pyerr)
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let server = self.server.read().await;
+                server.cleanup_stale_connections(max_idle_seconds).await
+            })
         })
+        .map_err(to_pyerr)
     }
 
-    pub fn stop(&self) -> PyResult<()> {
+    pub fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        runtime.block_on(async {
-            let server = self.server.lock().await;
-            server.stop().await.map_err(to_pyerr)
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let server = self.server.read().await;
+                server.stop().await
+            })
         })
+        .map_err(to_pyerr)
     }
 }
 

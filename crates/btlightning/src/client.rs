@@ -15,9 +15,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct LightningClient {
     wallet_hotkey: String,
-    signer: Option<Box<dyn Signer>>,
+    signer: Option<Arc<dyn Signer>>,
     connection_pool: Arc<RwLock<ConnectionPool>>,
     active_miners: Arc<RwLock<HashMap<String, QuicAxonInfo>>>,
     established_connections: Arc<RwLock<HashMap<String, Connection>>>,
@@ -37,40 +39,72 @@ impl LightningClient {
     }
 
     pub fn set_signer(&mut self, signer: Box<dyn Signer>) {
-        self.signer = Some(signer);
+        self.signer = Some(Arc::from(signer));
         info!("Signer configured");
     }
 
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
 
-        let mut results = Vec::new();
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?
+            .clone();
+        let wallet_hotkey = self.wallet_hotkey.clone();
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
+            .clone();
+
+        let mut set = tokio::task::JoinSet::new();
         for miner in miners {
-            let miner_key = format!("{}:{}", miner.ip, miner.port);
-            let result = self.establish_connection_with_handshake(&miner).await;
-            results.push((miner_key, miner, result));
+            let ep = endpoint.clone();
+            let wh = wallet_hotkey.clone();
+            let s = signer.clone();
+            set.spawn(async move {
+                let miner_key = format!("{}:{}", miner.ip, miner.port);
+                let result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    connect_and_handshake(ep, miner.clone(), wh, s),
+                )
+                .await;
+                let result = match result {
+                    Ok(r) => r,
+                    Err(_) => Err(LightningError::Connection(format!(
+                        "Connection to {} timed out",
+                        miner_key
+                    ))),
+                };
+                (miner_key, miner, result)
+            });
         }
 
         let mut active_miners = self.active_miners.write().await;
         let mut pool = self.connection_pool.write().await;
         let mut connections = self.established_connections.write().await;
 
-        for (miner_key, miner, result) in results {
-            match result {
-                Ok(connection) => {
-                    let connection_id =
-                        format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
-
-                    pool.add_connection(&miner_key, connection_id);
-                    active_miners.insert(miner_key.clone(), miner);
-                    info!(
-                        "Established persistent QUIC connection to miner: {}",
-                        miner_key
-                    );
-                    connections.insert(miner_key, connection);
-                }
+        while let Some(join_result) = set.join_next().await {
+            match join_result {
+                Ok((miner_key, miner, result)) => match result {
+                    Ok(connection) => {
+                        let connection_id =
+                            format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
+                        pool.add_connection(&miner_key, connection_id);
+                        active_miners.insert(miner_key.clone(), miner);
+                        info!(
+                            "Established persistent QUIC connection to miner: {}",
+                            miner_key
+                        );
+                        connections.insert(miner_key, connection);
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to miner {}: {}", miner_key, e);
+                    }
+                },
                 Err(e) => {
-                    error!("Failed to connect to miner {}: {}", miner_key, e);
+                    error!("Connection task panicked: {}", e);
                 }
             }
         }
@@ -109,93 +143,6 @@ impl LightningClient {
         Ok(())
     }
 
-    async fn establish_connection_with_handshake(
-        &self,
-        miner: &QuicAxonInfo,
-    ) -> Result<Connection> {
-        let endpoint = self
-            .endpoint
-            .as_ref()
-            .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?;
-
-        let addr: SocketAddr = format!("{}:{}", miner.ip, miner.port)
-            .parse()
-            .map_err(|e| LightningError::Connection(format!("Invalid address: {}", e)))?;
-
-        let connection = endpoint
-            .connect(addr, &miner.ip)
-            .map_err(|e| LightningError::Connection(format!("Connection failed: {}", e)))?
-            .await
-            .map_err(|e| {
-                LightningError::Connection(format!("Connection handshake failed: {}", e))
-            })?;
-
-        let nonce = generate_nonce();
-        let timestamp = unix_timestamp_secs();
-        let handshake_request = HandshakeRequest {
-            validator_hotkey: self.wallet_hotkey.clone(),
-            timestamp,
-            nonce: nonce.clone(),
-            signature: self.sign_handshake_message(&nonce, timestamp)?,
-        };
-
-        let response = self.send_handshake(&connection, handshake_request).await?;
-        if response.accepted {
-            info!("Handshake successful with miner {}", miner.hotkey);
-            Ok(connection)
-        } else {
-            Err(LightningError::Handshake(
-                "Handshake rejected by miner".into(),
-            ))
-        }
-    }
-
-    async fn send_handshake(
-        &self,
-        connection: &Connection,
-        request: HandshakeRequest,
-    ) -> Result<HandshakeResponse> {
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
-            LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
-        })?;
-
-        let request_bytes = serde_json::to_vec(&request).map_err(|e| {
-            LightningError::Serialization(format!("Failed to serialize handshake: {}", e))
-        })?;
-
-        send.write_all(&request_bytes).await.map_err(|e| {
-            LightningError::Transport(format!("Failed to send handshake packet: {}", e))
-        })?;
-        send.finish().await.map_err(|e| {
-            LightningError::Transport(format!("Failed to finish sending handshake: {}", e))
-        })?;
-
-        let buffer = recv
-            .read_to_end(MAX_RESPONSE_SIZE)
-            .await
-            .map_err(|e| {
-                LightningError::Transport(format!("Failed to read handshake response: {}", e))
-            })?;
-
-        let response: HandshakeResponse = serde_json::from_slice(&buffer).map_err(|e| {
-            LightningError::Serialization(format!("Failed to parse handshake response: {}", e))
-        })?;
-
-        Ok(response)
-    }
-
-    fn sign_handshake_message(&self, nonce: &str, timestamp: u64) -> Result<String> {
-        let message = format!("handshake:{}:{}:{}", self.wallet_hotkey, timestamp, nonce);
-
-        match &self.signer {
-            Some(signer) => {
-                let signature_bytes = signer.sign(message.as_bytes())?;
-                Ok(BASE64_STANDARD.encode(&signature_bytes))
-            }
-            None => Err(LightningError::Signing("No signer configured".into())),
-        }
-    }
-
     pub async fn query_axon(
         &self,
         axon_info: QuicAxonInfo,
@@ -203,69 +150,31 @@ impl LightningClient {
     ) -> Result<QuicResponse> {
         let miner_key = format!("{}:{}", axon_info.ip, axon_info.port);
 
-        let connections = self.established_connections.read().await;
-        if let Some(connection) = connections.get(&miner_key) {
-            if connection.close_reason().is_some() {
-                return Err(LightningError::Connection(format!(
-                    "Connection to miner {} is closed",
-                    miner_key
-                )));
+        let connection = {
+            let connections = self.established_connections.read().await;
+            match connections.get(&miner_key) {
+                Some(conn) => {
+                    if conn.close_reason().is_some() {
+                        return Err(LightningError::Connection(format!(
+                            "Connection to miner {} is closed",
+                            miner_key
+                        )));
+                    }
+                    conn.clone()
+                }
+                None => {
+                    return Err(LightningError::Connection(format!(
+                        "No persistent QUIC connection to miner: {}",
+                        miner_key
+                    )));
+                }
             }
-            self.send_synapse_packet(connection, request).await
-        } else {
-            Err(LightningError::Connection(format!(
-                "No persistent QUIC connection to miner: {}",
-                miner_key
-            )))
-        }
-    }
-
-    async fn send_synapse_packet(
-        &self,
-        connection: &Connection,
-        request: QuicRequest,
-    ) -> Result<QuicResponse> {
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
-            LightningError::Connection(format!("Failed to open stream: {}", e))
-        })?;
-
-        let synapse_packet = SynapsePacket {
-            synapse_type: request.synapse_type.clone(),
-            data: request.data.clone(),
-            timestamp: unix_timestamp_secs(),
         };
 
-        let packet_bytes = serde_json::to_vec(&synapse_packet).map_err(|e| {
-            LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
-        })?;
-
-        send.write_all(&packet_bytes).await.map_err(|e| {
-            LightningError::Transport(format!("Failed to send synapse packet: {}", e))
-        })?;
-        send.finish().await.map_err(|e| {
-            LightningError::Transport(format!("Failed to finish sending: {}", e))
-        })?;
-
-        let buffer = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| {
-            LightningError::Transport(format!("Failed to read response: {}", e))
-        })?;
-
-        let synapse_response: crate::types::SynapseResponse =
-            serde_json::from_slice(&buffer).map_err(|e| {
-                LightningError::Serialization(format!(
-                    "Failed to parse synapse response: {}",
-                    e
-                ))
-            })?;
-
-        Ok(QuicResponse {
-            success: synapse_response.success,
-            data: synapse_response.data,
-            latency_ms: 0.0,
-        })
+        send_synapse_packet(&connection, request).await
     }
 
-    pub async fn update_miner_registry(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
+    pub async fn update_miner_registry(&self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         let current_miners: HashMap<String, QuicAxonInfo> = miners
             .iter()
             .map(|m| (format!("{}:{}", m.ip, m.port), m.clone()))
@@ -295,30 +204,64 @@ impl LightningClient {
                 .collect();
         }
 
-        let mut results = Vec::new();
-        for (key, miner) in new_miner_keys {
-            info!("New miner detected, establishing QUIC connection: {}", key);
-            let result = self.establish_connection_with_handshake(&miner).await;
-            results.push((key, miner, result));
-        }
+        if !new_miner_keys.is_empty() {
+            let endpoint = self
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    LightningError::Connection("QUIC endpoint not initialized".into())
+                })?
+                .clone();
+            let wallet_hotkey = self.wallet_hotkey.clone();
+            let signer = self
+                .signer
+                .as_ref()
+                .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
+                .clone();
 
-        if !results.is_empty() {
+            let mut set = tokio::task::JoinSet::new();
+            for (key, miner) in new_miner_keys {
+                info!("New miner detected, establishing QUIC connection: {}", key);
+                let ep = endpoint.clone();
+                let wh = wallet_hotkey.clone();
+                let s = signer.clone();
+                set.spawn(async move {
+                    let result = tokio::time::timeout(
+                        CONNECT_TIMEOUT,
+                        connect_and_handshake(ep, miner.clone(), wh, s),
+                    )
+                    .await;
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(_) => Err(LightningError::Connection(format!(
+                            "Connection to {} timed out",
+                            key
+                        ))),
+                    };
+                    (key, miner, result)
+                });
+            }
+
             let mut active_miners = self.active_miners.write().await;
             let mut pool = self.connection_pool.write().await;
             let mut connections = self.established_connections.write().await;
 
-            for (key, miner, result) in results {
-                match result {
-                    Ok(connection) => {
-                        let connection_id =
-                            format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
-
-                        pool.add_connection(&key, connection_id);
-                        active_miners.insert(key.clone(), miner);
-                        connections.insert(key, connection);
-                    }
+            while let Some(join_result) = set.join_next().await {
+                match join_result {
+                    Ok((key, miner, result)) => match result {
+                        Ok(connection) => {
+                            let connection_id =
+                                format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
+                            pool.add_connection(&key, connection_id);
+                            active_miners.insert(key.clone(), miner);
+                            connections.insert(key, connection);
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to new miner {}: {}", key, e);
+                        }
+                    },
                     Err(e) => {
-                        error!("Failed to connect to new miner {}: {}", key, e);
+                        error!("Connection task panicked: {}", e);
                     }
                 }
             }
@@ -367,6 +310,124 @@ impl LightningClient {
         info!("All Lightning QUIC connections closed");
         Ok(())
     }
+}
+
+async fn connect_and_handshake(
+    endpoint: Endpoint,
+    miner: QuicAxonInfo,
+    wallet_hotkey: String,
+    signer: Arc<dyn Signer>,
+) -> Result<Connection> {
+    let addr: SocketAddr = format!("{}:{}", miner.ip, miner.port)
+        .parse()
+        .map_err(|e| LightningError::Connection(format!("Invalid address: {}", e)))?;
+
+    let connection = endpoint
+        .connect(addr, &miner.ip)
+        .map_err(|e| LightningError::Connection(format!("Connection failed: {}", e)))?
+        .await
+        .map_err(|e| {
+            LightningError::Connection(format!("Connection handshake failed: {}", e))
+        })?;
+
+    let nonce = generate_nonce();
+    let timestamp = unix_timestamp_secs();
+    let message = format!("handshake:{}:{}:{}", wallet_hotkey, timestamp, nonce);
+    let signature_bytes = signer.sign(message.as_bytes())?;
+
+    let handshake_request = HandshakeRequest {
+        validator_hotkey: wallet_hotkey,
+        timestamp,
+        nonce,
+        signature: BASE64_STANDARD.encode(&signature_bytes),
+    };
+
+    let response = send_handshake(&connection, handshake_request).await?;
+    if response.accepted {
+        info!("Handshake successful with miner {}", miner.hotkey);
+        Ok(connection)
+    } else {
+        Err(LightningError::Handshake(
+            "Handshake rejected by miner".into(),
+        ))
+    }
+}
+
+async fn send_handshake(
+    connection: &Connection,
+    request: HandshakeRequest,
+) -> Result<HandshakeResponse> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+        LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
+    })?;
+
+    let request_bytes = serde_json::to_vec(&request).map_err(|e| {
+        LightningError::Serialization(format!("Failed to serialize handshake: {}", e))
+    })?;
+
+    send.write_all(&request_bytes).await.map_err(|e| {
+        LightningError::Transport(format!("Failed to send handshake packet: {}", e))
+    })?;
+    send.finish().await.map_err(|e| {
+        LightningError::Transport(format!("Failed to finish sending handshake: {}", e))
+    })?;
+
+    let buffer = recv
+        .read_to_end(MAX_RESPONSE_SIZE)
+        .await
+        .map_err(|e| {
+            LightningError::Transport(format!("Failed to read handshake response: {}", e))
+        })?;
+
+    let response: HandshakeResponse = serde_json::from_slice(&buffer).map_err(|e| {
+        LightningError::Serialization(format!("Failed to parse handshake response: {}", e))
+    })?;
+
+    Ok(response)
+}
+
+async fn send_synapse_packet(
+    connection: &Connection,
+    request: QuicRequest,
+) -> Result<QuicResponse> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
+        LightningError::Connection(format!("Failed to open stream: {}", e))
+    })?;
+
+    let synapse_packet = SynapsePacket {
+        synapse_type: request.synapse_type.clone(),
+        data: request.data.clone(),
+        timestamp: unix_timestamp_secs(),
+    };
+
+    let packet_bytes = serde_json::to_vec(&synapse_packet).map_err(|e| {
+        LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
+    })?;
+
+    send.write_all(&packet_bytes).await.map_err(|e| {
+        LightningError::Transport(format!("Failed to send synapse packet: {}", e))
+    })?;
+    send.finish().await.map_err(|e| {
+        LightningError::Transport(format!("Failed to finish sending: {}", e))
+    })?;
+
+    let buffer = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| {
+        LightningError::Transport(format!("Failed to read response: {}", e))
+    })?;
+
+    let synapse_response: crate::types::SynapseResponse =
+        serde_json::from_slice(&buffer).map_err(|e| {
+            LightningError::Serialization(format!(
+                "Failed to parse synapse response: {}",
+                e
+            ))
+        })?;
+
+    Ok(QuicResponse {
+        success: synapse_response.success,
+        data: synapse_response.data,
+        latency_ms: 0.0,
+    })
 }
 
 fn generate_nonce() -> String {
