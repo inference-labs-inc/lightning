@@ -6,7 +6,7 @@ use quinn::{
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -76,7 +76,7 @@ pub struct LightningServer {
     port: u16,
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
-    used_nonces: Arc<RwLock<HashSet<String>>>,
+    used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     endpoint: Option<Endpoint>,
 }
 
@@ -89,7 +89,7 @@ impl LightningServer {
             port,
             connections: Arc::new(RwLock::new(HashMap::new())),
             synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
-            used_nonces: Arc::new(RwLock::new(HashSet::new())),
+            used_nonces: Arc::new(RwLock::new(HashMap::new())),
             endpoint: None,
         }
     }
@@ -190,7 +190,7 @@ impl LightningServer {
         connection: Connection,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
-        used_nonces: Arc<RwLock<HashSet<String>>>,
+        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
@@ -234,7 +234,7 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
         synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
-        used_nonces: Arc<RwLock<HashSet<String>>>,
+        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) {
@@ -288,7 +288,7 @@ impl LightningServer {
         request: HandshakeRequest,
         connection: Arc<quinn::Connection>,
         connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        used_nonces: Arc<RwLock<HashSet<String>>>,
+        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         miner_hotkey: String,
         miner_keypair: Option<[u8; 32]>,
     ) -> HandshakeResponse {
@@ -341,7 +341,7 @@ impl LightningServer {
 
     async fn verify_validator_signature(
         request: &HandshakeRequest,
-        used_nonces: Arc<RwLock<HashSet<String>>>,
+        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     ) -> bool {
         let current_time = unix_timestamp_secs();
 
@@ -364,8 +364,8 @@ impl LightningServer {
         }
 
         {
-            let mut nonces = used_nonces.write().await;
-            if !nonces.insert(request.nonce.clone()) {
+            let nonces = used_nonces.read().await;
+            if nonces.contains_key(&request.nonce) {
                 error!("Nonce already used: {}", request.nonce);
                 return false;
             }
@@ -376,7 +376,7 @@ impl LightningServer {
             request.validator_hotkey, request.timestamp, request.nonce
         );
 
-        match sr25519::Public::from_ss58check(&request.validator_hotkey) {
+        let valid = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
             Ok(public_key) => match BASE64_STANDARD.decode(&request.signature) {
                 Ok(signature_bytes) => {
                     if signature_bytes.len() != 64 {
@@ -402,7 +402,14 @@ impl LightningServer {
                 );
                 false
             }
+        };
+
+        if valid {
+            let mut nonces = used_nonces.write().await;
+            nonces.insert(request.nonce.clone(), current_time);
         }
+
+        valid
     }
 
     fn sign_handshake_response(
@@ -572,7 +579,8 @@ impl LightningServer {
 
     pub async fn cleanup_expired_nonces(&self) {
         let mut nonces = self.used_nonces.write().await;
-        nonces.clear();
+        let cutoff = unix_timestamp_secs().saturating_sub(MAX_SIGNATURE_AGE);
+        nonces.retain(|_, ts| *ts > cutoff);
     }
 
     pub async fn stop(&self) -> Result<()> {

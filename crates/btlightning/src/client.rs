@@ -144,11 +144,12 @@ impl LightningClient {
             })?;
 
         let nonce = generate_nonce();
+        let timestamp = unix_timestamp_secs();
         let handshake_request = HandshakeRequest {
             validator_hotkey: self.wallet_hotkey.clone(),
-            timestamp: unix_timestamp_secs(),
+            timestamp,
             nonce: nonce.clone(),
-            signature: self.sign_handshake_message(&nonce)?,
+            signature: self.sign_handshake_message(&nonce, timestamp)?,
         };
 
         let response = self.send_handshake(&connection, handshake_request).await?;
@@ -171,30 +172,11 @@ impl LightningClient {
             LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
         })?;
 
-        let handshake_data = serde_json::to_value(&request).map_err(|e| {
-            LightningError::Serialization(format!("Failed to serialize handshake data: {}", e))
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            LightningError::Serialization(format!("Failed to serialize handshake: {}", e))
         })?;
 
-        let data = handshake_data
-            .as_object()
-            .ok_or_else(|| {
-                LightningError::Serialization("Handshake data is not a JSON object".into())
-            })?
-            .clone()
-            .into_iter()
-            .collect();
-
-        let synapse_packet = SynapsePacket {
-            synapse_type: "Handshake".to_string(),
-            data,
-            timestamp: unix_timestamp_secs(),
-        };
-
-        let packet_json = serde_json::to_string(&synapse_packet).map_err(|e| {
-            LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
-        })?;
-
-        send.write_all(packet_json.as_bytes()).await.map_err(|e| {
+        send.write_all(request_json.as_bytes()).await.map_err(|e| {
             LightningError::Transport(format!("Failed to send handshake packet: {}", e))
         })?;
         send.finish().await.map_err(|e| {
@@ -219,8 +201,7 @@ impl LightningClient {
         Ok(response)
     }
 
-    fn sign_handshake_message(&self, nonce: &str) -> Result<String> {
-        let timestamp = unix_timestamp_secs();
+    fn sign_handshake_message(&self, nonce: &str, timestamp: u64) -> Result<String> {
         let message = format!("handshake:{}:{}:{}", self.wallet_hotkey, timestamp, nonce);
 
         match &self.signer {
@@ -392,12 +373,9 @@ impl LightningClient {
 }
 
 fn generate_nonce() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    unix_timestamp_millis().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
 struct AcceptAnyCertVerifier;
