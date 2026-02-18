@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "btlightning"
 version = "0.1.0"
 description = "QUIC transport layer for Bittensor"
-readme = "../../README.md"
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "Inference Labs Inc" }]
