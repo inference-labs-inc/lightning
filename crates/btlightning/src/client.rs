@@ -513,13 +513,13 @@ async fn connect_and_handshake(
         }
     }
 
-    verify_miner_response_signature(&response, &wallet_hotkey, &nonce, &peer_cert_fp_b64)?;
+    verify_miner_response_signature(&response, &wallet_hotkey, &nonce, &peer_cert_fp_b64).await?;
 
     info!("Handshake successful with miner {}", miner.hotkey);
     Ok(connection)
 }
 
-fn verify_miner_response_signature(
+async fn verify_miner_response_signature(
     response: &HandshakeResponse,
     validator_hotkey: &str,
     nonce: &str,
@@ -558,7 +558,13 @@ fn verify_miner_response_signature(
     sig_array.copy_from_slice(&signature_bytes);
     let signature = sr25519::Signature::from_raw(sig_array);
 
-    if !sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key) {
+    let valid = tokio::task::spawn_blocking(move || {
+        sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
+    })
+    .await
+    .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?;
+
+    if !valid {
         return Err(LightningError::Handshake(
             "Miner response signature verification failed".to_string(),
         ));

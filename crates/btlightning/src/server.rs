@@ -322,10 +322,9 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         ctx: &ServerContext,
     ) -> HandshakeResponse {
-        let cert_fp = ctx.cert_fingerprint.read().await;
+        let cert_fp: Option<[u8; 32]> = *ctx.cert_fingerprint.read().await;
         let is_valid =
             Self::verify_validator_signature(&request, ctx.used_nonces.clone(), &cert_fp).await;
-        drop(cert_fp);
 
         if is_valid {
             let now = unix_timestamp_secs();
@@ -364,7 +363,6 @@ impl LightningServer {
                 connection_id
             );
 
-            let cert_fp = ctx.cert_fingerprint.read().await;
             HandshakeResponse {
                 miner_hotkey: ctx.miner_hotkey.clone(),
                 timestamp: now,
