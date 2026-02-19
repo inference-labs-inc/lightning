@@ -99,7 +99,9 @@ impl RustLightning {
         reconnect_initial_backoff_secs=None,
         reconnect_max_backoff_secs=None,
         reconnect_max_retries=None,
+        max_connections=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         wallet_hotkey: String,
         connect_timeout_secs: Option<u64>,
@@ -108,6 +110,7 @@ impl RustLightning {
         reconnect_initial_backoff_secs: Option<u64>,
         reconnect_max_backoff_secs: Option<u64>,
         reconnect_max_retries: Option<u32>,
+        max_connections: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -134,6 +137,9 @@ impl RustLightning {
         }
         if let Some(v) = reconnect_max_retries {
             config.reconnect_max_retries = v;
+        }
+        if let Some(v) = max_connections {
+            config.max_connections = v;
         }
 
         let client = btlightning::LightningClient::with_config(wallet_hotkey, config);

@@ -25,6 +25,7 @@ pub struct LightningClientConfig {
     pub reconnect_initial_backoff: Duration,
     pub reconnect_max_backoff: Duration,
     pub reconnect_max_retries: u32,
+    pub max_connections: usize,
 }
 
 impl Default for LightningClientConfig {
@@ -36,6 +37,7 @@ impl Default for LightningClientConfig {
             reconnect_initial_backoff: Duration::from_secs(1),
             reconnect_max_backoff: Duration::from_secs(60),
             reconnect_max_retries: 5,
+            max_connections: 1024,
         }
     }
 }
@@ -438,10 +440,25 @@ impl LightningClient {
                 }
             }
 
-            new_miner_keys = current_miners
+            let remaining_capacity = self
+                .config
+                .max_connections
+                .saturating_sub(state.active_miners.len());
+            let eligible: Vec<(String, QuicAxonInfo)> = current_miners
                 .into_iter()
                 .filter(|(key, _)| !state.active_miners.contains_key(key))
                 .collect();
+
+            if eligible.len() > remaining_capacity {
+                warn!(
+                    "Connection limit ({}) reached, skipping {} of {} new miners",
+                    self.config.max_connections,
+                    eligible.len() - remaining_capacity,
+                    eligible.len()
+                );
+            }
+
+            new_miner_keys = eligible.into_iter().take(remaining_capacity).collect();
 
             for (key, miner) in &new_miner_keys {
                 state.active_miners.insert(key.clone(), miner.clone());
