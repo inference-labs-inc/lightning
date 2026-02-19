@@ -6,7 +6,7 @@ use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
-use sp_core::{crypto::Ss58Codec, sr25519, Pair};
+use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -73,7 +73,8 @@ struct ServerContext {
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     miner_hotkey: String,
-    miner_keypair: Option<[u8; 32]>,
+    miner_keypair: Option<sr25519::Pair>,
+    cert_fingerprint: Arc<RwLock<Option<[u8; 32]>>>,
 }
 
 pub struct LightningServer {
@@ -95,13 +96,14 @@ impl LightningServer {
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
                 miner_hotkey,
                 miner_keypair: None,
+                cert_fingerprint: Arc::new(RwLock::new(None)),
             },
             endpoint: None,
         }
     }
 
     pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
-        self.ctx.miner_keypair = Some(keypair_bytes);
+        self.ctx.miner_keypair = Some(sr25519::Pair::from_seed(&keypair_bytes));
     }
 
     pub async fn register_synapse_handler(
@@ -115,13 +117,20 @@ impl LightningServer {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn create_self_signed_cert(
-    ) -> std::result::Result<(Vec<Certificate>, PrivateKey), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(Vec<Certificate>, PrivateKey, [u8; 32]), Box<dyn std::error::Error>>
+    {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let cert_der = cert.serialize_der()?;
         let priv_key = cert.serialize_private_key_der();
+        let fingerprint = blake2_256(&cert_der);
 
-        Ok((vec![Certificate(cert_der)], PrivateKey(priv_key)))
+        Ok((
+            vec![Certificate(cert_der)],
+            PrivateKey(priv_key),
+            fingerprint,
+        ))
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -129,8 +138,10 @@ impl LightningServer {
             "Starting Lightning QUIC server on {}:{}",
             self.host, self.port
         );
-        let (certs, key) = Self::create_self_signed_cert()
+        let (certs, key, fingerprint) = Self::create_self_signed_cert()
             .map_err(|e| LightningError::Config(format!("Failed to create certificate: {}", e)))?;
+
+        *self.ctx.cert_fingerprint.write().await = Some(fingerprint);
 
         let mut server_config = RustlsServerConfig::builder()
             .with_safe_defaults()
@@ -285,6 +296,7 @@ impl LightningServer {
                                 signature: String::new(),
                                 accepted: false,
                                 connection_id: String::new(),
+                                cert_fingerprint: None,
                             };
                             match serde_json::to_vec(&err_response) {
                                 Ok(bytes) => {
@@ -310,7 +322,10 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         ctx: &ServerContext,
     ) -> HandshakeResponse {
-        let is_valid = Self::verify_validator_signature(&request, ctx.used_nonces.clone()).await;
+        let cert_fp = ctx.cert_fingerprint.read().await;
+        let is_valid =
+            Self::verify_validator_signature(&request, ctx.used_nonces.clone(), &cert_fp).await;
+        drop(cert_fp);
 
         if is_valid {
             let now = unix_timestamp_secs();
@@ -349,12 +364,20 @@ impl LightningServer {
                 connection_id
             );
 
+            let cert_fp = ctx.cert_fingerprint.read().await;
             HandshakeResponse {
                 miner_hotkey: ctx.miner_hotkey.clone(),
                 timestamp: now,
-                signature: Self::sign_handshake_response(&request, &ctx.miner_keypair, now),
+                signature: Self::sign_handshake_response(
+                    &request,
+                    &ctx.miner_hotkey,
+                    &ctx.miner_keypair,
+                    now,
+                    &cert_fp,
+                ),
                 accepted: true,
                 connection_id,
+                cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
             }
         } else {
             error!("Handshake failed: invalid signature");
@@ -364,6 +387,7 @@ impl LightningServer {
                 signature: String::new(),
                 accepted: false,
                 connection_id: String::new(),
+                cert_fingerprint: None,
             }
         }
     }
@@ -371,6 +395,7 @@ impl LightningServer {
     async fn verify_validator_signature(
         request: &HandshakeRequest,
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
+        cert_fingerprint: &Option<[u8; 32]>,
     ) -> bool {
         let current_time = unix_timestamp_secs();
 
@@ -392,9 +417,13 @@ impl LightningServer {
             return false;
         }
 
+        let fp_b64 = cert_fingerprint
+            .as_ref()
+            .map(|fp| BASE64_STANDARD.encode(fp))
+            .unwrap_or_default();
         let expected_message = format!(
-            "handshake:{}:{}:{}",
-            request.validator_hotkey, request.timestamp, request.nonce
+            "handshake:{}:{}:{}:{}",
+            request.validator_hotkey, request.timestamp, request.nonce, fp_b64
         );
 
         let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
@@ -442,17 +471,22 @@ impl LightningServer {
 
     fn sign_handshake_response(
         request: &HandshakeRequest,
-        miner_keypair: &Option<[u8; 32]>,
+        miner_hotkey: &str,
+        miner_keypair: &Option<sr25519::Pair>,
         timestamp: u64,
+        cert_fingerprint: &Option<[u8; 32]>,
     ) -> String {
+        let fp_b64 = cert_fingerprint
+            .as_ref()
+            .map(|fp| BASE64_STANDARD.encode(fp))
+            .unwrap_or_default();
         let message = format!(
-            "handshake_response:{}:{}",
-            request.validator_hotkey, timestamp
+            "handshake_response:{}:{}:{}:{}:{}",
+            request.validator_hotkey, miner_hotkey, timestamp, request.nonce, fp_b64
         );
 
         match miner_keypair {
-            Some(keypair_seed) => {
-                let pair = sr25519::Pair::from_seed(keypair_seed);
+            Some(pair) => {
                 let signature = pair.sign(message.as_bytes());
                 BASE64_STANDARD.encode(signature.0)
             }
