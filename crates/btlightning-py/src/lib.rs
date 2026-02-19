@@ -219,7 +219,8 @@ impl RustLightning {
                     let client = self.client.read().await;
                     match timeout_secs {
                         Some(t) => {
-                            if !t.is_finite() || t < 0.0 {
+                            const MAX_TIMEOUT_SECS: f64 = u64::MAX as f64;
+                            if !t.is_finite() || !(0.0..=MAX_TIMEOUT_SECS).contains(&t) {
                                 return Err(btlightning::LightningError::Config(format!(
                                     "timeout_secs must be a finite non-negative number, got {t}"
                                 )));
@@ -239,16 +240,15 @@ impl RustLightning {
             .map_err(to_pyerr)?;
 
         let result_dict = PyDict::new(py);
+        for (key, value) in &response.data {
+            let py_value = msgpack_value_to_py(py, value)?;
+            result_dict.set_item(key, py_value)?;
+        }
         result_dict.set_item("success", response.success)?;
         result_dict.set_item("latency_ms", response.latency_ms)?;
         match &response.error {
             Some(e) => result_dict.set_item("error", e)?,
             None => result_dict.set_item("error", py.None())?,
-        }
-
-        for (key, value) in &response.data {
-            let py_value = msgpack_value_to_py(py, value)?;
-            result_dict.set_item(key, py_value)?;
         }
 
         Ok(result_dict.into_any().unbind())

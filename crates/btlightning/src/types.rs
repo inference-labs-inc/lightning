@@ -36,6 +36,14 @@ impl QuicAxonInfo {
     }
 }
 
+pub(crate) fn hashmap_to_rmpv_map(data: HashMap<String, rmpv::Value>) -> rmpv::Value {
+    rmpv::Value::Map(
+        data.into_iter()
+            .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+            .collect(),
+    )
+}
+
 pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<String, rmpv::Value>> {
     let bytes =
         rmp_serde::to_vec_named(val).map_err(|e| LightningError::Serialization(e.to_string()))?;
@@ -103,12 +111,7 @@ impl QuicResponse {
     }
 
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        let map_value = rmpv::Value::Map(
-            self.data
-                .iter()
-                .map(|(k, v)| (rmpv::Value::String(k.clone().into()), v.clone()))
-                .collect(),
-        );
+        let map_value = hashmap_to_rmpv_map(self.data.clone());
         rmpv::ext::from_value(map_value).map_err(|e| LightningError::Serialization(e.to_string()))
     }
 }
@@ -352,21 +355,7 @@ mod tests {
             label: "test".into(),
         };
 
-        let bytes = rmp_serde::to_vec_named(&original).unwrap();
-        let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
-        let data: HashMap<String, rmpv::Value> = match rmpv_val {
-            rmpv::Value::Map(entries) => entries
-                .into_iter()
-                .map(|(k, v)| {
-                    let key = match k {
-                        rmpv::Value::String(s) => s.into_str().unwrap(),
-                        other => other.to_string(),
-                    };
-                    (key, v)
-                })
-                .collect(),
-            _ => panic!("expected map"),
-        };
+        let data = serialize_to_rmpv_map(&original).unwrap();
 
         let resp = QuicResponse {
             success: true,

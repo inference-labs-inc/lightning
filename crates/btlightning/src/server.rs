@@ -3,8 +3,9 @@ use crate::error::{LightningError, Result};
 use crate::signing::BtWalletSigner;
 use crate::signing::{Signer, Sr25519Signer};
 use crate::types::{
-    read_frame, write_frame, write_frame_and_finish, HandshakeRequest, HandshakeResponse,
-    MessageType, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
+    hashmap_to_rmpv_map, read_frame, serialize_to_rmpv_map, write_frame, write_frame_and_finish,
+    HandshakeRequest, HandshakeResponse, MessageType, StreamChunk, StreamEnd, SynapsePacket,
+    SynapseResponse,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -912,7 +913,8 @@ impl LightningServer {
         } else {
             drop(async_handlers);
             let handlers = ctx.synapse_handlers.read().await;
-            if let Some(handler) = handlers.get(&packet.synapse_type) {
+            if let Some(handler) = handlers.get(&packet.synapse_type).cloned() {
+                drop(handlers);
                 match handler.handle(&packet.synapse_type, packet.data) {
                     Ok(response_data) => SynapseResponse {
                         success: true,
@@ -1042,8 +1044,6 @@ impl Drop for LightningServer {
     }
 }
 
-use crate::types::serialize_to_rmpv_map;
-
 struct TypedSyncHandler<F, Req, Resp, E> {
     f: F,
     _phantom: std::marker::PhantomData<fn(Req) -> (Resp, E)>,
@@ -1061,12 +1061,7 @@ where
         _synapse_type: &str,
         data: HashMap<String, rmpv::Value>,
     ) -> Result<HashMap<String, rmpv::Value>> {
-        let map_value = rmpv::Value::Map(
-            data.into_iter()
-                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-                .collect(),
-        );
-        let req: Req = rmpv::ext::from_value(map_value)
+        let req: Req = rmpv::ext::from_value(hashmap_to_rmpv_map(data))
             .map_err(|e| LightningError::Serialization(e.to_string()))?;
         let resp = (self.f)(req).map_err(|e| LightningError::Handler(e.to_string()))?;
         serialize_to_rmpv_map(&resp)
@@ -1106,12 +1101,7 @@ where
         _synapse_type: &str,
         data: HashMap<String, rmpv::Value>,
     ) -> Result<HashMap<String, rmpv::Value>> {
-        let map_value = rmpv::Value::Map(
-            data.into_iter()
-                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-                .collect(),
-        );
-        let req: Req = rmpv::ext::from_value(map_value)
+        let req: Req = rmpv::ext::from_value(hashmap_to_rmpv_map(data))
             .map_err(|e| LightningError::Serialization(e.to_string()))?;
         let resp = (self.f)(req)
             .await
