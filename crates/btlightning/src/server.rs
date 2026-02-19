@@ -728,10 +728,12 @@ impl LightningServer {
         if let Some(prev_conn) =
             connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
         {
-            prev_conn.connection.close(0u32.into(), b"replaced");
-            let prev_addr = prev_conn.connection.remote_address();
-            if prev_addr != remote_addr {
-                addr_index.remove(&prev_addr);
+            if !Arc::ptr_eq(&prev_conn.connection, &connection) {
+                prev_conn.connection.close(0u32.into(), b"replaced");
+                let prev_addr = prev_conn.connection.remote_address();
+                if prev_addr != remote_addr {
+                    addr_index.remove(&prev_addr);
+                }
             }
         }
         addr_index.insert(remote_addr, request.validator_hotkey.clone());
@@ -981,6 +983,9 @@ impl LightningServer {
     }
 }
 
+/// Best-effort cleanup: aborts the nonce cleanup task if the mutex is not
+/// held. Callers must invoke `stop()` for a guaranteed graceful shutdown
+/// that closes all QUIC connections and the endpoint.
 impl Drop for LightningServer {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.cleanup_handle.try_lock() {
@@ -1053,6 +1058,23 @@ mod tests {
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_exact_boundary_timestamp() {
+        let max_signature_age: u64 = 300;
+        let now = unix_timestamp_secs();
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: now.saturating_sub(max_signature_age),
+            nonce: "test-nonce".to_string(),
+            signature: String::new(),
+        };
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, max_signature_age)
+                .await;
+        assert!(!result, "timestamp exactly at boundary must be rejected");
     }
 
     #[test]
