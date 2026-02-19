@@ -153,6 +153,11 @@ impl LightningServer {
                 "nonce_cleanup_interval_secs must be non-zero".to_string(),
             ));
         }
+        if config.idle_timeout_secs == 0 {
+            return Err(LightningError::Config(
+                "idle_timeout_secs must be non-zero".to_string(),
+            ));
+        }
         if config.keep_alive_interval_secs == 0 {
             return Err(LightningError::Config(
                 "keep_alive_interval_secs must be non-zero".to_string(),
@@ -285,43 +290,43 @@ impl LightningServer {
     }
 
     pub async fn serve_forever(&self) -> Result<()> {
-        if let Some(endpoint) = &self.endpoint {
-            {
-                let mut guard = self.cleanup_handle.lock().await;
-                if let Some(old) = guard.take() {
-                    old.abort();
-                }
+        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
+            LightningError::Config("server not started: call start() first".to_string())
+        })?;
+        {
+            let mut guard = self.cleanup_handle.lock().await;
+            if let Some(old) = guard.take() {
+                old.abort();
             }
+        }
 
-            let nonces_for_cleanup = self.ctx.used_nonces.clone();
-            let cleanup_interval_secs = self.ctx.config.nonce_cleanup_interval_secs;
-            let max_sig_age = self.ctx.config.max_signature_age_secs;
-            let handle = tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
-                loop {
-                    interval.tick().await;
-                    let mut nonces = nonces_for_cleanup.write().await;
-                    let cutoff = unix_timestamp_secs().saturating_sub(max_sig_age);
-                    nonces.retain(|_, ts| *ts >= cutoff);
+        let nonces_for_cleanup = self.ctx.used_nonces.clone();
+        let cleanup_interval_secs = self.ctx.config.nonce_cleanup_interval_secs;
+        let max_sig_age = self.ctx.config.max_signature_age_secs;
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
+            loop {
+                interval.tick().await;
+                let mut nonces = nonces_for_cleanup.write().await;
+                let cutoff = unix_timestamp_secs().saturating_sub(max_sig_age);
+                nonces.retain(|_, ts| *ts >= cutoff);
+            }
+        });
+        *self.cleanup_handle.lock().await = Some(handle);
+
+        while let Some(conn) = endpoint.accept().await {
+            let ctx = self.ctx.clone();
+
+            tokio::spawn(async move {
+                match conn.await {
+                    Ok(connection) => {
+                        Self::handle_connection(connection, ctx).await;
+                    }
+                    Err(e) => {
+                        error!("Connection failed: {}", e);
+                    }
                 }
             });
-            *self.cleanup_handle.lock().await = Some(handle);
-
-            while let Some(conn) = endpoint.accept().await {
-                let ctx = self.ctx.clone();
-
-                tokio::spawn(async move {
-                    match conn.await {
-                        Ok(connection) => {
-                            Self::handle_connection(connection, ctx).await;
-                        }
-                        Err(e) => {
-                            error!("Connection failed: {}", e);
-                        }
-                    }
-                });
-            }
         }
         Ok(())
     }
@@ -365,6 +370,10 @@ impl LightningServer {
                 .find(|(_, v)| Arc::ptr_eq(&v.connection, &connection))
                 .map(|(k, _)| k.clone());
             if let Some(hotkey) = stale_hotkey {
+                warn!(
+                    "Stale connection cleanup via fallback scan for validator: {}",
+                    hotkey
+                );
                 connections.remove(&hotkey);
                 addr_index.retain(|_, v| v != &hotkey);
             }
@@ -972,6 +981,16 @@ impl LightningServer {
     }
 }
 
+impl Drop for LightningServer {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.cleanup_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1049,16 @@ mod tests {
     fn config_rejects_zero_keepalive_interval() {
         let config = LightningServerConfig {
             keep_alive_interval_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_idle_timeout() {
+        let config = LightningServerConfig {
+            idle_timeout_secs: 0,
             ..Default::default()
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
