@@ -52,6 +52,8 @@ jobs:
           args: --release --out dist ${{ matrix.zig && '--zig' || '' }} ${{ matrix.target == 'aarch64' && matrix.os == 'ubuntu-latest' && '-i python3.12' || '' }}
           container: "off"
           working-directory: crates/btlightning-py
+        env:
+          LDFLAGS: ${{ startsWith(matrix.os, 'macos') && '-ld_classic' || '' }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v6
