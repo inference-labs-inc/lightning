@@ -1042,31 +1042,7 @@ impl Drop for LightningServer {
     }
 }
 
-fn serialize_to_rmpv_map<T: serde::Serialize>(
-    val: &T,
-) -> std::result::Result<HashMap<String, rmpv::Value>, LightningError> {
-    let bytes =
-        rmp_serde::to_vec_named(val).map_err(|e| LightningError::Serialization(e.to_string()))?;
-    let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
-        .map_err(|e| LightningError::Serialization(e.to_string()))?;
-    match rmpv_val {
-        rmpv::Value::Map(entries) => entries
-            .into_iter()
-            .map(|(k, v)| {
-                let key = match k {
-                    rmpv::Value::String(s) => s
-                        .into_str()
-                        .ok_or_else(|| LightningError::Serialization("non-UTF8 map key".into())),
-                    other => Ok(other.to_string()),
-                };
-                key.map(|k| (k, v))
-            })
-            .collect(),
-        _ => Err(LightningError::Serialization(
-            "expected map from serialized struct".into(),
-        )),
-    }
-}
+use crate::types::serialize_to_rmpv_map;
 
 struct TypedSyncHandler<F, Req, Resp, E> {
     f: F,

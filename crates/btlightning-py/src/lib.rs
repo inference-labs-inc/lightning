@@ -219,6 +219,11 @@ impl RustLightning {
                     let client = self.client.read().await;
                     match timeout_secs {
                         Some(t) => {
+                            if !t.is_finite() || t < 0.0 {
+                                return Err(btlightning::LightningError::Config(format!(
+                                    "timeout_secs must be a finite non-negative number, got {t}"
+                                )));
+                            }
                             client
                                 .query_axon_with_timeout(
                                     axon_info,
@@ -236,6 +241,10 @@ impl RustLightning {
         let result_dict = PyDict::new(py);
         result_dict.set_item("success", response.success)?;
         result_dict.set_item("latency_ms", response.latency_ms)?;
+        match &response.error {
+            Some(e) => result_dict.set_item("error", e)?,
+            None => result_dict.set_item("error", py.None())?,
+        }
 
         for (key, value) in &response.data {
             let py_value = msgpack_value_to_py(py, value)?;

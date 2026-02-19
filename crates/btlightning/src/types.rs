@@ -36,6 +36,30 @@ impl QuicAxonInfo {
     }
 }
 
+pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<String, rmpv::Value>> {
+    let bytes =
+        rmp_serde::to_vec_named(val).map_err(|e| LightningError::Serialization(e.to_string()))?;
+    let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
+        .map_err(|e| LightningError::Serialization(e.to_string()))?;
+    match rmpv_val {
+        rmpv::Value::Map(entries) => entries
+            .into_iter()
+            .map(|(k, v)| {
+                let key = match k {
+                    rmpv::Value::String(s) => s
+                        .into_str()
+                        .ok_or_else(|| LightningError::Serialization("non-UTF8 map key".into())),
+                    other => Ok(other.to_string()),
+                };
+                key.map(|k| (k, v))
+            })
+            .collect(),
+        _ => Err(LightningError::Serialization(
+            "expected map from serialized struct".into(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicRequest {
     pub synapse_type: String,
@@ -51,32 +75,9 @@ impl QuicRequest {
         synapse_type: impl Into<String>,
         data: &T,
     ) -> Result<Self> {
-        let bytes = rmp_serde::to_vec_named(data)
-            .map_err(|e| LightningError::Serialization(e.to_string()))?;
-        let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
-            .map_err(|e| LightningError::Serialization(e.to_string()))?;
-        let map = match rmpv_val {
-            rmpv::Value::Map(entries) => entries
-                .into_iter()
-                .map(|(k, v)| {
-                    let key = match k {
-                        rmpv::Value::String(s) => s.into_str().ok_or_else(|| {
-                            LightningError::Serialization("non-UTF8 map key".into())
-                        }),
-                        other => Ok(other.to_string()),
-                    };
-                    key.map(|k| (k, v))
-                })
-                .collect::<Result<HashMap<String, rmpv::Value>>>()?,
-            _ => {
-                return Err(LightningError::Serialization(
-                    "expected struct to serialize as map".into(),
-                ))
-            }
-        };
         Ok(Self {
             synapse_type: synapse_type.into(),
-            data: map,
+            data: serialize_to_rmpv_map(data)?,
         })
     }
 }
@@ -108,10 +109,7 @@ impl QuicResponse {
                 .map(|(k, v)| (rmpv::Value::String(k.clone().into()), v.clone()))
                 .collect(),
         );
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &map_value)
-            .map_err(|e| LightningError::Serialization(e.to_string()))?;
-        rmp_serde::from_slice(&buf).map_err(|e| LightningError::Serialization(e.to_string()))
+        rmpv::ext::from_value(map_value).map_err(|e| LightningError::Serialization(e.to_string()))
     }
 }
 
