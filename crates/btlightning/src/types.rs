@@ -65,6 +65,8 @@ pub struct HandshakeResponse {
     pub signature: String,
     pub accepted: bool,
     pub connection_id: String,
+    #[serde(default)]
+    pub cert_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

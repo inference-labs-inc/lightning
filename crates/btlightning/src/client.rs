@@ -8,6 +8,7 @@ use crate::util::{unix_timestamp_millis, unix_timestamp_secs, MAX_RESPONSE_SIZE}
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use rustls::ClientConfig as RustlsClientConfig;
+use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -446,6 +447,13 @@ impl LightningClient {
     }
 }
 
+fn get_peer_cert_fingerprint(connection: &Connection) -> Option<[u8; 32]> {
+    let identity = connection.peer_identity()?;
+    let certs = identity.downcast::<Vec<rustls::Certificate>>().ok()?;
+    let first = certs.first()?;
+    Some(blake2_256(&first.0))
+}
+
 async fn connect_and_handshake(
     endpoint: Endpoint,
     miner: QuicAxonInfo,
@@ -462,27 +470,107 @@ async fn connect_and_handshake(
         .await
         .map_err(|e| LightningError::Connection(format!("Connection handshake failed: {}", e)))?;
 
+    let peer_cert_fp = get_peer_cert_fingerprint(&connection);
+    let peer_cert_fp_b64 = peer_cert_fp
+        .as_ref()
+        .map(|fp| BASE64_STANDARD.encode(fp))
+        .unwrap_or_default();
+
     let nonce = generate_nonce();
     let timestamp = unix_timestamp_secs();
-    let message = format!("handshake:{}:{}:{}", wallet_hotkey, timestamp, nonce);
+    let message = format!(
+        "handshake:{}:{}:{}:{}",
+        wallet_hotkey, timestamp, nonce, peer_cert_fp_b64
+    );
     let signature_bytes = signer.sign(message.as_bytes())?;
 
     let handshake_request = HandshakeRequest {
-        validator_hotkey: wallet_hotkey,
+        validator_hotkey: wallet_hotkey.clone(),
         timestamp,
-        nonce,
+        nonce: nonce.clone(),
         signature: BASE64_STANDARD.encode(&signature_bytes),
     };
 
     let response = send_handshake(&connection, handshake_request).await?;
-    if response.accepted {
-        info!("Handshake successful with miner {}", miner.hotkey);
-        Ok(connection)
-    } else {
-        Err(LightningError::Handshake(
+    if !response.accepted {
+        return Err(LightningError::Handshake(
             "Handshake rejected by miner".into(),
-        ))
+        ));
     }
+
+    if response.miner_hotkey != miner.hotkey {
+        return Err(LightningError::Handshake(format!(
+            "Miner hotkey mismatch: expected {}, got {}",
+            miner.hotkey, response.miner_hotkey
+        )));
+    }
+
+    if let Some(ref resp_fp) = response.cert_fingerprint {
+        if *resp_fp != peer_cert_fp_b64 {
+            return Err(LightningError::Handshake(
+                "Cert fingerprint mismatch between TLS session and handshake response".to_string(),
+            ));
+        }
+    }
+
+    verify_miner_response_signature(&response, &wallet_hotkey, &nonce, &peer_cert_fp_b64).await?;
+
+    info!("Handshake successful with miner {}", miner.hotkey);
+    Ok(connection)
+}
+
+async fn verify_miner_response_signature(
+    response: &HandshakeResponse,
+    validator_hotkey: &str,
+    nonce: &str,
+    cert_fp_b64: &str,
+) -> Result<()> {
+    if response.signature.is_empty() {
+        return Err(LightningError::Handshake(
+            "Miner returned empty signature".to_string(),
+        ));
+    }
+
+    let expected_message = format!(
+        "handshake_response:{}:{}:{}:{}:{}",
+        validator_hotkey, response.miner_hotkey, response.timestamp, nonce, cert_fp_b64
+    );
+
+    let public_key = sr25519::Public::from_ss58check(&response.miner_hotkey).map_err(|e| {
+        LightningError::Handshake(format!(
+            "Invalid miner SS58 address {}: {}",
+            response.miner_hotkey, e
+        ))
+    })?;
+
+    let signature_bytes = BASE64_STANDARD.decode(&response.signature).map_err(|e| {
+        LightningError::Handshake(format!("Failed to decode miner signature: {}", e))
+    })?;
+
+    if signature_bytes.len() != 64 {
+        return Err(LightningError::Handshake(format!(
+            "Invalid miner signature length: {}",
+            signature_bytes.len()
+        )));
+    }
+
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(&signature_bytes);
+    let signature = sr25519::Signature::from_raw(sig_array);
+
+    let valid = tokio::task::spawn_blocking(move || {
+        sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
+    })
+    .await
+    .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?;
+
+    if !valid {
+        return Err(LightningError::Handshake(
+            "Miner response signature verification failed".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn send_handshake(
