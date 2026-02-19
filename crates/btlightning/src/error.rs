@@ -9,6 +9,7 @@ pub enum LightningError {
     Transport(String),
     Handler(String),
     Config(String),
+    Stream(String),
 }
 
 impl fmt::Display for LightningError {
@@ -21,6 +22,7 @@ impl fmt::Display for LightningError {
             LightningError::Transport(msg) => write!(f, "transport error: {}", msg),
             LightningError::Handler(msg) => write!(f, "handler error: {}", msg),
             LightningError::Config(msg) => write!(f, "config error: {}", msg),
+            LightningError::Stream(msg) => write!(f, "stream error: {}", msg),
         }
     }
 }

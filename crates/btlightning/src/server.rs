@@ -1,6 +1,9 @@
 use crate::error::{LightningError, Result};
-use crate::types::{HandshakeRequest, HandshakeResponse, SynapsePacket, SynapseResponse};
-use crate::util::{unix_timestamp_secs, MAX_RESPONSE_SIZE};
+use crate::types::{
+    read_frame, write_frame, write_frame_and_finish, HandshakeRequest, HandshakeResponse,
+    MessageType, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
+};
+use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
@@ -9,15 +12,11 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-
-fn synapse_finder() -> &'static memchr::memmem::Finder<'static> {
-    static FINDER: OnceLock<memchr::memmem::Finder<'static>> = OnceLock::new();
-    FINDER.get_or_init(|| memchr::memmem::Finder::new(b"\"synapse_type\""))
-}
 
 const MAX_SIGNATURE_AGE: u64 = 300;
 
@@ -25,18 +24,41 @@ pub trait SynapseHandler: Send + Sync {
     fn handle(
         &self,
         synapse_type: &str,
-        data: HashMap<String, serde_json::Value>,
-    ) -> Result<HashMap<String, serde_json::Value>>;
+        data: HashMap<String, rmpv::Value>,
+    ) -> Result<HashMap<String, rmpv::Value>>;
 }
 
-#[derive(Debug, Clone)]
+#[async_trait::async_trait]
+pub trait StreamingSynapseHandler: Send + Sync {
+    async fn handle(
+        &self,
+        synapse_type: &str,
+        data: HashMap<String, rmpv::Value>,
+        sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<()>;
+}
+
+#[derive(Debug)]
 pub struct ValidatorConnection {
     pub validator_hotkey: String,
     pub connection_id: String,
     pub established_at: u64,
-    pub last_activity: u64,
+    pub last_activity: AtomicU64,
     pub verified: bool,
     pub connection: Arc<quinn::Connection>,
+}
+
+impl Clone for ValidatorConnection {
+    fn clone(&self) -> Self {
+        Self {
+            validator_hotkey: self.validator_hotkey.clone(),
+            connection_id: self.connection_id.clone(),
+            established_at: self.established_at,
+            last_activity: AtomicU64::new(self.last_activity.load(Ordering::Relaxed)),
+            verified: self.verified,
+            connection: self.connection.clone(),
+        }
+    }
 }
 
 impl ValidatorConnection {
@@ -50,7 +72,7 @@ impl ValidatorConnection {
             validator_hotkey,
             connection_id,
             established_at: now,
-            last_activity: now,
+            last_activity: AtomicU64::new(now),
             verified: false,
             connection: conn,
         }
@@ -61,8 +83,9 @@ impl ValidatorConnection {
         self.update_activity();
     }
 
-    pub fn update_activity(&mut self) {
-        self.last_activity = unix_timestamp_secs();
+    pub fn update_activity(&self) {
+        self.last_activity
+            .store(unix_timestamp_secs(), Ordering::Relaxed);
     }
 }
 
@@ -71,6 +94,7 @@ struct ServerContext {
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
     addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+    streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     miner_hotkey: String,
     miner_keypair: Option<sr25519::Pair>,
@@ -93,6 +117,7 @@ impl LightningServer {
                 connections: Arc::new(RwLock::new(HashMap::new())),
                 addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
                 synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+                streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
                 miner_hotkey,
                 miner_keypair: None,
@@ -114,6 +139,17 @@ impl LightningServer {
         let mut handlers = self.ctx.synapse_handlers.write().await;
         handlers.insert(synapse_type.clone(), handler);
         info!("Registered synapse handler for: {}", synapse_type);
+        Ok(())
+    }
+
+    pub async fn register_streaming_handler(
+        &self,
+        synapse_type: String,
+        handler: Arc<dyn StreamingSynapseHandler>,
+    ) -> Result<()> {
+        let mut handlers = self.ctx.streaming_handlers.write().await;
+        handlers.insert(synapse_type.clone(), handler);
+        info!("Registered streaming synapse handler for: {}", synapse_type);
         Ok(())
     }
 
@@ -149,7 +185,7 @@ impl LightningServer {
             .with_single_cert(certs, key)
             .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
 
-        server_config.alpn_protocols = vec![b"lightning-quic".to_vec()];
+        server_config.alpn_protocols = vec![b"btlightning".to_vec()];
         let mut transport_config = TransportConfig::default();
         let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150))
             .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
@@ -230,90 +266,243 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         ctx: ServerContext,
     ) {
-        match recv.read_to_end(MAX_RESPONSE_SIZE).await {
-            Ok(buffer) => {
-                if synapse_finder().find(&buffer).is_some() {
-                    match serde_json::from_slice::<SynapsePacket>(&buffer) {
-                        Ok(synapse_packet) => {
-                            let response = Self::process_synapse_packet(
-                                synapse_packet,
-                                connection.clone(),
-                                &ctx,
+        let frame = match read_frame(&mut recv).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to read frame: {}", e);
+                return;
+            }
+        };
+
+        match frame {
+            (MessageType::SynapsePacket, payload) => {
+                let packet: SynapsePacket = match rmp_serde::from_slice(&payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Failed to parse synapse packet: {}", e);
+                        let err_response = SynapseResponse {
+                            success: false,
+                            data: HashMap::new(),
+                            timestamp: unix_timestamp_secs(),
+                            error: Some(e.to_string()),
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec(&err_response) {
+                            let _ = write_frame_and_finish(
+                                &mut send,
+                                MessageType::SynapseResponse,
+                                &bytes,
                             )
                             .await;
-
-                            match serde_json::to_vec(&response) {
-                                Ok(response_bytes) => {
-                                    let _ = send.write_all(&response_bytes).await;
-                                    let _ = send.finish().await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize SynapseResponse: {}", e);
-                                }
-                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to parse synapse packet: {}", e);
-                            let err_response = SynapseResponse {
-                                success: false,
-                                data: HashMap::new(),
-                                timestamp: unix_timestamp_secs(),
-                                error: Some(e.to_string()),
-                            };
-                            match serde_json::to_vec(&err_response) {
-                                Ok(bytes) => {
-                                    let _ = send.write_all(&bytes).await;
-                                    let _ = send.finish().await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize SynapseResponse error: {}", e);
-                                }
-                            }
-                        }
+                        return;
                     }
-                } else {
-                    match serde_json::from_slice::<HandshakeRequest>(&buffer) {
-                        Ok(handshake_req) => {
-                            let response =
-                                Self::process_handshake(handshake_req, connection.clone(), &ctx)
-                                    .await;
+                };
 
-                            match serde_json::to_vec(&response) {
-                                Ok(response_bytes) => {
-                                    let _ = send.write_all(&response_bytes).await;
-                                    let _ = send.finish().await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize HandshakeResponse: {}", e);
-                                }
-                            }
+                let is_streaming = {
+                    let handlers = ctx.streaming_handlers.read().await;
+                    handlers.contains_key(&packet.synapse_type)
+                };
+
+                if is_streaming {
+                    Self::handle_streaming_synapse(send, packet, connection, &ctx).await;
+                } else {
+                    let response =
+                        Self::process_synapse_packet(packet, connection.clone(), &ctx).await;
+                    match rmp_serde::to_vec(&response) {
+                        Ok(bytes) => {
+                            let _ = write_frame_and_finish(
+                                &mut send,
+                                MessageType::SynapseResponse,
+                                &bytes,
+                            )
+                            .await;
                         }
                         Err(e) => {
-                            warn!("Unknown message format received: {}", e);
-                            let err_response = HandshakeResponse {
-                                miner_hotkey: ctx.miner_hotkey,
-                                timestamp: unix_timestamp_secs(),
-                                signature: String::new(),
-                                accepted: false,
-                                connection_id: String::new(),
-                                cert_fingerprint: None,
-                            };
-                            match serde_json::to_vec(&err_response) {
-                                Ok(bytes) => {
-                                    let _ = send.write_all(&bytes).await;
-                                    let _ = send.finish().await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize HandshakeResponse error: {}", e);
-                                }
-                            }
+                            error!("Failed to serialize SynapseResponse: {}", e);
                         }
                     }
                 }
             }
-            Err(e) => {
-                error!("Failed to read stream: {}", e);
+            (MessageType::HandshakeRequest, payload) => {
+                let request: HandshakeRequest = match rmp_serde::from_slice(&payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Failed to parse handshake request: {}", e);
+                        let err_response = HandshakeResponse {
+                            miner_hotkey: ctx.miner_hotkey,
+                            timestamp: unix_timestamp_secs(),
+                            signature: String::new(),
+                            accepted: false,
+                            connection_id: String::new(),
+                            cert_fingerprint: None,
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec(&err_response) {
+                            let _ = write_frame_and_finish(
+                                &mut send,
+                                MessageType::HandshakeResponse,
+                                &bytes,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                };
+
+                let response = Self::process_handshake(request, connection.clone(), &ctx).await;
+                match rmp_serde::to_vec(&response) {
+                    Ok(bytes) => {
+                        let _ = write_frame_and_finish(
+                            &mut send,
+                            MessageType::HandshakeResponse,
+                            &bytes,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize HandshakeResponse: {}", e);
+                    }
+                }
             }
+            (msg_type, _) => {
+                warn!("Unexpected message type on server: {:?}", msg_type);
+            }
+        }
+    }
+
+    async fn verify_synapse_auth(
+        connection: &Arc<quinn::Connection>,
+        ctx: &ServerContext,
+    ) -> std::result::Result<String, SynapseResponse> {
+        let validator_hotkey = {
+            let addr_index = ctx.addr_to_hotkey.read().await;
+            match addr_index.get(&connection.remote_address()).cloned() {
+                Some(hotkey) => hotkey,
+                None => {
+                    error!(
+                        "Unknown or unauthenticated connection from {}",
+                        connection.remote_address()
+                    );
+                    return Err(SynapseResponse {
+                        success: false,
+                        data: HashMap::new(),
+                        timestamp: unix_timestamp_secs(),
+                        error: Some("Unknown or unauthenticated validator".to_string()),
+                    });
+                }
+            }
+        };
+
+        {
+            let connections_guard = ctx.connections.read().await;
+            if let Some(conn) = connections_guard.get(&validator_hotkey) {
+                if !conn.verified {
+                    error!(
+                        "Connection not verified for validator: {}",
+                        validator_hotkey
+                    );
+                    return Err(SynapseResponse {
+                        success: false,
+                        data: HashMap::new(),
+                        timestamp: unix_timestamp_secs(),
+                        error: Some("Connection not verified".to_string()),
+                    });
+                }
+                conn.update_activity();
+            } else {
+                error!("No connection found for validator {}", validator_hotkey);
+                return Err(SynapseResponse {
+                    success: false,
+                    data: HashMap::new(),
+                    timestamp: unix_timestamp_secs(),
+                    error: Some("Unknown or unauthenticated validator".to_string()),
+                });
+            }
+        }
+
+        Ok(validator_hotkey)
+    }
+
+    async fn handle_streaming_synapse(
+        mut send: SendStream,
+        packet: SynapsePacket,
+        connection: Arc<quinn::Connection>,
+        ctx: &ServerContext,
+    ) {
+        if let Err(err_response) = Self::verify_synapse_auth(&connection, ctx).await {
+            let end = StreamEnd {
+                success: false,
+                error: err_response.error,
+            };
+            if let Ok(bytes) = rmp_serde::to_vec(&end) {
+                let _ = write_frame_and_finish(&mut send, MessageType::StreamEnd, &bytes).await;
+            }
+            return;
+        }
+
+        let handler = {
+            let handlers = ctx.streaming_handlers.read().await;
+            match handlers.get(&packet.synapse_type) {
+                Some(h) => h.clone(),
+                None => {
+                    error!(
+                        "No streaming handler registered for synapse type: {}",
+                        packet.synapse_type
+                    );
+                    let end = StreamEnd {
+                        success: false,
+                        error: Some(format!(
+                            "No handler for synapse type: {}",
+                            packet.synapse_type
+                        )),
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec(&end) {
+                        let _ =
+                            write_frame_and_finish(&mut send, MessageType::StreamEnd, &bytes).await;
+                    }
+                    return;
+                }
+            }
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let synapse_type = packet.synapse_type.clone();
+
+        let handle =
+            tokio::spawn(async move { handler.handle(&synapse_type, packet.data, tx).await });
+
+        while let Some(chunk_data) = rx.recv().await {
+            let chunk = StreamChunk { data: chunk_data };
+            match rmp_serde::to_vec(&chunk) {
+                Ok(bytes) => {
+                    if let Err(e) = write_frame(&mut send, MessageType::StreamChunk, &bytes).await {
+                        error!("Failed to write stream chunk: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize stream chunk: {}", e);
+                    break;
+                }
+            }
+        }
+
+        let end = match handle.await {
+            Ok(Ok(())) => StreamEnd {
+                success: true,
+                error: None,
+            },
+            Ok(Err(e)) => StreamEnd {
+                success: false,
+                error: Some(e.to_string()),
+            },
+            Err(e) => StreamEnd {
+                success: false,
+                error: Some(format!("handler panicked: {}", e)),
+            },
+        };
+
+        if let Ok(bytes) = rmp_serde::to_vec(&end) {
+            let _ = write_frame_and_finish(&mut send, MessageType::StreamEnd, &bytes).await;
         }
     }
 
@@ -502,55 +691,10 @@ impl LightningServer {
     ) -> SynapseResponse {
         debug!("Processing {} synapse packet", packet.synapse_type);
 
-        let validator_hotkey = {
-            let addr_index = ctx.addr_to_hotkey.read().await;
-            match addr_index.get(&connection.remote_address()).cloned() {
-                Some(hotkey) => hotkey,
-                None => {
-                    error!(
-                        "Unknown or unauthenticated connection from {}",
-                        connection.remote_address()
-                    );
-                    return SynapseResponse {
-                        success: false,
-                        data: HashMap::new(),
-                        timestamp: unix_timestamp_secs(),
-                        error: Some("Unknown or unauthenticated validator".to_string()),
-                    };
-                }
-            }
+        let _validator_hotkey = match Self::verify_synapse_auth(&connection, ctx).await {
+            Ok(hotkey) => hotkey,
+            Err(err_response) => return err_response,
         };
-
-        {
-            let mut connections_guard = ctx.connections.write().await;
-            if let Some(connection) = connections_guard.get_mut(&validator_hotkey) {
-                if !connection.verified {
-                    error!(
-                        "Connection not verified for validator: {}",
-                        validator_hotkey
-                    );
-                    return SynapseResponse {
-                        success: false,
-                        data: HashMap::new(),
-                        timestamp: unix_timestamp_secs(),
-                        error: Some("Connection not verified".to_string()),
-                    };
-                }
-                connection.update_activity();
-                debug!(
-                    "Connection verified and activity updated for validator: {}",
-                    validator_hotkey
-                );
-            } else {
-                error!("No connection found for validator {}", validator_hotkey);
-                return SynapseResponse {
-                    success: false,
-                    data: HashMap::new(),
-                    timestamp: unix_timestamp_secs(),
-                    error: Some("Unknown or unauthenticated validator".to_string()),
-                };
-            }
-        }
 
         let handlers = ctx.synapse_handlers.read().await;
         if let Some(handler) = handlers.get(&packet.synapse_type) {
@@ -623,7 +767,9 @@ impl LightningServer {
 
         let mut to_remove = Vec::new();
         for (validator, connection) in connections.iter() {
-            if now.saturating_sub(connection.last_activity) > max_idle_seconds {
+            if now.saturating_sub(connection.last_activity.load(Ordering::Relaxed))
+                > max_idle_seconds
+            {
                 to_remove.push((validator.clone(), connection.connection.remote_address()));
             }
         }
