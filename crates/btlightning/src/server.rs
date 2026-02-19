@@ -153,6 +153,11 @@ impl LightningServer {
                 "nonce_cleanup_interval_secs must be non-zero".to_string(),
             ));
         }
+        if config.keep_alive_interval_secs == 0 {
+            return Err(LightningError::Config(
+                "keep_alive_interval_secs must be non-zero".to_string(),
+            ));
+        }
         if config.keep_alive_interval_secs >= config.idle_timeout_secs {
             return Err(LightningError::Config(format!(
                 "keep_alive_interval_secs ({}) must be less than idle_timeout_secs ({})",
@@ -344,12 +349,24 @@ impl LightningServer {
         let remote_addr = connection.remote_address();
         let mut connections = ctx.connections.write().await;
         let mut addr_index = ctx.addr_to_hotkey.write().await;
+        let mut cleaned = false;
         if let Some(hotkey) = addr_index.get(&remote_addr).cloned() {
             if let Some(existing) = connections.get(&hotkey) {
                 if Arc::ptr_eq(&existing.connection, &connection) {
                     connections.remove(&hotkey);
                     addr_index.remove(&remote_addr);
+                    cleaned = true;
                 }
+            }
+        }
+        if !cleaned {
+            let stale_hotkey = connections
+                .iter()
+                .find(|(_, v)| Arc::ptr_eq(&v.connection, &connection))
+                .map(|(k, _)| k.clone());
+            if let Some(hotkey) = stale_hotkey {
+                connections.remove(&hotkey);
+                addr_index.retain(|_, v| v != &hotkey);
             }
         }
         drop(addr_index);
@@ -1003,6 +1020,16 @@ mod tests {
     fn config_rejects_zero_nonce_cleanup_interval() {
         let config = LightningServerConfig {
             nonce_cleanup_interval_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_keepalive_interval() {
+        let config = LightningServerConfig {
+            keep_alive_interval_secs: 0,
             ..Default::default()
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
