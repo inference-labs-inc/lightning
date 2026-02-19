@@ -3,7 +3,7 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 pub const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,9 +45,8 @@ pub(crate) fn hashmap_to_rmpv_map(data: HashMap<String, rmpv::Value>) -> rmpv::V
 }
 
 pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<String, rmpv::Value>> {
-    let bytes =
-        rmp_serde::to_vec_named(val).map_err(|e| LightningError::Serialization(e.to_string()))?;
-    let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
+    let rmpv_val = val
+        .serialize(NamedSerializer)
         .map_err(|e| LightningError::Serialization(e.to_string()))?;
     match rmpv_val {
         rmpv::Value::Map(entries) => entries
@@ -65,6 +64,382 @@ pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<Str
         _ => Err(LightningError::Serialization(
             "expected map from serialized struct".into(),
         )),
+    }
+}
+
+pub(crate) fn handshake_request_message(
+    validator_hotkey: &str,
+    timestamp: u64,
+    nonce: &str,
+    cert_fp_b64: &str,
+) -> String {
+    format!(
+        "handshake:{}:{}:{}:{}",
+        validator_hotkey, timestamp, nonce, cert_fp_b64
+    )
+}
+
+pub(crate) fn handshake_response_message(
+    validator_hotkey: &str,
+    miner_hotkey: &str,
+    timestamp: u64,
+    nonce: &str,
+    cert_fp_b64: &str,
+) -> String {
+    format!(
+        "handshake_response:{}:{}:{}:{}:{}",
+        validator_hotkey, miner_hotkey, timestamp, nonce, cert_fp_b64
+    )
+}
+
+struct NamedSerializer;
+
+impl serde::Serializer for NamedSerializer {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    type SerializeSeq = SerializeVec;
+    type SerializeTuple = SerializeVec;
+    type SerializeTupleStruct = SerializeVec;
+    type SerializeTupleVariant = SerializeTupleVariant;
+    type SerializeMap = SerializeMap;
+    type SerializeStruct = SerializeMap;
+    type SerializeStructVariant = SerializeStructVariant;
+
+    fn serialize_bool(self, v: bool) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Boolean(v))
+    }
+
+    fn serialize_i8(self, v: i8) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_i64(v as i64)
+    }
+
+    fn serialize_i16(self, v: i16) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_i64(v as i64)
+    }
+
+    fn serialize_i32(self, v: i32) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_i64(v as i64)
+    }
+
+    fn serialize_i64(self, v: i64) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Integer(rmpv::Integer::from(v)))
+    }
+
+    fn serialize_u8(self, v: u8) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_u64(v as u64)
+    }
+
+    fn serialize_u16(self, v: u16) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_u64(v as u64)
+    }
+
+    fn serialize_u32(self, v: u32) -> std::result::Result<rmpv::Value, Self::Error> {
+        self.serialize_u64(v as u64)
+    }
+
+    fn serialize_u64(self, v: u64) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Integer(rmpv::Integer::from(v)))
+    }
+
+    fn serialize_f32(self, v: f32) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::F32(v))
+    }
+
+    fn serialize_f64(self, v: f64) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::F64(v))
+    }
+
+    fn serialize_char(self, v: char) -> std::result::Result<rmpv::Value, Self::Error> {
+        let mut s = String::new();
+        s.push(v);
+        self.serialize_str(&s)
+    }
+
+    fn serialize_str(self, v: &str) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::String(rmpv::Utf8String::from(v)))
+    }
+
+    fn serialize_bytes(self, v: &[u8]) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Binary(v.to_vec()))
+    }
+
+    fn serialize_none(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Nil)
+    }
+
+    fn serialize_some<T: ?Sized + serde::Serialize>(
+        self,
+        value: &T,
+    ) -> std::result::Result<rmpv::Value, Self::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Nil)
+    }
+
+    fn serialize_unit_struct(
+        self,
+        _name: &'static str,
+    ) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Nil)
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        idx: u32,
+        _variant: &'static str,
+    ) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Integer(rmpv::Integer::from(idx)))
+    }
+
+    fn serialize_newtype_struct<T: ?Sized + serde::Serialize>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> std::result::Result<rmpv::Value, Self::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: ?Sized + serde::Serialize>(
+        self,
+        _name: &'static str,
+        idx: u32,
+        _variant: &'static str,
+        value: &T,
+    ) -> std::result::Result<rmpv::Value, Self::Error> {
+        let inner = value.serialize(NamedSerializer)?;
+        Ok(rmpv::Value::Map(vec![(
+            rmpv::Value::Integer(rmpv::Integer::from(idx)),
+            inner,
+        )]))
+    }
+
+    fn serialize_seq(
+        self,
+        len: Option<usize>,
+    ) -> std::result::Result<Self::SerializeSeq, Self::Error> {
+        Ok(SerializeVec {
+            vec: Vec::with_capacity(len.unwrap_or(0)),
+        })
+    }
+
+    fn serialize_tuple(self, len: usize) -> std::result::Result<Self::SerializeTuple, Self::Error> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> std::result::Result<Self::SerializeTupleStruct, Self::Error> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        idx: u32,
+        _variant: &'static str,
+        len: usize,
+    ) -> std::result::Result<Self::SerializeTupleVariant, Self::Error> {
+        Ok(SerializeTupleVariant {
+            idx,
+            vec: Vec::with_capacity(len),
+        })
+    }
+
+    fn serialize_map(
+        self,
+        len: Option<usize>,
+    ) -> std::result::Result<Self::SerializeMap, Self::Error> {
+        Ok(SerializeMap {
+            entries: Vec::with_capacity(len.unwrap_or(0)),
+            cur_key: None,
+        })
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> std::result::Result<Self::SerializeStruct, Self::Error> {
+        self.serialize_map(Some(len))
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        idx: u32,
+        _variant: &'static str,
+        len: usize,
+    ) -> std::result::Result<Self::SerializeStructVariant, Self::Error> {
+        Ok(SerializeStructVariant {
+            idx,
+            entries: Vec::with_capacity(len),
+        })
+    }
+}
+
+struct SerializeVec {
+    vec: Vec<rmpv::Value>,
+}
+
+impl serde::ser::SerializeSeq for SerializeVec {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_element<T: ?Sized + serde::Serialize>(
+        &mut self,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        self.vec.push(value.serialize(NamedSerializer)?);
+        Ok(())
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Array(self.vec))
+    }
+}
+
+impl serde::ser::SerializeTuple for SerializeVec {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_element<T: ?Sized + serde::Serialize>(
+        &mut self,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for SerializeVec {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+struct SerializeTupleVariant {
+    idx: u32,
+    vec: Vec<rmpv::Value>,
+}
+
+impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        self.vec.push(value.serialize(NamedSerializer)?);
+        Ok(())
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Map(vec![(
+            rmpv::Value::Integer(rmpv::Integer::from(self.idx)),
+            rmpv::Value::Array(self.vec),
+        )]))
+    }
+}
+
+struct SerializeMap {
+    entries: Vec<(rmpv::Value, rmpv::Value)>,
+    cur_key: Option<rmpv::Value>,
+}
+
+impl serde::ser::SerializeMap for SerializeMap {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_key<T: ?Sized + serde::Serialize>(
+        &mut self,
+        key: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        self.cur_key = Some(key.serialize(NamedSerializer)?);
+        Ok(())
+    }
+
+    fn serialize_value<T: ?Sized + serde::Serialize>(
+        &mut self,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        let key = self
+            .cur_key
+            .take()
+            .expect("serialize_value called before serialize_key");
+        self.entries.push((key, value.serialize(NamedSerializer)?));
+        Ok(())
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Map(self.entries))
+    }
+}
+
+impl serde::ser::SerializeStruct for SerializeMap {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        let k = rmpv::Value::String(rmpv::Utf8String::from(key));
+        let v = value.serialize(NamedSerializer)?;
+        self.entries.push((k, v));
+        Ok(())
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Map(self.entries))
+    }
+}
+
+struct SerializeStructVariant {
+    idx: u32,
+    entries: Vec<(rmpv::Value, rmpv::Value)>,
+}
+
+impl serde::ser::SerializeStructVariant for SerializeStructVariant {
+    type Ok = rmpv::Value;
+    type Error = rmpv::ext::Error;
+
+    fn serialize_field<T: ?Sized + serde::Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> std::result::Result<(), Self::Error> {
+        let k = rmpv::Value::String(rmpv::Utf8String::from(key));
+        let v = value.serialize(NamedSerializer)?;
+        self.entries.push((k, v));
+        Ok(())
+    }
+
+    fn end(self) -> std::result::Result<rmpv::Value, Self::Error> {
+        Ok(rmpv::Value::Map(vec![(
+            rmpv::Value::Integer(rmpv::Integer::from(self.idx)),
+            rmpv::Value::Map(self.entries),
+        )]))
     }
 }
 
@@ -221,10 +596,10 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
     let msg_type = MessageType::try_from(header[0])?;
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
-    if payload_len > MAX_FRAME_SIZE {
+    if payload_len > MAX_FRAME_PAYLOAD {
         return Err(LightningError::Transport(format!(
             "frame payload {} bytes exceeds maximum {}",
-            payload_len, MAX_FRAME_SIZE
+            payload_len, MAX_FRAME_PAYLOAD
         )));
     }
 
@@ -366,5 +741,63 @@ mod tests {
 
         let deserialized: MyResp = resp.deserialize_data().unwrap();
         assert_eq!(deserialized, original);
+    }
+
+    #[test]
+    fn serialize_to_rmpv_map_handles_nested_structs() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Inner {
+            x: i32,
+            y: String,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Outer {
+            name: String,
+            inner: Inner,
+            values: Vec<u32>,
+        }
+
+        let original = Outer {
+            name: "test".into(),
+            inner: Inner {
+                x: 42,
+                y: "nested".into(),
+            },
+            values: vec![1, 2, 3],
+        };
+
+        let map = serialize_to_rmpv_map(&original).unwrap();
+        assert_eq!(
+            map.get("name").unwrap(),
+            &rmpv::Value::String("test".into())
+        );
+        assert!(matches!(map.get("inner").unwrap(), rmpv::Value::Map(_)));
+        assert!(matches!(map.get("values").unwrap(), rmpv::Value::Array(_)));
+
+        let resp = QuicResponse {
+            success: true,
+            data: map,
+            latency_ms: 0.0,
+            error: None,
+        };
+        let deserialized: Outer = resp.deserialize_data().unwrap();
+        assert_eq!(deserialized, original);
+    }
+
+    #[test]
+    fn handshake_request_message_format() {
+        let msg = handshake_request_message("5GrwvaEF", 1234567890, "abc123", "fp_b64");
+        assert_eq!(msg, "handshake:5GrwvaEF:1234567890:abc123:fp_b64");
+    }
+
+    #[test]
+    fn handshake_response_message_format() {
+        let msg =
+            handshake_response_message("5GrwvaEF", "5FHneW46", 1234567890, "abc123", "fp_b64");
+        assert_eq!(
+            msg,
+            "handshake_response:5GrwvaEF:5FHneW46:1234567890:abc123:fp_b64"
+        );
     }
 }

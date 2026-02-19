@@ -116,7 +116,7 @@ impl RustLightning {
             ))
         })?);
 
-        let mut config = btlightning::ClientConfig_::default();
+        let mut config = btlightning::LightningClientConfig::default();
         if let Some(v) = connect_timeout_secs {
             config.connect_timeout = Duration::from_secs(v);
         }

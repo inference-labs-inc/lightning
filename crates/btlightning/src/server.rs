@@ -3,9 +3,9 @@ use crate::error::{LightningError, Result};
 use crate::signing::BtWalletSigner;
 use crate::signing::{Signer, Sr25519Signer};
 use crate::types::{
-    hashmap_to_rmpv_map, read_frame, serialize_to_rmpv_map, write_frame, write_frame_and_finish,
-    HandshakeRequest, HandshakeResponse, MessageType, StreamChunk, StreamEnd, SynapsePacket,
-    SynapseResponse,
+    handshake_request_message, handshake_response_message, hashmap_to_rmpv_map, read_frame,
+    serialize_to_rmpv_map, write_frame, write_frame_and_finish, HandshakeRequest,
+    HandshakeResponse, MessageType, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -29,6 +29,7 @@ pub struct LightningServerConfig {
     pub idle_timeout_secs: u64,
     pub keep_alive_interval_secs: u64,
     pub nonce_cleanup_interval_secs: u64,
+    pub max_connections: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -38,6 +39,7 @@ impl Default for LightningServerConfig {
             idle_timeout_secs: 150,
             keep_alive_interval_secs: 30,
             nonce_cleanup_interval_secs: 60,
+            max_connections: 128,
         }
     }
 }
@@ -77,19 +79,6 @@ pub struct ValidatorConnection {
     pub last_activity: AtomicU64,
     pub verified: bool,
     pub connection: Arc<quinn::Connection>,
-}
-
-impl Clone for ValidatorConnection {
-    fn clone(&self) -> Self {
-        Self {
-            validator_hotkey: self.validator_hotkey.clone(),
-            connection_id: self.connection_id.clone(),
-            established_at: self.established_at,
-            last_activity: AtomicU64::new(self.last_activity.load(Ordering::Relaxed)),
-            verified: self.verified,
-            connection: self.connection.clone(),
-        }
-    }
 }
 
 impl ValidatorConnection {
@@ -143,9 +132,8 @@ pub struct LightningServer {
 }
 
 impl LightningServer {
-    pub fn new(miner_hotkey: String, host: String, port: u16) -> Self {
+    pub fn new(miner_hotkey: String, host: String, port: u16) -> Result<Self> {
         Self::with_config(miner_hotkey, host, port, LightningServerConfig::default())
-            .expect("default LightningServerConfig is always valid")
     }
 
     pub fn with_config(
@@ -157,6 +145,11 @@ impl LightningServer {
         if config.max_signature_age_secs == 0 {
             return Err(LightningError::Config(
                 "max_signature_age_secs must be non-zero".to_string(),
+            ));
+        }
+        if config.max_signature_age_secs > 3600 {
+            return Err(LightningError::Config(
+                "max_signature_age_secs must not exceed 3600 (1 hour)".to_string(),
             ));
         }
         if config.nonce_cleanup_interval_secs == 0 {
@@ -179,6 +172,11 @@ impl LightningServer {
                 "keep_alive_interval_secs ({}) must be less than idle_timeout_secs ({})",
                 config.keep_alive_interval_secs, config.idle_timeout_secs
             )));
+        }
+        if config.max_connections == 0 {
+            return Err(LightningError::Config(
+                "max_connections must be non-zero".to_string(),
+            ));
         }
         Ok(Self {
             host,
@@ -741,6 +739,23 @@ impl LightningServer {
 
         let remote_addr = connection.remote_address();
         let mut connections_guard = ctx.connections.write().await;
+        let is_reconnect = connections_guard.contains_key(&request.validator_hotkey);
+        if !is_reconnect && connections_guard.len() >= ctx.config.max_connections {
+            error!(
+                "Connection limit reached ({}/{}), rejecting validator {}",
+                connections_guard.len(),
+                ctx.config.max_connections,
+                request.validator_hotkey
+            );
+            return HandshakeResponse {
+                miner_hotkey: ctx.miner_hotkey.clone(),
+                timestamp: now,
+                signature: String::new(),
+                accepted: false,
+                connection_id: String::new(),
+                cert_fingerprint: None,
+            };
+        }
         let mut addr_index = ctx.addr_to_hotkey.write().await;
         let mut validator_conn = ValidatorConnection::new(
             request.validator_hotkey.clone(),
@@ -808,9 +823,11 @@ impl LightningServer {
             .as_ref()
             .map(|fp| BASE64_STANDARD.encode(fp))
             .unwrap_or_default();
-        let expected_message = format!(
-            "handshake:{}:{}:{}:{}",
-            request.validator_hotkey, request.timestamp, request.nonce, fp_b64
+        let expected_message = handshake_request_message(
+            &request.validator_hotkey,
+            request.timestamp,
+            &request.nonce,
+            &fp_b64,
         );
 
         let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
@@ -838,11 +855,17 @@ impl LightningServer {
         signature_array.copy_from_slice(&signature_bytes);
         let signature = sr25519::Signature::from_raw(signature_array);
 
-        let valid = tokio::task::spawn_blocking(move || {
+        let valid = match tokio::task::spawn_blocking(move || {
             sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
         })
         .await
-        .unwrap_or(false);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("signature verification task failed: {}", e);
+                return false;
+            }
+        };
 
         if valid {
             let mut nonces = used_nonces.write().await;
@@ -869,9 +892,12 @@ impl LightningServer {
             .as_ref()
             .map(|fp| BASE64_STANDARD.encode(fp))
             .unwrap_or_default();
-        let message = format!(
-            "handshake_response:{}:{}:{}:{}:{}",
-            request.validator_hotkey, miner_hotkey, timestamp, request.nonce, fp_b64
+        let message = handshake_response_message(
+            &request.validator_hotkey,
+            miner_hotkey,
+            timestamp,
+            &request.nonce,
+            &fp_b64,
         );
         let sig = signer.sign(message.as_bytes())?;
         Ok(BASE64_STANDARD.encode(sig))
@@ -882,12 +908,14 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         ctx: &ServerContext,
     ) -> SynapseResponse {
-        debug!("Processing {} synapse packet", packet.synapse_type);
-
-        let _validator_hotkey = match Self::verify_synapse_auth(&connection, ctx).await {
+        let validator_hotkey = match Self::verify_synapse_auth(&connection, ctx).await {
             Ok(hotkey) => hotkey,
             Err(err_response) => return err_response,
         };
+        debug!(
+            "Processing {} synapse from {}",
+            packet.synapse_type, validator_hotkey
+        );
 
         let async_handlers = ctx.async_handlers.read().await;
         if let Some(handler) = async_handlers.get(&packet.synapse_type) {
@@ -1283,5 +1311,41 @@ mod tests {
         let data = HashMap::new();
         let err = handler.handle("test", data).unwrap_err();
         assert!(err.to_string().contains("something went wrong"));
+    }
+
+    #[test]
+    fn config_rejects_zero_max_connections() {
+        let config = LightningServerConfig {
+            max_connections: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_signature_age_exceeding_one_hour() {
+        let config = LightningServerConfig {
+            max_signature_age_secs: 3601,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_accepts_signature_age_at_one_hour() {
+        let config = LightningServerConfig {
+            max_signature_age_secs: 3600,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        let result = LightningServer::new("test".into(), "0.0.0.0".into(), 8443);
+        assert!(result.is_ok());
     }
 }
