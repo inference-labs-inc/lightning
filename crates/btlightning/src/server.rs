@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+#[derive(Copy, Clone)]
 pub struct LightningServerConfig {
     pub max_signature_age_secs: u64,
     pub idle_timeout_secs: u64,
@@ -33,17 +34,6 @@ impl Default for LightningServerConfig {
             idle_timeout_secs: 150,
             keep_alive_interval_secs: 30,
             nonce_cleanup_interval_secs: 60,
-        }
-    }
-}
-
-impl Clone for LightningServerConfig {
-    fn clone(&self) -> Self {
-        Self {
-            max_signature_age_secs: self.max_signature_age_secs,
-            idle_timeout_secs: self.idle_timeout_secs,
-            keep_alive_interval_secs: self.keep_alive_interval_secs,
-            nonce_cleanup_interval_secs: self.nonce_cleanup_interval_secs,
         }
     }
 }
@@ -268,7 +258,11 @@ impl LightningServer {
                     nonces.retain(|_, ts| *ts > cutoff);
                 }
             });
-            *self.cleanup_handle.lock().await = Some(handle);
+            let mut guard = self.cleanup_handle.lock().await;
+            if let Some(old) = guard.take() {
+                old.abort();
+            }
+            *guard = Some(handle);
 
             while let Some(conn) = endpoint.accept().await {
                 let ctx = self.ctx.clone();
