@@ -545,6 +545,27 @@ impl LightningServer {
                     .as_millis()
             );
 
+            let signature = match Self::sign_handshake_response(
+                &request,
+                &ctx.miner_hotkey,
+                ctx.miner_signer.as_deref(),
+                now,
+                &cert_fp,
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    error!("Handshake signing failed: {}", e);
+                    return HandshakeResponse {
+                        miner_hotkey: ctx.miner_hotkey.clone(),
+                        timestamp: unix_timestamp_secs(),
+                        signature: String::new(),
+                        accepted: false,
+                        connection_id: String::new(),
+                        cert_fingerprint: None,
+                    };
+                }
+            };
+
             let remote_addr = connection.remote_address();
             let mut connections_guard = ctx.connections.write().await;
             let mut addr_index = ctx.addr_to_hotkey.write().await;
@@ -571,32 +592,13 @@ impl LightningServer {
                 connection_id
             );
 
-            match Self::sign_handshake_response(
-                &request,
-                &ctx.miner_hotkey,
-                ctx.miner_signer.as_deref(),
-                now,
-                &cert_fp,
-            ) {
-                Ok(signature) => HandshakeResponse {
-                    miner_hotkey: ctx.miner_hotkey.clone(),
-                    timestamp: now,
-                    signature,
-                    accepted: true,
-                    connection_id,
-                    cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
-                },
-                Err(e) => {
-                    error!("Handshake signing failed: {}", e);
-                    HandshakeResponse {
-                        miner_hotkey: ctx.miner_hotkey.clone(),
-                        timestamp: unix_timestamp_secs(),
-                        signature: String::new(),
-                        accepted: false,
-                        connection_id: String::new(),
-                        cert_fingerprint: None,
-                    }
-                }
+            HandshakeResponse {
+                miner_hotkey: ctx.miner_hotkey.clone(),
+                timestamp: now,
+                signature,
+                accepted: true,
+                connection_id,
+                cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
             }
         } else {
             error!("Handshake failed: invalid signature");
