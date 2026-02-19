@@ -12,12 +12,11 @@ name = "btlightning"
 crate-type = ["cdylib"]
 
 [dependencies]
-btlightning = { path = "../btlightning" }
-pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
-pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+btlightning = { path = "../btlightning", features = ["btwallet"] }
+pyo3 = { version = "0.26", features = ["extension-module"] }
 tokio = { version = "1.0", features = ["full"] }
 rmpv = { version = "1", features = ["with-serde"] }
 async-trait = "0.1"
 
 [build-dependencies]
-pyo3-build-config = "0.20"
+pyo3-build-config = "0.26"

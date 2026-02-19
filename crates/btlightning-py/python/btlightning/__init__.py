@@ -38,6 +38,14 @@ class Lightning:
     def set_python_signer(self, signer_callback) -> None:
         return self._rust_client.set_python_signer(signer_callback)
 
+    def set_wallet(
+        self,
+        wallet_name: str = "default",
+        wallet_path: str = "~/.bittensor/wallets",
+        hotkey_name: str = "default",
+    ) -> None:
+        return self._rust_client.set_wallet(wallet_name, wallet_path, hotkey_name)
+
     def initialize_connections(self, miners: List[Dict[str, Any]]) -> None:
         return self._rust_client.initialize_connections(miners)
 
@@ -70,6 +78,17 @@ class Lightning:
 class LightningServer:
     def __init__(self, miner_hotkey: str, host: str = "0.0.0.0", port: int = 8443):
         self._rust_server = RustLightningServer(miner_hotkey, host, port)
+
+    def set_miner_keypair(self, keypair_seed: bytes) -> None:
+        return self._rust_server.set_miner_keypair(list(keypair_seed))
+
+    def set_miner_wallet(
+        self,
+        wallet_name: str = "default",
+        wallet_path: str = "~/.bittensor/wallets",
+        hotkey_name: str = "default",
+    ) -> None:
+        return self._rust_server.set_miner_wallet(wallet_name, wallet_path, hotkey_name)
 
     def register_synapse_handler(
         self, synapse_type: str, handler: Callable[[Dict[str, Any]], Dict[str, Any]]
