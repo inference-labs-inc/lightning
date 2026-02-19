@@ -1,7 +1,5 @@
-#![allow(non_local_definitions)]
-
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,17 +62,17 @@ impl PyStreamingResponse {
         slf
     }
 
-    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let response = self.response.clone();
         let runtime = self.runtime.clone();
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             runtime.block_on(async {
                 let mut resp = response.lock().await;
                 resp.next_chunk().await
             })
         });
         match result {
-            Ok(Some(bytes)) => Ok(Some(PyBytes::new(py, &bytes).into())),
+            Ok(Some(bytes)) => Ok(Some(PyBytes::new(py, &bytes).into_any().unbind())),
             Ok(None) => Ok(None),
             Err(e) => Err(to_pyerr(e)),
         }
@@ -145,7 +143,7 @@ impl RustLightning {
 
     pub fn set_validator_keypair(&self, py: Python<'_>, keypair_seed: [u8; 32]) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let mut client = self.client.write().await;
                 client.set_signer(Box::new(btlightning::Sr25519Signer::from_seed(
@@ -156,9 +154,9 @@ impl RustLightning {
         Ok(())
     }
 
-    pub fn set_python_signer(&self, py: Python<'_>, signer_callback: PyObject) -> PyResult<()> {
+    pub fn set_python_signer(&self, py: Python<'_>, signer_callback: Py<PyAny>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let mut client = self.client.write().await;
                 client.set_signer(Box::new(PythonSigner::new(signer_callback)));
@@ -167,14 +165,31 @@ impl RustLightning {
         Ok(())
     }
 
-    pub fn initialize_connections(&self, py: Python<'_>, miners: Vec<PyObject>) -> PyResult<()> {
+    pub fn set_wallet(
+        &self,
+        py: Python<'_>,
+        wallet_name: String,
+        wallet_path: String,
+        hotkey_name: String,
+    ) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(|| {
+            runtime.block_on(async {
+                let mut client = self.client.write().await;
+                client.set_wallet(&wallet_name, &wallet_path, &hotkey_name)
+            })
+        })
+        .map_err(to_pyerr)
+    }
+
+    pub fn initialize_connections(&self, py: Python<'_>, miners: Vec<Py<PyAny>>) -> PyResult<()> {
         let mut quic_miners = Vec::new();
         for miner_obj in miners {
             quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
         }
 
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let mut client = self.client.write().await;
                 client.initialize_connections(quic_miners).await
@@ -186,15 +201,15 @@ impl RustLightning {
     pub fn query_axon(
         &self,
         py: Python<'_>,
-        axon_data: PyObject,
-        request_data: PyObject,
-    ) -> PyResult<PyObject> {
+        axon_data: Py<PyAny>,
+        request_data: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         let axon_info = extract_quic_axon_info(py, &axon_data)?;
         let request = extract_quic_request(py, &request_data)?;
 
         let runtime = Arc::clone(&self.runtime);
         let response = py
-            .allow_threads(|| {
+            .detach(|| {
                 runtime.block_on(async {
                     let client = self.client.read().await;
                     client.query_axon(axon_info, request).await
@@ -202,7 +217,7 @@ impl RustLightning {
             })
             .map_err(to_pyerr)?;
 
-        let result_dict = pyo3::types::PyDict::new(py);
+        let result_dict = PyDict::new(py);
         result_dict.set_item("success", response.success)?;
         result_dict.set_item("latency_ms", response.latency_ms)?;
 
@@ -211,21 +226,21 @@ impl RustLightning {
             result_dict.set_item(key, py_value)?;
         }
 
-        Ok(result_dict.into())
+        Ok(result_dict.into_any().unbind())
     }
 
     pub fn query_axon_stream(
         &self,
         py: Python<'_>,
-        axon_data: PyObject,
-        request_data: PyObject,
+        axon_data: Py<PyAny>,
+        request_data: Py<PyAny>,
     ) -> PyResult<PyStreamingResponse> {
         let axon_info = extract_quic_axon_info(py, &axon_data)?;
         let request = extract_quic_request(py, &request_data)?;
 
         let runtime = Arc::clone(&self.runtime);
         let streaming_response = py
-            .allow_threads(|| {
+            .detach(|| {
                 runtime.block_on(async {
                     let client = self.client.read().await;
                     client.query_axon_stream(axon_info, request).await
@@ -239,14 +254,14 @@ impl RustLightning {
         })
     }
 
-    pub fn update_miner_registry(&self, py: Python<'_>, miners: Vec<PyObject>) -> PyResult<()> {
+    pub fn update_miner_registry(&self, py: Python<'_>, miners: Vec<Py<PyAny>>) -> PyResult<()> {
         let mut quic_miners = Vec::new();
         for miner_obj in miners {
             quic_miners.push(extract_quic_axon_info(py, &miner_obj)?);
         }
 
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let client = self.client.read().await;
                 client.update_miner_registry(quic_miners).await
@@ -255,10 +270,10 @@ impl RustLightning {
         .map_err(to_pyerr)
     }
 
-    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let runtime = Arc::clone(&self.runtime);
         let stats = py
-            .allow_threads(|| {
+            .detach(|| {
                 runtime.block_on(async {
                     let client = self.client.read().await;
                     client.get_connection_stats().await
@@ -266,16 +281,16 @@ impl RustLightning {
             })
             .map_err(to_pyerr)?;
 
-        let result_dict = pyo3::types::PyDict::new(py);
+        let result_dict = PyDict::new(py);
         for (key, value) in stats {
             result_dict.set_item(key, value)?;
         }
-        Ok(result_dict.into())
+        Ok(result_dict.into_any().unbind())
     }
 
     pub fn close_all_connections(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let client = self.client.read().await;
                 client.close_all_connections().await
@@ -341,14 +356,42 @@ impl RustLightningServer {
         })
     }
 
+    pub fn set_miner_keypair(&self, py: Python<'_>, keypair_seed: [u8; 32]) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(|| {
+            runtime.block_on(async {
+                let mut server = self.server.write().await;
+                server.set_miner_keypair(keypair_seed);
+            })
+        });
+        Ok(())
+    }
+
+    pub fn set_miner_wallet(
+        &self,
+        py: Python<'_>,
+        wallet_name: String,
+        wallet_path: String,
+        hotkey_name: String,
+    ) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(|| {
+            runtime.block_on(async {
+                let mut server = self.server.write().await;
+                server.set_miner_wallet(&wallet_name, &wallet_path, &hotkey_name)
+            })
+        })
+        .map_err(to_pyerr)
+    }
+
     pub fn register_synapse_handler(
         &self,
         py: Python<'_>,
         synapse_type: String,
-        handler: PyObject,
+        handler: Py<PyAny>,
     ) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
                 server
@@ -366,10 +409,10 @@ impl RustLightningServer {
         &self,
         py: Python<'_>,
         synapse_type: String,
-        handler: PyObject,
+        handler: Py<PyAny>,
     ) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
                 server
@@ -385,7 +428,7 @@ impl RustLightningServer {
 
     pub fn start(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let mut server = self.server.write().await;
                 server.start().await
@@ -396,7 +439,7 @@ impl RustLightningServer {
 
     pub fn serve_forever(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
                 server.serve_forever().await
@@ -405,10 +448,10 @@ impl RustLightningServer {
         .map_err(to_pyerr)
     }
 
-    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn get_connection_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let runtime = Arc::clone(&self.runtime);
         let stats = py
-            .allow_threads(|| {
+            .detach(|| {
                 runtime.block_on(async {
                     let server = self.server.read().await;
                     server.get_connection_stats().await
@@ -416,16 +459,16 @@ impl RustLightningServer {
             })
             .map_err(to_pyerr)?;
 
-        let result_dict = pyo3::types::PyDict::new(py);
+        let result_dict = PyDict::new(py);
         for (key, value) in stats {
             result_dict.set_item(key, value)?;
         }
-        Ok(result_dict.into())
+        Ok(result_dict.into_any().unbind())
     }
 
     pub fn cleanup_stale_connections(&self, py: Python<'_>, max_idle_seconds: u64) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
                 server.cleanup_stale_connections(max_idle_seconds).await
@@ -436,7 +479,7 @@ impl RustLightningServer {
 
     pub fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
-        py.allow_threads(|| {
+        py.detach(|| {
             runtime.block_on(async {
                 let server = self.server.read().await;
                 server.stop().await
@@ -446,8 +489,11 @@ impl RustLightningServer {
     }
 }
 
-fn extract_quic_request(py: Python, request_data: &PyObject) -> PyResult<btlightning::QuicRequest> {
-    let request_dict = request_data.extract::<HashMap<String, PyObject>>(py)?;
+fn extract_quic_request(
+    py: Python,
+    request_data: &Py<pyo3::PyAny>,
+) -> PyResult<btlightning::QuicRequest> {
+    let request_dict = request_data.extract::<HashMap<String, Py<pyo3::PyAny>>>(py)?;
 
     let synapse_type = request_dict
         .get("synapse_type")
@@ -458,9 +504,9 @@ fn extract_quic_request(py: Python, request_data: &PyObject) -> PyResult<btlight
 
     let mut data = HashMap::new();
     if let Some(data_obj) = request_dict.get("data") {
-        let data_dict = data_obj.extract::<HashMap<String, PyObject>>(py)?;
+        let data_dict = data_obj.extract::<HashMap<String, Py<pyo3::PyAny>>>(py)?;
         for (key, value) in data_dict {
-            let val = value.as_ref(py);
+            let val = value.bind(py);
             let msgpack_value = py_to_msgpack_value(val).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "Failed to convert Python value to msgpack: {}",
@@ -474,8 +520,11 @@ fn extract_quic_request(py: Python, request_data: &PyObject) -> PyResult<btlight
     Ok(btlightning::QuicRequest::new(synapse_type, data))
 }
 
-fn extract_quic_axon_info(py: Python, miner_obj: &PyObject) -> PyResult<btlightning::QuicAxonInfo> {
-    let miner_dict = miner_obj.extract::<HashMap<String, PyObject>>(py)?;
+fn extract_quic_axon_info(
+    py: Python,
+    miner_obj: &Py<pyo3::PyAny>,
+) -> PyResult<btlightning::QuicAxonInfo> {
+    let miner_dict = miner_obj.extract::<HashMap<String, Py<pyo3::PyAny>>>(py)?;
 
     let hotkey = miner_dict
         .get("hotkey")
@@ -519,7 +568,7 @@ fn extract_quic_axon_info(py: Python, miner_obj: &PyObject) -> PyResult<btlightn
 }
 
 #[pymodule]
-fn _native(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _native(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RustLightning>()?;
     m.add_class::<RustLightningServer>()?;
     m.add_class::<PyStreamingResponse>()?;

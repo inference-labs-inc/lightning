@@ -138,6 +138,19 @@ impl LightningClient {
         info!("Signer configured");
     }
 
+    #[cfg(feature = "btwallet")]
+    pub fn set_wallet(
+        &mut self,
+        wallet_name: &str,
+        wallet_path: &str,
+        hotkey_name: &str,
+    ) -> Result<()> {
+        let signer =
+            crate::signing::BtWalletSigner::from_wallet(wallet_name, wallet_path, hotkey_name)?;
+        self.set_signer(Box::new(signer));
+        Ok(())
+    }
+
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
 

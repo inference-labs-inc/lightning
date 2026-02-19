@@ -1,5 +1,3 @@
-#![allow(non_local_definitions)]
-
 use btlightning::types::QuicAxonInfo as CoreQuicAxonInfo;
 use pyo3::prelude::*;
 
