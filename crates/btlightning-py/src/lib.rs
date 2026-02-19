@@ -18,7 +18,10 @@ use types::PyQuicAxonInfo;
 fn to_pyerr(err: btlightning::LightningError) -> PyErr {
     match err {
         btlightning::LightningError::Connection(msg) => {
-            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(msg)
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "connection error: {}",
+                msg
+            ))
         }
         btlightning::LightningError::Handshake(msg) => {
             PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
@@ -27,7 +30,7 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
             ))
         }
         btlightning::LightningError::Config(msg) => {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("config error: {}", msg))
         }
         btlightning::LightningError::Serialization(msg) => {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("serialization error: {}", msg))
@@ -348,7 +351,8 @@ impl RustLightningServer {
             config.nonce_cleanup_interval_secs = v;
         }
 
-        let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config);
+        let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
+            .map_err(to_pyerr)?;
 
         Ok(Self {
             server: RwLock::new(server),

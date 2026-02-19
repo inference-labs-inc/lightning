@@ -1,3 +1,5 @@
+import sys
+import traceback
 from typing import Callable, Dict, Any, List, Optional, Iterator
 
 from btlightning._native import (
@@ -72,7 +74,7 @@ class Lightning:
         try:
             self.close()
         except Exception:
-            pass
+            sys.stderr.write(f"Lightning.__del__: {traceback.format_exc()}")
 
 
 class LightningServer:
@@ -136,7 +138,7 @@ class LightningServer:
         try:
             self.stop()
         except Exception:
-            pass
+            sys.stderr.write(f"LightningServer.__del__: {traceback.format_exc()}")
 
 
 __all__ = [

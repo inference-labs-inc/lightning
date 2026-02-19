@@ -134,6 +134,7 @@ pub struct LightningServer {
 impl LightningServer {
     pub fn new(miner_hotkey: String, host: String, port: u16) -> Self {
         Self::with_config(miner_hotkey, host, port, LightningServerConfig::default())
+            .expect("default LightningServerConfig is always valid")
     }
 
     pub fn with_config(
@@ -141,8 +142,14 @@ impl LightningServer {
         host: String,
         port: u16,
         config: LightningServerConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if config.keep_alive_interval_secs >= config.idle_timeout_secs {
+            return Err(LightningError::Config(format!(
+                "keep_alive_interval_secs ({}) must be less than idle_timeout_secs ({})",
+                config.keep_alive_interval_secs, config.idle_timeout_secs
+            )));
+        }
+        Ok(Self {
             host,
             port,
             ctx: ServerContext {
@@ -158,7 +165,7 @@ impl LightningServer {
             },
             endpoint: None,
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        })
     }
 
     pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
@@ -264,6 +271,13 @@ impl LightningServer {
 
     pub async fn serve_forever(&self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
+            {
+                let mut guard = self.cleanup_handle.lock().await;
+                if let Some(old) = guard.take() {
+                    old.abort();
+                }
+            }
+
             let nonces_for_cleanup = self.ctx.used_nonces.clone();
             let cleanup_interval_secs = self.ctx.config.nonce_cleanup_interval_secs;
             let max_sig_age = self.ctx.config.max_signature_age_secs;
@@ -274,14 +288,10 @@ impl LightningServer {
                     interval.tick().await;
                     let mut nonces = nonces_for_cleanup.write().await;
                     let cutoff = unix_timestamp_secs().saturating_sub(max_sig_age);
-                    nonces.retain(|_, ts| *ts > cutoff);
+                    nonces.retain(|_, ts| *ts >= cutoff);
                 }
             });
-            let mut guard = self.cleanup_handle.lock().await;
-            if let Some(old) = guard.take() {
-                old.abort();
-            }
-            *guard = Some(handle);
+            *self.cleanup_handle.lock().await = Some(handle);
 
             while let Some(conn) = endpoint.accept().await {
                 let ctx = self.ctx.clone();
@@ -322,16 +332,18 @@ impl LightningServer {
         }
 
         let remote_addr = connection.remote_address();
-        let hotkey = {
-            let addr_index = ctx.addr_to_hotkey.read().await;
-            addr_index.get(&remote_addr).cloned()
-        };
-        if let Some(hotkey) = hotkey {
-            let mut connections = ctx.connections.write().await;
-            let mut addr_index = ctx.addr_to_hotkey.write().await;
-            connections.remove(&hotkey);
-            addr_index.remove(&remote_addr);
+        let mut connections = ctx.connections.write().await;
+        let mut addr_index = ctx.addr_to_hotkey.write().await;
+        if let Some(hotkey) = addr_index.get(&remote_addr).cloned() {
+            if let Some(existing) = connections.get(&hotkey) {
+                if Arc::ptr_eq(&existing.connection, &connection) {
+                    connections.remove(&hotkey);
+                    addr_index.remove(&remote_addr);
+                }
+            }
         }
+        drop(addr_index);
+        drop(connections);
         connection.close(0u32.into(), b"done");
     }
 
@@ -680,6 +692,7 @@ impl LightningServer {
         if let Some(prev_conn) =
             connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
         {
+            prev_conn.connection.close(0u32.into(), b"replaced");
             let prev_addr = prev_conn.connection.remote_address();
             if prev_addr != remote_addr {
                 addr_index.remove(&prev_addr);
@@ -713,7 +726,7 @@ impl LightningServer {
         let current_time = unix_timestamp_secs();
 
         if current_time > request.timestamp
-            && (current_time - request.timestamp) > max_signature_age
+            && (current_time - request.timestamp) >= max_signature_age
         {
             error!(
                 "Signature timestamp too old: {} (current: {})",
@@ -908,7 +921,7 @@ impl LightningServer {
     pub async fn cleanup_expired_nonces(&self) {
         let mut nonces = self.ctx.used_nonces.write().await;
         let cutoff = unix_timestamp_secs().saturating_sub(self.ctx.config.max_signature_age_secs);
-        nonces.retain(|_, ts| *ts > cutoff);
+        nonces.retain(|_, ts| *ts >= cutoff);
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -929,5 +942,40 @@ impl LightningServer {
 
         info!("Lightning QUIC server stopped, all connections closed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_rejects_keepalive_ge_idle_timeout() {
+        let config = LightningServerConfig {
+            keep_alive_interval_secs: 150,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+
+        let config = LightningServerConfig {
+            keep_alive_interval_secs: 200,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_accepts_keepalive_lt_idle_timeout() {
+        let config = LightningServerConfig {
+            keep_alive_interval_secs: 30,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_ok());
     }
 }
