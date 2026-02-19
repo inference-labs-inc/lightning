@@ -99,7 +99,9 @@ impl RustLightning {
         reconnect_initial_backoff_secs=None,
         reconnect_max_backoff_secs=None,
         reconnect_max_retries=None,
+        max_connections=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         wallet_hotkey: String,
         connect_timeout_secs: Option<u64>,
@@ -108,6 +110,7 @@ impl RustLightning {
         reconnect_initial_backoff_secs: Option<u64>,
         reconnect_max_backoff_secs: Option<u64>,
         reconnect_max_retries: Option<u32>,
+        max_connections: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -116,7 +119,7 @@ impl RustLightning {
             ))
         })?);
 
-        let mut config = btlightning::ClientConfig_::default();
+        let mut config = btlightning::LightningClientConfig::default();
         if let Some(v) = connect_timeout_secs {
             config.connect_timeout = Duration::from_secs(v);
         }
@@ -134,6 +137,9 @@ impl RustLightning {
         }
         if let Some(v) = reconnect_max_retries {
             config.reconnect_max_retries = v;
+        }
+        if let Some(v) = max_connections {
+            config.max_connections = v;
         }
 
         let client = btlightning::LightningClient::with_config(wallet_hotkey, config);
@@ -342,7 +348,9 @@ impl RustLightningServer {
         idle_timeout_secs=None,
         keep_alive_interval_secs=None,
         nonce_cleanup_interval_secs=None,
+        max_connections=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         miner_hotkey: String,
         host: String,
@@ -351,6 +359,7 @@ impl RustLightningServer {
         idle_timeout_secs: Option<u64>,
         keep_alive_interval_secs: Option<u64>,
         nonce_cleanup_interval_secs: Option<u64>,
+        max_connections: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -371,6 +380,9 @@ impl RustLightningServer {
         }
         if let Some(v) = nonce_cleanup_interval_secs {
             config.nonce_cleanup_interval_secs = v;
+        }
+        if let Some(v) = max_connections {
+            config.max_connections = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)

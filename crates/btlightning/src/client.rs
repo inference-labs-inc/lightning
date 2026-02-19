@@ -1,12 +1,11 @@
-use crate::connection_pool::ConnectionPool;
 use crate::error::{LightningError, Result};
 use crate::signing::Signer;
 use crate::types::{
-    read_frame, write_frame_and_finish, HandshakeRequest, HandshakeResponse, MessageType,
-    QuicAxonInfo, QuicRequest, QuicResponse, StreamChunk, StreamEnd, SynapsePacket,
-    SynapseResponse, MAX_RESPONSE_SIZE,
+    handshake_request_message, handshake_response_message, read_frame, write_frame_and_finish,
+    HandshakeRequest, HandshakeResponse, MessageType, QuicAxonInfo, QuicRequest, QuicResponse,
+    StreamChunk, StreamEnd, SynapsePacket, SynapseResponse, MAX_RESPONSE_SIZE,
 };
-use crate::util::{unix_timestamp_millis, unix_timestamp_secs};
+use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use rustls::ClientConfig as RustlsClientConfig;
@@ -19,16 +18,17 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-pub struct ClientConfig_ {
+pub struct LightningClientConfig {
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
     pub keep_alive_interval: Duration,
     pub reconnect_initial_backoff: Duration,
     pub reconnect_max_backoff: Duration,
     pub reconnect_max_retries: u32,
+    pub max_connections: usize,
 }
 
-impl Default for ClientConfig_ {
+impl Default for LightningClientConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
@@ -37,6 +37,7 @@ impl Default for ClientConfig_ {
             reconnect_initial_backoff: Duration::from_secs(1),
             reconnect_max_backoff: Duration::from_secs(60),
             reconnect_max_retries: 5,
+            max_connections: 1024,
         }
     }
 }
@@ -44,6 +45,12 @@ impl Default for ClientConfig_ {
 struct ReconnectState {
     attempts: u32,
     next_retry_at: Instant,
+}
+
+struct ClientState {
+    active_miners: HashMap<String, QuicAxonInfo>,
+    established_connections: HashMap<String, Connection>,
+    reconnect_states: HashMap<String, ReconnectState>,
 }
 
 pub struct StreamingResponse {
@@ -105,30 +112,28 @@ impl StreamingResponse {
 }
 
 pub struct LightningClient {
-    config: ClientConfig_,
+    config: LightningClientConfig,
     wallet_hotkey: String,
     signer: Option<Arc<dyn Signer>>,
-    connection_pool: Arc<RwLock<ConnectionPool>>,
-    active_miners: Arc<RwLock<HashMap<String, QuicAxonInfo>>>,
-    established_connections: Arc<RwLock<HashMap<String, Connection>>>,
-    reconnect_states: Arc<RwLock<HashMap<String, ReconnectState>>>,
+    state: Arc<RwLock<ClientState>>,
     endpoint: Option<Endpoint>,
 }
 
 impl LightningClient {
     pub fn new(wallet_hotkey: String) -> Self {
-        Self::with_config(wallet_hotkey, ClientConfig_::default())
+        Self::with_config(wallet_hotkey, LightningClientConfig::default())
     }
 
-    pub fn with_config(wallet_hotkey: String, config: ClientConfig_) -> Self {
+    pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Self {
         Self {
             config,
             wallet_hotkey,
             signer: None,
-            connection_pool: Arc::new(RwLock::new(ConnectionPool::new())),
-            active_miners: Arc::new(RwLock::new(HashMap::new())),
-            established_connections: Arc::new(RwLock::new(HashMap::new())),
-            reconnect_states: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(ClientState {
+                active_miners: HashMap::new(),
+                established_connections: HashMap::new(),
+                reconnect_states: HashMap::new(),
+            })),
             endpoint: None,
         }
     }
@@ -188,23 +193,18 @@ impl LightningClient {
             });
         }
 
-        let mut active_miners = self.active_miners.write().await;
-        let mut pool = self.connection_pool.write().await;
-        let mut connections = self.established_connections.write().await;
+        let mut state = self.state.write().await;
 
         while let Some(join_result) = set.join_next().await {
             match join_result {
                 Ok((miner_key, miner, result)) => match result {
                     Ok(connection) => {
-                        let connection_id =
-                            format!("{}:{}:{}", miner.ip, miner.port, unix_timestamp_millis());
-                        pool.add_connection(&miner_key, connection_id);
-                        active_miners.insert(miner_key.clone(), miner);
+                        state.active_miners.insert(miner_key.clone(), miner);
                         info!(
                             "Established persistent QUIC connection to miner: {}",
                             miner_key
                         );
-                        connections.insert(miner_key, connection);
+                        state.established_connections.insert(miner_key, connection);
                     }
                     Err(e) => {
                         error!("Failed to connect to miner {}: {}", miner_key, e);
@@ -258,8 +258,8 @@ impl LightningClient {
         let miner_key = format!("{}:{}", axon_info.ip, axon_info.port);
 
         let connection = {
-            let connections = self.established_connections.read().await;
-            connections.get(&miner_key).cloned()
+            let state = self.state.read().await;
+            state.established_connections.get(&miner_key).cloned()
         };
 
         match connection {
@@ -292,8 +292,8 @@ impl LightningClient {
         let miner_key = format!("{}:{}", axon_info.ip, axon_info.port);
 
         let connection = {
-            let connections = self.established_connections.read().await;
-            connections.get(&miner_key).cloned()
+            let state = self.state.read().await;
+            state.established_connections.get(&miner_key).cloned()
         };
 
         match connection {
@@ -327,21 +327,26 @@ impl LightningClient {
         open_streaming_synapse(&connection, request).await
     }
 
+    // Intentional TOCTOU: read-lock reconnect_states for backoff check, drop before
+    // network I/O (connect_and_handshake), then write-lock to update established_connections
+    // and reconnect_states. This avoids holding a write lock across network calls at the cost
+    // of allowing concurrent reconnections for the same miner_key — benign because the later
+    // write simply overwrites the connection entry, wasting only redundant handshake work.
     async fn try_reconnect(&self, miner_key: &str, axon_info: &QuicAxonInfo) -> Result<Connection> {
         {
-            let states = self.reconnect_states.read().await;
-            if let Some(state) = states.get(miner_key) {
-                if state.attempts >= self.config.reconnect_max_retries {
+            let state = self.state.read().await;
+            if let Some(rs) = state.reconnect_states.get(miner_key) {
+                if rs.attempts >= self.config.reconnect_max_retries {
                     return Err(LightningError::Connection(format!(
                         "Reconnection attempts exhausted for {} ({}/{}), awaiting registry refresh",
-                        miner_key, state.attempts, self.config.reconnect_max_retries
+                        miner_key, rs.attempts, self.config.reconnect_max_retries
                     )));
                 }
-                if Instant::now() < state.next_retry_at {
+                if Instant::now() < rs.next_retry_at {
                     return Err(LightningError::Connection(format!(
                         "Reconnection to {} in backoff, next retry in {:?}",
                         miner_key,
-                        state.next_retry_at - Instant::now()
+                        rs.next_retry_at - Instant::now()
                     )));
                 }
             }
@@ -381,33 +386,31 @@ impl LightningClient {
 
         match reconnect_result {
             Ok(connection) => {
-                {
-                    let mut connections = self.established_connections.write().await;
-                    connections.insert(miner_key.to_string(), connection.clone());
-                }
-                {
-                    let mut states = self.reconnect_states.write().await;
-                    states.remove(miner_key);
-                }
+                let mut state = self.state.write().await;
+                state
+                    .established_connections
+                    .insert(miner_key.to_string(), connection.clone());
+                state.reconnect_states.remove(miner_key);
                 info!("Reconnected to miner {}", miner_key);
                 Ok(connection)
             }
             Err(e) => {
-                let mut states = self.reconnect_states.write().await;
-                let state = states
+                let mut state = self.state.write().await;
+                let rs = state
+                    .reconnect_states
                     .entry(miner_key.to_string())
                     .or_insert_with(|| ReconnectState {
                         attempts: 0,
                         next_retry_at: Instant::now(),
                     });
-                state.attempts += 1;
-                let shift = state.attempts.min(20);
+                rs.attempts += 1;
+                let shift = rs.attempts.min(20);
                 let backoff = (self.config.reconnect_initial_backoff * 2u32.pow(shift))
                     .min(self.config.reconnect_max_backoff);
-                state.next_retry_at = Instant::now() + backoff;
+                rs.next_retry_at = Instant::now() + backoff;
                 error!(
                     "Reconnection to {} failed (attempt {}/{}), next retry in {:?}: {}",
-                    miner_key, state.attempts, self.config.reconnect_max_retries, backoff, e
+                    miner_key, rs.attempts, self.config.reconnect_max_retries, backoff, e
                 );
                 Err(e)
             }
@@ -422,34 +425,49 @@ impl LightningClient {
 
         let new_miner_keys: Vec<(String, QuicAxonInfo)>;
         {
-            let mut active_miners = self.active_miners.write().await;
-            let mut pool = self.connection_pool.write().await;
-            let mut connections = self.established_connections.write().await;
-            let mut reconnect_states = self.reconnect_states.write().await;
+            let mut state = self.state.write().await;
 
-            let active_keys: Vec<String> = active_miners.keys().cloned().collect();
+            let active_keys: Vec<String> = state.active_miners.keys().cloned().collect();
             for key in active_keys {
                 if !current_miners.contains_key(&key) {
                     info!("Miner deregistered, closing QUIC connection: {}", key);
-                    if let Some(connection) = connections.remove(&key) {
+                    if let Some(connection) = state.established_connections.remove(&key) {
                         connection.close(0u32.into(), b"miner_deregistered");
                     }
-                    pool.remove_connection(&key);
-                    active_miners.remove(&key);
-                    reconnect_states.remove(&key);
+                    state.active_miners.remove(&key);
+                    state.reconnect_states.remove(&key);
                 }
             }
 
             for key in current_miners.keys() {
-                if reconnect_states.remove(key).is_some() {
+                if state.reconnect_states.remove(key).is_some() {
                     info!("Registry refresh reset reconnection backoff for {}", key);
                 }
             }
 
-            new_miner_keys = current_miners
+            let remaining_capacity = self
+                .config
+                .max_connections
+                .saturating_sub(state.active_miners.len());
+            let eligible: Vec<(String, QuicAxonInfo)> = current_miners
                 .into_iter()
-                .filter(|(key, _)| !active_miners.contains_key(key))
+                .filter(|(key, _)| !state.active_miners.contains_key(key))
                 .collect();
+
+            if eligible.len() > remaining_capacity {
+                warn!(
+                    "Connection limit ({}) reached, skipping {} of {} new miners",
+                    self.config.max_connections,
+                    eligible.len() - remaining_capacity,
+                    eligible.len()
+                );
+            }
+
+            new_miner_keys = eligible.into_iter().take(remaining_capacity).collect();
+
+            for (key, miner) in &new_miner_keys {
+                state.active_miners.insert(key.clone(), miner.clone());
+            }
         }
 
         if !new_miner_keys.is_empty() {
@@ -485,34 +503,21 @@ impl LightningClient {
                             key
                         ))),
                     };
-                    (key, miner, result)
+                    (key, result)
                 });
             }
 
-            let mut active_miners = self.active_miners.write().await;
-            let mut pool = self.connection_pool.write().await;
-            let mut connections = self.established_connections.write().await;
+            let mut state = self.state.write().await;
 
             while let Some(join_result) = set.join_next().await {
                 match join_result {
-                    Ok((key, miner, result)) => match result {
+                    Ok((key, result)) => match result {
                         Ok(connection) => {
-                            if active_miners.contains_key(&key) {
-                                connection.close(0u32.into(), b"duplicate");
-                            } else {
-                                let connection_id = format!(
-                                    "{}:{}:{}",
-                                    miner.ip,
-                                    miner.port,
-                                    unix_timestamp_millis()
-                                );
-                                pool.add_connection(&key, connection_id);
-                                active_miners.insert(key.clone(), miner);
-                                connections.insert(key, connection);
-                            }
+                            state.established_connections.insert(key, connection);
                         }
                         Err(e) => {
                             error!("Failed to connect to new miner {}: {}", key, e);
+                            state.active_miners.remove(&key);
                         }
                     },
                     Err(e) => {
@@ -526,24 +531,21 @@ impl LightningClient {
     }
 
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
-        let pool = self.connection_pool.read().await;
-        let active_miners = self.active_miners.read().await;
-        let connections = self.established_connections.read().await;
+        let state = self.state.read().await;
 
         let mut stats = HashMap::new();
         stats.insert(
             "total_connections".to_string(),
-            pool.connection_count().to_string(),
+            state.established_connections.len().to_string(),
         );
-        stats.insert("active_miners".to_string(), active_miners.len().to_string());
         stats.insert(
-            "quic_connections".to_string(),
-            connections.len().to_string(),
+            "active_miners".to_string(),
+            state.active_miners.len().to_string(),
         );
 
-        for (key, _) in active_miners.iter() {
-            if let Some(connection_id) = pool.get_connection(key) {
-                stats.insert(format!("connection_{}", key), connection_id);
+        for key in state.active_miners.keys() {
+            if state.established_connections.contains_key(key) {
+                stats.insert(format!("connection_{}", key), "active".to_string());
             }
         }
 
@@ -551,18 +553,14 @@ impl LightningClient {
     }
 
     pub async fn close_all_connections(&self) -> Result<()> {
-        let mut pool = self.connection_pool.write().await;
-        let mut active_miners = self.active_miners.write().await;
-        let mut connections = self.established_connections.write().await;
-        let mut reconnect_states = self.reconnect_states.write().await;
+        let mut state = self.state.write().await;
 
-        for (_, connection) in connections.drain() {
+        for (_, connection) in state.established_connections.drain() {
             connection.close(0u32.into(), b"client_shutdown");
         }
 
-        pool.close_all();
-        active_miners.clear();
-        reconnect_states.clear();
+        state.active_miners.clear();
+        state.reconnect_states.clear();
 
         info!("All Lightning QUIC connections closed");
         Ok(())
@@ -592,18 +590,14 @@ async fn connect_and_handshake(
         .await
         .map_err(|e| LightningError::Connection(format!("Connection handshake failed: {}", e)))?;
 
-    let peer_cert_fp = get_peer_cert_fingerprint(&connection);
-    let peer_cert_fp_b64 = peer_cert_fp
-        .as_ref()
-        .map(|fp| BASE64_STANDARD.encode(fp))
-        .unwrap_or_default();
+    let peer_cert_fp = get_peer_cert_fingerprint(&connection).ok_or_else(|| {
+        LightningError::Handshake("peer certificate not available for fingerprinting".to_string())
+    })?;
+    let peer_cert_fp_b64 = BASE64_STANDARD.encode(peer_cert_fp);
 
     let nonce = generate_nonce();
     let timestamp = unix_timestamp_secs();
-    let message = format!(
-        "handshake:{}:{}:{}:{}",
-        wallet_hotkey, timestamp, nonce, peer_cert_fp_b64
-    );
+    let message = handshake_request_message(&wallet_hotkey, timestamp, &nonce, &peer_cert_fp_b64);
     let signature_bytes = signer.sign(message.as_bytes())?;
 
     let handshake_request = HandshakeRequest {
@@ -653,9 +647,12 @@ async fn verify_miner_response_signature(
         ));
     }
 
-    let expected_message = format!(
-        "handshake_response:{}:{}:{}:{}:{}",
-        validator_hotkey, response.miner_hotkey, response.timestamp, nonce, cert_fp_b64
+    let expected_message = handshake_response_message(
+        validator_hotkey,
+        &response.miner_hotkey,
+        response.timestamp,
+        nonce,
+        cert_fp_b64,
     );
 
     let public_key = sr25519::Public::from_ss58check(&response.miner_hotkey).map_err(|e| {
@@ -776,7 +773,9 @@ async fn send_synapse_packet(
                 LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
             })?;
 
-            let mut all_data = first_chunk.data;
+            let initial_capacity = (first_chunk.data.len() * 4).min(MAX_RESPONSE_SIZE);
+            let mut all_data = Vec::with_capacity(initial_capacity);
+            all_data.extend_from_slice(&first_chunk.data);
             loop {
                 let (frame_type, frame_payload) = read_frame(&mut recv).await?;
                 match frame_type {
@@ -855,6 +854,10 @@ fn generate_nonce() -> String {
     format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
+// Deliberately disables TLS PKI certificate validation. TLS still provides transport
+// encryption but not identity authentication. Authenticity is instead enforced at the
+// application layer: the handshake exchanges certificate fingerprints and verifies
+// sr25519 signatures over them (see connect_and_handshake / process_handshake).
 struct AcceptAnyCertVerifier;
 
 impl rustls::client::ServerCertVerifier for AcceptAnyCertVerifier {

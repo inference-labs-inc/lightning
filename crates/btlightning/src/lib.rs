@@ -1,12 +1,11 @@
 pub mod client;
-pub mod connection_pool;
 pub mod error;
 pub mod server;
 pub mod signing;
 pub mod types;
 pub mod util;
 
-pub use client::{ClientConfig_, LightningClient, StreamingResponse};
+pub use client::{LightningClient, LightningClientConfig, StreamingResponse};
 pub use error::{LightningError, Result};
 pub use server::{
     typed_async_handler, typed_handler, AsyncSynapseHandler, LightningServer,

@@ -2,17 +2,14 @@ use btlightning::{LightningError, Result, StreamingSynapseHandler, SynapseHandle
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 pub struct PythonSynapseHandler {
-    callback: Mutex<Py<PyAny>>,
+    callback: Py<PyAny>,
 }
 
 impl PythonSynapseHandler {
     pub fn new(callback: Py<PyAny>) -> Self {
-        Self {
-            callback: Mutex::new(callback),
-        }
+        Self { callback }
     }
 }
 
@@ -22,10 +19,6 @@ impl SynapseHandler for PythonSynapseHandler {
         _synapse_type: &str,
         data: HashMap<String, rmpv::Value>,
     ) -> Result<HashMap<String, rmpv::Value>> {
-        let callback = self
-            .callback
-            .lock()
-            .map_err(|e| LightningError::Handler(format!("lock poisoned: {}", e)))?;
         Python::attach(|py| {
             let py_dict = PyDict::new(py);
 
@@ -37,7 +30,8 @@ impl SynapseHandler for PythonSynapseHandler {
                     .map_err(|e| LightningError::Handler(e.to_string()))?;
             }
 
-            let result = callback
+            let result = self
+                .callback
                 .call1(py, (&py_dict,))
                 .map_err(|e| LightningError::Handler(format!("Python handler error: {}", e)))?;
 
@@ -62,14 +56,12 @@ impl SynapseHandler for PythonSynapseHandler {
 }
 
 pub struct PythonStreamingSynapseHandler {
-    callback: Mutex<Py<PyAny>>,
+    callback: Py<PyAny>,
 }
 
 impl PythonStreamingSynapseHandler {
     pub fn new(callback: Py<PyAny>) -> Self {
-        Self {
-            callback: Mutex::new(callback),
-        }
+        Self { callback }
     }
 }
 
@@ -81,13 +73,7 @@ impl StreamingSynapseHandler for PythonStreamingSynapseHandler {
         data: HashMap<String, rmpv::Value>,
         sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
-        let callback = Python::attach(|py| {
-            let guard = self
-                .callback
-                .lock()
-                .map_err(|e| LightningError::Handler(format!("lock poisoned: {}", e)))?;
-            Ok::<_, LightningError>(guard.clone_ref(py))
-        })?;
+        let callback = Python::attach(|py| Ok::<_, LightningError>(self.callback.clone_ref(py)))?;
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
