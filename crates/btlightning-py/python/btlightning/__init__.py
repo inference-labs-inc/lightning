@@ -52,9 +52,12 @@ class Lightning:
         return self._rust_client.initialize_connections(miners)
 
     def query_axon(
-        self, axon_info: Dict[str, Any], request: Dict[str, Any]
+        self,
+        axon_info: Dict[str, Any],
+        request: Dict[str, Any],
+        timeout_secs: Optional[float] = None,
     ) -> Dict[str, Any]:
-        return self._rust_client.query_axon(axon_info, request)
+        return self._rust_client.query_axon(axon_info, request, timeout_secs=timeout_secs)
 
     def query_axon_stream(
         self, axon_info: Dict[str, Any], request: Dict[str, Any]

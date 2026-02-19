@@ -46,6 +46,39 @@ impl QuicRequest {
     pub fn new(synapse_type: String, data: HashMap<String, rmpv::Value>) -> Self {
         Self { synapse_type, data }
     }
+
+    pub fn from_typed<T: serde::Serialize>(
+        synapse_type: impl Into<String>,
+        data: &T,
+    ) -> Result<Self> {
+        let bytes = rmp_serde::to_vec_named(data)
+            .map_err(|e| LightningError::Serialization(e.to_string()))?;
+        let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
+            .map_err(|e| LightningError::Serialization(e.to_string()))?;
+        let map = match rmpv_val {
+            rmpv::Value::Map(entries) => entries
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        rmpv::Value::String(s) => s.into_str().ok_or_else(|| {
+                            LightningError::Serialization("non-UTF8 map key".into())
+                        }),
+                        other => Ok(other.to_string()),
+                    };
+                    key.map(|k| (k, v))
+                })
+                .collect::<Result<HashMap<String, rmpv::Value>>>()?,
+            _ => {
+                return Err(LightningError::Serialization(
+                    "expected struct to serialize as map".into(),
+                ))
+            }
+        };
+        Ok(Self {
+            synapse_type: synapse_type.into(),
+            data: map,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +86,33 @@ pub struct QuicResponse {
     pub success: bool,
     pub data: HashMap<String, rmpv::Value>,
     pub latency_ms: f64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl QuicResponse {
+    pub fn into_result(self) -> Result<Self> {
+        if self.success {
+            Ok(self)
+        } else {
+            Err(LightningError::Handler(
+                self.error.unwrap_or_else(|| "request failed".into()),
+            ))
+        }
+    }
+
+    pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        let map_value = rmpv::Value::Map(
+            self.data
+                .iter()
+                .map(|(k, v)| (rmpv::Value::String(k.clone().into()), v.clone()))
+                .collect(),
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &map_value)
+            .map_err(|e| LightningError::Serialization(e.to_string()))?;
+        rmp_serde::from_slice(&buf).map_err(|e| LightningError::Serialization(e.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,4 +272,112 @@ pub async fn write_frame_and_finish(
         .await
         .map_err(|e| LightningError::Transport(format!("failed to finish stream: {}", e)))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_request_from_typed_serializes_struct() {
+        #[derive(serde::Serialize)]
+        struct MyReq {
+            name: String,
+            count: u32,
+        }
+
+        let req = QuicRequest::from_typed(
+            "test_synapse",
+            &MyReq {
+                name: "hello".into(),
+                count: 42,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(req.synapse_type, "test_synapse");
+        assert_eq!(
+            req.data.get("name").unwrap(),
+            &rmpv::Value::String("hello".into())
+        );
+        assert_eq!(
+            req.data.get("count").unwrap(),
+            &rmpv::Value::Integer(42.into())
+        );
+    }
+
+    #[test]
+    fn quic_response_into_result_ok_on_success() {
+        let resp = QuicResponse {
+            success: true,
+            data: HashMap::new(),
+            latency_ms: 1.0,
+            error: None,
+        };
+        assert!(resp.into_result().is_ok());
+    }
+
+    #[test]
+    fn quic_response_into_result_err_on_failure() {
+        let resp = QuicResponse {
+            success: false,
+            data: HashMap::new(),
+            latency_ms: 1.0,
+            error: Some("bad request".into()),
+        };
+        let err = resp.into_result().unwrap_err();
+        assert!(err.to_string().contains("bad request"));
+    }
+
+    #[test]
+    fn quic_response_into_result_uses_default_message() {
+        let resp = QuicResponse {
+            success: false,
+            data: HashMap::new(),
+            latency_ms: 1.0,
+            error: None,
+        };
+        let err = resp.into_result().unwrap_err();
+        assert!(err.to_string().contains("request failed"));
+    }
+
+    #[test]
+    fn quic_response_deserialize_data_roundtrips() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct MyResp {
+            value: i32,
+            label: String,
+        }
+
+        let original = MyResp {
+            value: 99,
+            label: "test".into(),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&original).unwrap();
+        let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let data: HashMap<String, rmpv::Value> = match rmpv_val {
+            rmpv::Value::Map(entries) => entries
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        rmpv::Value::String(s) => s.into_str().unwrap(),
+                        other => other.to_string(),
+                    };
+                    (key, v)
+                })
+                .collect(),
+            _ => panic!("expected map"),
+        };
+
+        let resp = QuicResponse {
+            success: true,
+            data,
+            latency_ms: 1.0,
+            error: None,
+        };
+
+        let deserialized: MyResp = resp.deserialize_data().unwrap();
+        assert_eq!(deserialized, original);
+    }
 }

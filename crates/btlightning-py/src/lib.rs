@@ -201,11 +201,13 @@ impl RustLightning {
         .map_err(to_pyerr)
     }
 
+    #[pyo3(signature = (axon_data, request_data, timeout_secs=None))]
     pub fn query_axon(
         &self,
         py: Python<'_>,
         axon_data: Py<PyAny>,
         request_data: Py<PyAny>,
+        timeout_secs: Option<f64>,
     ) -> PyResult<Py<PyAny>> {
         let axon_info = extract_quic_axon_info(py, &axon_data)?;
         let request = extract_quic_request(py, &request_data)?;
@@ -215,7 +217,18 @@ impl RustLightning {
             .detach(|| {
                 runtime.block_on(async {
                     let client = self.client.read().await;
-                    client.query_axon(axon_info, request).await
+                    match timeout_secs {
+                        Some(t) => {
+                            client
+                                .query_axon_with_timeout(
+                                    axon_info,
+                                    request,
+                                    Duration::from_secs_f64(t),
+                                )
+                                .await
+                        }
+                        None => client.query_axon(axon_info, request).await,
+                    }
                 })
             })
             .map_err(to_pyerr)?;

@@ -50,6 +50,15 @@ pub trait SynapseHandler: Send + Sync {
 }
 
 #[async_trait::async_trait]
+pub trait AsyncSynapseHandler: Send + Sync {
+    async fn handle(
+        &self,
+        synapse_type: &str,
+        data: HashMap<String, rmpv::Value>,
+    ) -> Result<HashMap<String, rmpv::Value>>;
+}
+
+#[async_trait::async_trait]
 pub trait StreamingSynapseHandler: Send + Sync {
     async fn handle(
         &self,
@@ -115,6 +124,7 @@ struct ServerContext {
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
     addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+    async_handlers: Arc<RwLock<HashMap<String, Arc<dyn AsyncSynapseHandler>>>>,
     streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     miner_hotkey: String,
@@ -176,6 +186,7 @@ impl LightningServer {
                 connections: Arc::new(RwLock::new(HashMap::new())),
                 addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
                 synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+                async_handlers: Arc::new(RwLock::new(HashMap::new())),
                 streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
                 miner_hotkey,
@@ -216,6 +227,17 @@ impl LightningServer {
         let mut handlers = self.ctx.synapse_handlers.write().await;
         handlers.insert(synapse_type.clone(), handler);
         info!("Registered synapse handler for: {}", synapse_type);
+        Ok(())
+    }
+
+    pub async fn register_async_synapse_handler(
+        &self,
+        synapse_type: String,
+        handler: Arc<dyn AsyncSynapseHandler>,
+    ) -> Result<()> {
+        let mut handlers = self.ctx.async_handlers.write().await;
+        handlers.insert(synapse_type.clone(), handler);
+        info!("Registered async synapse handler for: {}", synapse_type);
         Ok(())
     }
 
@@ -866,9 +888,11 @@ impl LightningServer {
             Err(err_response) => return err_response,
         };
 
-        let handlers = ctx.synapse_handlers.read().await;
-        if let Some(handler) = handlers.get(&packet.synapse_type) {
-            match handler.handle(&packet.synapse_type, packet.data) {
+        let async_handlers = ctx.async_handlers.read().await;
+        if let Some(handler) = async_handlers.get(&packet.synapse_type) {
+            let handler = Arc::clone(handler);
+            drop(async_handlers);
+            match handler.handle(&packet.synapse_type, packet.data).await {
                 Ok(response_data) => SynapseResponse {
                     success: true,
                     data: response_data,
@@ -886,18 +910,40 @@ impl LightningServer {
                 }
             }
         } else {
-            error!(
-                "No handler registered for synapse type: {}",
-                packet.synapse_type
-            );
-            SynapseResponse {
-                success: false,
-                data: HashMap::new(),
-                timestamp: unix_timestamp_secs(),
-                error: Some(format!(
-                    "No handler for synapse type: {}",
+            drop(async_handlers);
+            let handlers = ctx.synapse_handlers.read().await;
+            if let Some(handler) = handlers.get(&packet.synapse_type) {
+                match handler.handle(&packet.synapse_type, packet.data) {
+                    Ok(response_data) => SynapseResponse {
+                        success: true,
+                        data: response_data,
+                        timestamp: unix_timestamp_secs(),
+                        error: None,
+                    },
+                    Err(e) => {
+                        error!("Handler error for {}: {}", packet.synapse_type, e);
+                        SynapseResponse {
+                            success: false,
+                            data: HashMap::new(),
+                            timestamp: unix_timestamp_secs(),
+                            error: Some(e.to_string()),
+                        }
+                    }
+                }
+            } else {
+                error!(
+                    "No handler registered for synapse type: {}",
                     packet.synapse_type
-                )),
+                );
+                SynapseResponse {
+                    success: false,
+                    data: HashMap::new(),
+                    timestamp: unix_timestamp_secs(),
+                    error: Some(format!(
+                        "No handler for synapse type: {}",
+                        packet.synapse_type
+                    )),
+                }
             }
         }
     }
@@ -996,6 +1042,122 @@ impl Drop for LightningServer {
     }
 }
 
+fn serialize_to_rmpv_map<T: serde::Serialize>(
+    val: &T,
+) -> std::result::Result<HashMap<String, rmpv::Value>, LightningError> {
+    let bytes =
+        rmp_serde::to_vec_named(val).map_err(|e| LightningError::Serialization(e.to_string()))?;
+    let rmpv_val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
+        .map_err(|e| LightningError::Serialization(e.to_string()))?;
+    match rmpv_val {
+        rmpv::Value::Map(entries) => entries
+            .into_iter()
+            .map(|(k, v)| {
+                let key = match k {
+                    rmpv::Value::String(s) => s
+                        .into_str()
+                        .ok_or_else(|| LightningError::Serialization("non-UTF8 map key".into())),
+                    other => Ok(other.to_string()),
+                };
+                key.map(|k| (k, v))
+            })
+            .collect(),
+        _ => Err(LightningError::Serialization(
+            "expected map from serialized struct".into(),
+        )),
+    }
+}
+
+struct TypedSyncHandler<F, Req, Resp, E> {
+    f: F,
+    _phantom: std::marker::PhantomData<fn(Req) -> (Resp, E)>,
+}
+
+impl<F, Req, Resp, E> SynapseHandler for TypedSyncHandler<F, Req, Resp, E>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Resp: serde::Serialize + Send + 'static,
+    E: std::fmt::Display + 'static,
+    F: Fn(Req) -> std::result::Result<Resp, E> + Send + Sync + 'static,
+{
+    fn handle(
+        &self,
+        _synapse_type: &str,
+        data: HashMap<String, rmpv::Value>,
+    ) -> Result<HashMap<String, rmpv::Value>> {
+        let map_value = rmpv::Value::Map(
+            data.into_iter()
+                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+                .collect(),
+        );
+        let req: Req = rmpv::ext::from_value(map_value)
+            .map_err(|e| LightningError::Serialization(e.to_string()))?;
+        let resp = (self.f)(req).map_err(|e| LightningError::Handler(e.to_string()))?;
+        serialize_to_rmpv_map(&resp)
+    }
+}
+
+pub fn typed_handler<Req, Resp, E, F>(f: F) -> Arc<dyn SynapseHandler>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Resp: serde::Serialize + Send + 'static,
+    E: std::fmt::Display + 'static,
+    F: Fn(Req) -> std::result::Result<Resp, E> + Send + Sync + 'static,
+{
+    Arc::new(TypedSyncHandler {
+        f,
+        _phantom: std::marker::PhantomData,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+struct TypedAsyncHandler<F, Req, Resp, E, Fut> {
+    f: F,
+    _phantom: std::marker::PhantomData<fn(Req) -> (Resp, E, Fut)>,
+}
+
+#[async_trait::async_trait]
+impl<F, Req, Resp, E, Fut> AsyncSynapseHandler for TypedAsyncHandler<F, Req, Resp, E, Fut>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Resp: serde::Serialize + Send + 'static,
+    E: std::fmt::Display + 'static,
+    F: Fn(Req) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Resp, E>> + Send + 'static,
+{
+    async fn handle(
+        &self,
+        _synapse_type: &str,
+        data: HashMap<String, rmpv::Value>,
+    ) -> Result<HashMap<String, rmpv::Value>> {
+        let map_value = rmpv::Value::Map(
+            data.into_iter()
+                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+                .collect(),
+        );
+        let req: Req = rmpv::ext::from_value(map_value)
+            .map_err(|e| LightningError::Serialization(e.to_string()))?;
+        let resp = (self.f)(req)
+            .await
+            .map_err(|e| LightningError::Handler(e.to_string()))?;
+        serialize_to_rmpv_map(&resp)
+    }
+}
+
+pub fn typed_async_handler<Req, Resp, E, F, Fut>(f: F) -> Arc<dyn AsyncSynapseHandler>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Resp: serde::Serialize + Send + 'static,
+    E: std::fmt::Display + 'static,
+    F: Fn(Req) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<Resp, E>> + Send + 'static,
+{
+    Arc::new(TypedAsyncHandler {
+        f,
+        _phantom: std::marker::PhantomData,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,5 +1247,75 @@ mod tests {
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn typed_handler_roundtrips_serde_struct() {
+        #[derive(serde::Deserialize)]
+        struct Req {
+            x: i32,
+            y: String,
+        }
+        #[derive(serde::Serialize)]
+        struct Resp {
+            sum: i32,
+            echo: String,
+        }
+
+        let handler = typed_handler(|req: Req| -> std::result::Result<Resp, String> {
+            Ok(Resp {
+                sum: req.x + 1,
+                echo: req.y,
+            })
+        });
+
+        let mut data = HashMap::new();
+        data.insert("x".to_string(), rmpv::Value::Integer(41.into()));
+        data.insert("y".to_string(), rmpv::Value::String("hello".into()));
+
+        let result = handler.handle("test", data).unwrap();
+        assert_eq!(result.get("sum").unwrap(), &rmpv::Value::Integer(42.into()));
+        assert_eq!(
+            result.get("echo").unwrap(),
+            &rmpv::Value::String("hello".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_async_handler_roundtrips_serde_struct() {
+        #[derive(serde::Deserialize)]
+        struct Req {
+            value: i32,
+        }
+        #[derive(serde::Serialize)]
+        struct Resp {
+            doubled: i32,
+        }
+
+        let handler = typed_async_handler(|req: Req| async move {
+            Ok::<_, String>(Resp {
+                doubled: req.value * 2,
+            })
+        });
+
+        let mut data = HashMap::new();
+        data.insert("value".to_string(), rmpv::Value::Integer(21.into()));
+
+        let result = handler.handle("test", data).await.unwrap();
+        assert_eq!(
+            result.get("doubled").unwrap(),
+            &rmpv::Value::Integer(42.into())
+        );
+    }
+
+    #[test]
+    fn typed_handler_propagates_error() {
+        let handler = typed_handler(|_req: HashMap<String, String>| -> std::result::Result<HashMap<String, String>, String> {
+            Err("something went wrong".into())
+        });
+
+        let data = HashMap::new();
+        let err = handler.handle("test", data).unwrap_err();
+        assert!(err.to_string().contains("something went wrong"));
     }
 }
