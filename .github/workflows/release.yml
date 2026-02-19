@@ -42,6 +42,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Use classic macOS linker
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          mkdir -p .cargo
+          printf '[target.aarch64-apple-darwin]\nrustflags = ["-C", "link-arg=-ld_classic"]\n' >> .cargo/config.toml
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -49,8 +55,6 @@ jobs:
           args: --release --out dist ${{ matrix.zig && '--zig' || '' }} ${{ matrix.target == 'aarch64' && matrix.os == 'ubuntu-latest' && '-i python3.12' || '' }}
           container: "off"
           working-directory: crates/btlightning-py
-        env:
-          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.os == 'macos-14' && '-C link-arg=-ld_classic' || '' }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v6
