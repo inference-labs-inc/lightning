@@ -327,6 +327,11 @@ impl LightningClient {
         open_streaming_synapse(&connection, request).await
     }
 
+    // Intentional TOCTOU: read-lock reconnect_states for backoff check, drop before
+    // network I/O (connect_and_handshake), then write-lock to update established_connections
+    // and reconnect_states. This avoids holding a write lock across network calls at the cost
+    // of allowing concurrent reconnections for the same miner_key — benign because the later
+    // write simply overwrites the connection entry, wasting only redundant handshake work.
     async fn try_reconnect(&self, miner_key: &str, axon_info: &QuicAxonInfo) -> Result<Connection> {
         {
             let state = self.state.read().await;
@@ -849,6 +854,10 @@ fn generate_nonce() -> String {
     format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
+// Deliberately disables TLS PKI certificate validation. TLS still provides transport
+// encryption but not identity authentication. Authenticity is instead enforced at the
+// application layer: the handshake exchanges certificate fingerprints and verifies
+// sr25519 signatures over them (see connect_and_handshake / process_handshake).
 struct AcceptAnyCertVerifier;
 
 impl rustls::client::ServerCertVerifier for AcceptAnyCertVerifier {

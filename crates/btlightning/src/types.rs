@@ -67,6 +67,9 @@ pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<Str
     }
 }
 
+// ":" is safe as delimiter: SS58 hotkeys are base58, nonces are hex, cert fingerprints
+// are base64 (standard alphabet uses +/= but not ":"), and timestamps are numeric.
+// If any field format changes to permit ":", switch to a structured encoding.
 pub(crate) fn handshake_request_message(
     validator_hotkey: &str,
     timestamp: u64,
