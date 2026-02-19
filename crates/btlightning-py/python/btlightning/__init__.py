@@ -1,3 +1,5 @@
+import sys
+import traceback
 from typing import Callable, Dict, Any, List, Optional, Iterator
 
 from btlightning._native import (
@@ -72,12 +74,29 @@ class Lightning:
         try:
             self.close()
         except Exception:
-            pass
+            sys.stderr.write(f"Lightning.__del__: {traceback.format_exc()}")
 
 
 class LightningServer:
-    def __init__(self, miner_hotkey: str, host: str = "0.0.0.0", port: int = 8443):
-        self._rust_server = RustLightningServer(miner_hotkey, host, port)
+    def __init__(
+        self,
+        miner_hotkey: str,
+        host: str = "0.0.0.0",
+        port: int = 8443,
+        max_signature_age_secs: Optional[int] = None,
+        idle_timeout_secs: Optional[int] = None,
+        keep_alive_interval_secs: Optional[int] = None,
+        nonce_cleanup_interval_secs: Optional[int] = None,
+    ):
+        self._rust_server = RustLightningServer(
+            miner_hotkey,
+            host,
+            port,
+            max_signature_age_secs=max_signature_age_secs,
+            idle_timeout_secs=idle_timeout_secs,
+            keep_alive_interval_secs=keep_alive_interval_secs,
+            nonce_cleanup_interval_secs=nonce_cleanup_interval_secs,
+        )
 
     def set_miner_keypair(self, keypair_seed: bytes) -> None:
         return self._rust_server.set_miner_keypair(list(keypair_seed))
@@ -114,6 +133,12 @@ class LightningServer:
 
     def stop(self) -> None:
         return self._rust_server.stop()
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            sys.stderr.write(f"LightningServer.__del__: {traceback.format_exc()}")
 
 
 __all__ = [

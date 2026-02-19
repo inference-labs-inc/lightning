@@ -18,10 +18,28 @@ use types::PyQuicAxonInfo;
 fn to_pyerr(err: btlightning::LightningError) -> PyErr {
     match err {
         btlightning::LightningError::Connection(msg) => {
-            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(msg)
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "connection error: {}",
+                msg
+            ))
+        }
+        btlightning::LightningError::Handshake(msg) => {
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "handshake error: {}",
+                msg
+            ))
         }
         btlightning::LightningError::Config(msg) => {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("config error: {}", msg))
+        }
+        btlightning::LightningError::Serialization(msg) => {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("serialization error: {}", msg))
+        }
+        btlightning::LightningError::Transport(msg) => {
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "transport error: {}",
+                msg
+            ))
         }
         btlightning::LightningError::Signing(msg) => {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("signing error: {}", msg))
@@ -32,7 +50,6 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
         btlightning::LightningError::Stream(msg) => {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("stream error: {}", msg))
         }
-        _ => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()),
     }
 }
 
@@ -295,7 +312,24 @@ pub struct RustLightningServer {
 #[pymethods]
 impl RustLightningServer {
     #[new]
-    pub fn new(miner_hotkey: String, host: String, port: u16) -> PyResult<Self> {
+    #[pyo3(signature = (
+        miner_hotkey,
+        host,
+        port,
+        max_signature_age_secs=None,
+        idle_timeout_secs=None,
+        keep_alive_interval_secs=None,
+        nonce_cleanup_interval_secs=None,
+    ))]
+    pub fn new(
+        miner_hotkey: String,
+        host: String,
+        port: u16,
+        max_signature_age_secs: Option<u64>,
+        idle_timeout_secs: Option<u64>,
+        keep_alive_interval_secs: Option<u64>,
+        nonce_cleanup_interval_secs: Option<u64>,
+    ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Failed to create async runtime: {}",
@@ -303,7 +337,22 @@ impl RustLightningServer {
             ))
         })?);
 
-        let server = btlightning::LightningServer::new(miner_hotkey, host, port);
+        let mut config = btlightning::LightningServerConfig::default();
+        if let Some(v) = max_signature_age_secs {
+            config.max_signature_age_secs = v;
+        }
+        if let Some(v) = idle_timeout_secs {
+            config.idle_timeout_secs = v;
+        }
+        if let Some(v) = keep_alive_interval_secs {
+            config.keep_alive_interval_secs = v;
+        }
+        if let Some(v) = nonce_cleanup_interval_secs {
+            config.nonce_cleanup_interval_secs = v;
+        }
+
+        let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
+            .map_err(to_pyerr)?;
 
         Ok(Self {
             server: RwLock::new(server),

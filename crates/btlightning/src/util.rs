@@ -1,7 +1,5 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-
 pub fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
