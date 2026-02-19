@@ -382,10 +382,11 @@ impl serde::ser::SerializeMap for SerializeMap {
         &mut self,
         value: &T,
     ) -> std::result::Result<(), Self::Error> {
-        let key = self
-            .cur_key
-            .take()
-            .expect("serialize_value called before serialize_key");
+        let key = self.cur_key.take().ok_or_else(|| {
+            <Self::Error as serde::ser::Error>::custom(
+                "serialize_value called before serialize_key",
+            )
+        })?;
         self.entries.push((key, value.serialize(NamedSerializer)?));
         Ok(())
     }

@@ -442,6 +442,10 @@ impl LightningClient {
                 .into_iter()
                 .filter(|(key, _)| !state.active_miners.contains_key(key))
                 .collect();
+
+            for (key, miner) in &new_miner_keys {
+                state.active_miners.insert(key.clone(), miner.clone());
+            }
         }
 
         if !new_miner_keys.is_empty() {
@@ -477,7 +481,7 @@ impl LightningClient {
                             key
                         ))),
                     };
-                    (key, miner, result)
+                    (key, result)
                 });
             }
 
@@ -485,17 +489,13 @@ impl LightningClient {
 
             while let Some(join_result) = set.join_next().await {
                 match join_result {
-                    Ok((key, miner, result)) => match result {
+                    Ok((key, result)) => match result {
                         Ok(connection) => {
-                            if state.active_miners.contains_key(&key) {
-                                connection.close(0u32.into(), b"duplicate");
-                            } else {
-                                state.active_miners.insert(key.clone(), miner);
-                                state.established_connections.insert(key, connection);
-                            }
+                            state.established_connections.insert(key, connection);
                         }
                         Err(e) => {
                             error!("Failed to connect to new miner {}: {}", key, e);
+                            state.active_miners.remove(&key);
                         }
                     },
                     Err(e) => {
