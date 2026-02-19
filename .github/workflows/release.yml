@@ -49,7 +49,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist ${{ matrix.zig && '--zig' || '' }}
+          args: --release --out dist ${{ matrix.zig && '--zig' || '' }} ${{ matrix.target == 'aarch64' && matrix.os == 'ubuntu-latest' && '-i python3.12' || '' }}
           container: "off"
           working-directory: crates/btlightning-py
 
@@ -109,22 +109,3 @@ jobs:
         with:
           packages-dir: dist/
 
-  publish-crates-io:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set version from tag
-        run: |
-          V="${VERSION#v}"
-          sed -i "s/^version = \".*\"/version = \"$V\"/" crates/btlightning/Cargo.toml crates/btlightning-py/Cargo.toml
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish btlightning
-        run: cargo publish -p btlightning --allow-dirty
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
