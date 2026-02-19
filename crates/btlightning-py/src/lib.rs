@@ -201,11 +201,13 @@ impl RustLightning {
         .map_err(to_pyerr)
     }
 
+    #[pyo3(signature = (axon_data, request_data, timeout_secs=None))]
     pub fn query_axon(
         &self,
         py: Python<'_>,
         axon_data: Py<PyAny>,
         request_data: Py<PyAny>,
+        timeout_secs: Option<f64>,
     ) -> PyResult<Py<PyAny>> {
         let axon_info = extract_quic_axon_info(py, &axon_data)?;
         let request = extract_quic_request(py, &request_data)?;
@@ -215,18 +217,38 @@ impl RustLightning {
             .detach(|| {
                 runtime.block_on(async {
                     let client = self.client.read().await;
-                    client.query_axon(axon_info, request).await
+                    match timeout_secs {
+                        Some(t) => {
+                            const MAX_TIMEOUT_SECS: f64 = u64::MAX as f64;
+                            if !t.is_finite() || !(0.0..=MAX_TIMEOUT_SECS).contains(&t) {
+                                return Err(btlightning::LightningError::Config(format!(
+                                    "timeout_secs must be a finite non-negative number, got {t}"
+                                )));
+                            }
+                            client
+                                .query_axon_with_timeout(
+                                    axon_info,
+                                    request,
+                                    Duration::from_secs_f64(t),
+                                )
+                                .await
+                        }
+                        None => client.query_axon(axon_info, request).await,
+                    }
                 })
             })
             .map_err(to_pyerr)?;
 
         let result_dict = PyDict::new(py);
-        result_dict.set_item("success", response.success)?;
-        result_dict.set_item("latency_ms", response.latency_ms)?;
-
         for (key, value) in &response.data {
             let py_value = msgpack_value_to_py(py, value)?;
             result_dict.set_item(key, py_value)?;
+        }
+        result_dict.set_item("success", response.success)?;
+        result_dict.set_item("latency_ms", response.latency_ms)?;
+        match &response.error {
+            Some(e) => result_dict.set_item("error", e)?,
+            None => result_dict.set_item("error", py.None())?,
         }
 
         Ok(result_dict.into_any().unbind())

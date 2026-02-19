@@ -273,6 +273,17 @@ impl LightningClient {
         }
     }
 
+    pub async fn query_axon_with_timeout(
+        &self,
+        axon_info: QuicAxonInfo,
+        request: QuicRequest,
+        timeout: Duration,
+    ) -> Result<QuicResponse> {
+        tokio::time::timeout(timeout, self.query_axon(axon_info, request))
+            .await
+            .map_err(|_| LightningError::Transport("query timed out".into()))?
+    }
+
     pub async fn query_axon_stream(
         &self,
         axon_info: QuicAxonInfo,
@@ -757,6 +768,7 @@ async fn send_synapse_packet(
                 success: synapse_response.success,
                 data: synapse_response.data,
                 latency_ms,
+                error: synapse_response.error,
             })
         }
         MessageType::StreamChunk => {
@@ -813,6 +825,7 @@ async fn send_synapse_packet(
                 success: true,
                 data,
                 latency_ms,
+                error: None,
             })
         }
         other => Err(LightningError::Transport(format!(

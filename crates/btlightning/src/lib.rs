@@ -8,11 +8,14 @@ pub mod util;
 
 pub use client::{ClientConfig_, LightningClient, StreamingResponse};
 pub use error::{LightningError, Result};
-pub use server::{LightningServer, LightningServerConfig, StreamingSynapseHandler, SynapseHandler};
+pub use server::{
+    typed_async_handler, typed_handler, AsyncSynapseHandler, LightningServer,
+    LightningServerConfig, StreamingSynapseHandler, SynapseHandler,
+};
 #[cfg(feature = "btwallet")]
 pub use signing::BtWalletSigner;
 pub use signing::{CallbackSigner, Signer, Sr25519Signer};
 pub use types::{
-    HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket,
-    SynapseResponse,
+    serialize_to_rmpv_map, HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest,
+    QuicResponse, SynapsePacket, SynapseResponse,
 };

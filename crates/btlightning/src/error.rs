@@ -29,4 +29,10 @@ impl fmt::Display for LightningError {
 
 impl std::error::Error for LightningError {}
 
+impl LightningError {
+    pub fn handler(e: impl std::fmt::Display) -> Self {
+        LightningError::Handler(e.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, LightningError>;
