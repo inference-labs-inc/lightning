@@ -35,9 +35,9 @@ impl SynapseHandler for PythonSynapseHandler {
                     .map_err(|e| LightningError::Handler(e.to_string()))?;
             }
 
-            let result = callback.call1(py, (py_dict,)).map_err(|e| {
-                LightningError::Handler(format!("Python handler error: {}", e))
-            })?;
+            let result = callback
+                .call1(py, (py_dict,))
+                .map_err(|e| LightningError::Handler(format!("Python handler error: {}", e)))?;
 
             let result_dict: &pyo3::types::PyDict = result
                 .extract(py)

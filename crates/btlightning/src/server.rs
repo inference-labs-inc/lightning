@@ -66,35 +66,42 @@ impl ValidatorConnection {
     }
 }
 
-pub struct LightningServer {
-    miner_hotkey: String,
-    miner_keypair_bytes: Option<[u8; 32]>,
-    host: String,
-    port: u16,
+#[derive(Clone)]
+struct ServerContext {
     connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
     addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
+    miner_hotkey: String,
+    miner_keypair: Option<[u8; 32]>,
+}
+
+pub struct LightningServer {
+    host: String,
+    port: u16,
+    ctx: ServerContext,
     endpoint: Option<Endpoint>,
 }
 
 impl LightningServer {
     pub fn new(miner_hotkey: String, host: String, port: u16) -> Self {
         Self {
-            miner_hotkey,
-            miner_keypair_bytes: None,
             host,
             port,
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
-            synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
-            used_nonces: Arc::new(RwLock::new(HashMap::new())),
+            ctx: ServerContext {
+                connections: Arc::new(RwLock::new(HashMap::new())),
+                addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
+                synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+                used_nonces: Arc::new(RwLock::new(HashMap::new())),
+                miner_hotkey,
+                miner_keypair: None,
+            },
             endpoint: None,
         }
     }
 
     pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
-        self.miner_keypair_bytes = Some(keypair_bytes);
+        self.ctx.miner_keypair = Some(keypair_bytes);
     }
 
     pub async fn register_synapse_handler(
@@ -102,7 +109,7 @@ impl LightningServer {
         synapse_type: String,
         handler: Arc<dyn SynapseHandler>,
     ) -> Result<()> {
-        let mut handlers = self.synapse_handlers.write().await;
+        let mut handlers = self.ctx.synapse_handlers.write().await;
         handlers.insert(synapse_type.clone(), handler);
         info!("Registered synapse handler for: {}", synapse_type);
         Ok(())
@@ -118,10 +125,12 @@ impl LightningServer {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting Lightning QUIC server on {}:{}", self.host, self.port);
-        let (certs, key) = Self::create_self_signed_cert().map_err(|e| {
-            LightningError::Config(format!("Failed to create certificate: {}", e))
-        })?;
+        info!(
+            "Starting Lightning QUIC server on {}:{}",
+            self.host, self.port
+        );
+        let (certs, key) = Self::create_self_signed_cert()
+            .map_err(|e| LightningError::Config(format!("Failed to create certificate: {}", e)))?;
 
         let mut server_config = RustlsServerConfig::builder()
             .with_safe_defaults()
@@ -131,9 +140,8 @@ impl LightningServer {
 
         server_config.alpn_protocols = vec![b"lightning-quic".to_vec()];
         let mut transport_config = TransportConfig::default();
-        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150)).map_err(|e| {
-            LightningError::Config(format!("Failed to set idle timeout: {}", e))
-        })?;
+        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150))
+            .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
         transport_config.max_idle_timeout(Some(idle_timeout));
         transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
 
@@ -155,7 +163,7 @@ impl LightningServer {
 
     pub async fn serve_forever(&self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
-            let nonces_for_cleanup = self.used_nonces.clone();
+            let nonces_for_cleanup = self.ctx.used_nonces.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
@@ -167,26 +175,12 @@ impl LightningServer {
             });
 
             while let Some(conn) = endpoint.accept().await {
-                let connections = self.connections.clone();
-                let addr_to_hotkey = self.addr_to_hotkey.clone();
-                let synapse_handlers = self.synapse_handlers.clone();
-                let used_nonces = self.used_nonces.clone();
-                let miner_hotkey = self.miner_hotkey.clone();
-                let miner_keypair = self.miner_keypair_bytes;
+                let ctx = self.ctx.clone();
 
                 tokio::spawn(async move {
                     match conn.await {
                         Ok(connection) => {
-                            Self::handle_connection(
-                                connection,
-                                connections,
-                                addr_to_hotkey,
-                                synapse_handlers,
-                                used_nonces,
-                                miner_hotkey,
-                                miner_keypair,
-                            )
-                            .await;
+                            Self::handle_connection(connection, ctx).await;
                         }
                         Err(e) => {
                             error!("Connection failed: {}", e);
@@ -198,41 +192,17 @@ impl LightningServer {
         Ok(())
     }
 
-    async fn handle_connection(
-        connection: Connection,
-        connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
-        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
-        miner_hotkey: String,
-        miner_keypair: Option<[u8; 32]>,
-    ) {
+    async fn handle_connection(connection: Connection, ctx: ServerContext) {
         let connection = Arc::new(connection);
 
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    let conn_clone = connection.clone();
-                    let connections_clone = connections.clone();
-                    let addr_to_hotkey_clone = addr_to_hotkey.clone();
-                    let handlers_clone = synapse_handlers.clone();
-                    let nonces_clone = used_nonces.clone();
-                    let miner_hotkey_clone = miner_hotkey.clone();
-                    let miner_keypair_clone = miner_keypair;
+                    let conn = connection.clone();
+                    let ctx = ctx.clone();
 
                     tokio::spawn(async move {
-                        Self::handle_stream(
-                            send,
-                            recv,
-                            conn_clone,
-                            connections_clone,
-                            addr_to_hotkey_clone,
-                            handlers_clone,
-                            nonces_clone,
-                            miner_hotkey_clone,
-                            miner_keypair_clone,
-                        )
-                        .await;
+                        Self::handle_stream(send, recv, conn, ctx).await;
                     });
                 }
                 Err(e) => {
@@ -247,12 +217,7 @@ impl LightningServer {
         mut send: SendStream,
         mut recv: RecvStream,
         connection: Arc<quinn::Connection>,
-        connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
-        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
-        miner_hotkey: String,
-        miner_keypair: Option<[u8; 32]>,
+        ctx: ServerContext,
     ) {
         match recv.read_to_end(MAX_RESPONSE_SIZE).await {
             Ok(buffer) => {
@@ -262,9 +227,7 @@ impl LightningServer {
                             let response = Self::process_synapse_packet(
                                 synapse_packet,
                                 connection.clone(),
-                                connections,
-                                addr_to_hotkey,
-                                synapse_handlers,
+                                &ctx,
                             )
                             .await;
 
@@ -300,16 +263,9 @@ impl LightningServer {
                 } else {
                     match serde_json::from_slice::<HandshakeRequest>(&buffer) {
                         Ok(handshake_req) => {
-                            let response = Self::process_handshake(
-                                handshake_req,
-                                connection.clone(),
-                                connections,
-                                addr_to_hotkey,
-                                used_nonces,
-                                miner_hotkey,
-                                miner_keypair,
-                            )
-                            .await;
+                            let response =
+                                Self::process_handshake(handshake_req, connection.clone(), &ctx)
+                                    .await;
 
                             match serde_json::to_vec(&response) {
                                 Ok(response_bytes) => {
@@ -324,7 +280,7 @@ impl LightningServer {
                         Err(e) => {
                             warn!("Unknown message format received: {}", e);
                             let err_response = HandshakeResponse {
-                                miner_hotkey,
+                                miner_hotkey: ctx.miner_hotkey,
                                 timestamp: unix_timestamp_secs(),
                                 signature: String::new(),
                                 accepted: false,
@@ -352,14 +308,9 @@ impl LightningServer {
     async fn process_handshake(
         request: HandshakeRequest,
         connection: Arc<quinn::Connection>,
-        connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
-        used_nonces: Arc<RwLock<HashMap<String, u64>>>,
-        miner_hotkey: String,
-        miner_keypair: Option<[u8; 32]>,
+        ctx: &ServerContext,
     ) -> HandshakeResponse {
-        let is_valid =
-            Self::verify_validator_signature(&request, used_nonces).await;
+        let is_valid = Self::verify_validator_signature(&request, ctx.used_nonces.clone()).await;
 
         if is_valid {
             let now = unix_timestamp_secs();
@@ -373,15 +324,17 @@ impl LightningServer {
             );
 
             let remote_addr = connection.remote_address();
-            let mut connections_guard = connections.write().await;
-            let mut addr_index = addr_to_hotkey.write().await;
+            let mut connections_guard = ctx.connections.write().await;
+            let mut addr_index = ctx.addr_to_hotkey.write().await;
             let mut validator_conn = ValidatorConnection::new(
                 request.validator_hotkey.clone(),
                 connection_id.clone(),
                 connection.clone(),
             );
             validator_conn.verify();
-            if let Some(prev_conn) = connections_guard.insert(request.validator_hotkey.clone(), validator_conn) {
+            if let Some(prev_conn) =
+                connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
+            {
                 let prev_addr = prev_conn.connection.remote_address();
                 if prev_addr != remote_addr {
                     addr_index.remove(&prev_addr);
@@ -397,16 +350,16 @@ impl LightningServer {
             );
 
             HandshakeResponse {
-                miner_hotkey: miner_hotkey.clone(),
+                miner_hotkey: ctx.miner_hotkey.clone(),
                 timestamp: now,
-                signature: Self::sign_handshake_response(&request, &miner_keypair, now),
+                signature: Self::sign_handshake_response(&request, &ctx.miner_keypair, now),
                 accepted: true,
                 connection_id,
             }
         } else {
             error!("Handshake failed: invalid signature");
             HandshakeResponse {
-                miner_hotkey: miner_hotkey.clone(),
+                miner_hotkey: ctx.miner_hotkey.clone(),
                 timestamp: unix_timestamp_secs(),
                 signature: String::new(),
                 accepted: false,
@@ -447,10 +400,7 @@ impl LightningServer {
         let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
             Ok(pk) => pk,
             Err(e) => {
-                error!(
-                    "Invalid SS58 address {}: {}",
-                    request.validator_hotkey, e
-                );
+                error!("Invalid SS58 address {}: {}", request.validator_hotkey, e);
                 return false;
             }
         };
@@ -516,14 +466,12 @@ impl LightningServer {
     async fn process_synapse_packet(
         packet: SynapsePacket,
         connection: Arc<quinn::Connection>,
-        connections: Arc<RwLock<HashMap<String, ValidatorConnection>>>,
-        addr_to_hotkey: Arc<RwLock<HashMap<SocketAddr, String>>>,
-        synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
+        ctx: &ServerContext,
     ) -> SynapseResponse {
         debug!("Processing {} synapse packet", packet.synapse_type);
 
         let validator_hotkey = {
-            let addr_index = addr_to_hotkey.read().await;
+            let addr_index = ctx.addr_to_hotkey.read().await;
             match addr_index.get(&connection.remote_address()).cloned() {
                 Some(hotkey) => hotkey,
                 None => {
@@ -542,7 +490,7 @@ impl LightningServer {
         };
 
         {
-            let mut connections_guard = connections.write().await;
+            let mut connections_guard = ctx.connections.write().await;
             if let Some(connection) = connections_guard.get_mut(&validator_hotkey) {
                 if !connection.verified {
                     error!(
@@ -562,10 +510,7 @@ impl LightningServer {
                     validator_hotkey
                 );
             } else {
-                error!(
-                    "No connection found for validator {}",
-                    validator_hotkey
-                );
+                error!("No connection found for validator {}", validator_hotkey);
                 return SynapseResponse {
                     success: false,
                     data: HashMap::new(),
@@ -575,7 +520,7 @@ impl LightningServer {
             }
         }
 
-        let handlers = synapse_handlers.read().await;
+        let handlers = ctx.synapse_handlers.read().await;
         if let Some(handler) = handlers.get(&packet.synapse_type) {
             match handler.handle(&packet.synapse_type, packet.data) {
                 Ok(response_data) => SynapseResponse {
@@ -612,7 +557,7 @@ impl LightningServer {
     }
 
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
-        let connections = self.connections.read().await;
+        let connections = self.ctx.connections.read().await;
         let mut stats = HashMap::new();
 
         stats.insert(
@@ -641,7 +586,7 @@ impl LightningServer {
     }
 
     pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> Result<()> {
-        let mut connections = self.connections.write().await;
+        let mut connections = self.ctx.connections.write().await;
         let now = unix_timestamp_secs();
 
         let mut to_remove = Vec::new();
@@ -651,14 +596,11 @@ impl LightningServer {
             }
         }
 
-        let mut addr_index = self.addr_to_hotkey.write().await;
+        let mut addr_index = self.ctx.addr_to_hotkey.write().await;
         for (validator, remote_addr) in &to_remove {
             if let Some(connection) = connections.remove(validator) {
                 connection.connection.close(0u32.into(), b"cleanup");
-                info!(
-                    "Cleaned up stale connection from validator: {}",
-                    validator
-                );
+                info!("Cleaned up stale connection from validator: {}", validator);
             }
             addr_index.remove(remote_addr);
         }
@@ -667,14 +609,14 @@ impl LightningServer {
     }
 
     pub async fn cleanup_expired_nonces(&self) {
-        let mut nonces = self.used_nonces.write().await;
+        let mut nonces = self.ctx.used_nonces.write().await;
         let cutoff = unix_timestamp_secs().saturating_sub(MAX_SIGNATURE_AGE);
         nonces.retain(|_, ts| *ts > cutoff);
     }
 
     pub async fn stop(&self) -> Result<()> {
-        let mut connections = self.connections.write().await;
-        let mut addr_index = self.addr_to_hotkey.write().await;
+        let mut connections = self.ctx.connections.write().await;
+        let mut addr_index = self.ctx.addr_to_hotkey.write().await;
         for (_, connection) in connections.drain() {
             connection.connection.close(0u32.into(), b"server_shutdown");
         }
