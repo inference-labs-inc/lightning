@@ -4,7 +4,7 @@ use crate::signing::Signer;
 use crate::types::{
     read_frame, write_frame_and_finish, HandshakeRequest, HandshakeResponse, MessageType,
     QuicAxonInfo, QuicRequest, QuicResponse, StreamChunk, StreamEnd, SynapsePacket,
-    SynapseResponse,
+    SynapseResponse, MAX_RESPONSE_SIZE,
 };
 use crate::util::{unix_timestamp_millis, unix_timestamp_secs};
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -69,9 +69,16 @@ impl StreamingResponse {
                     Err(LightningError::Stream(end.error.unwrap_or_default()))
                 }
             }
-            Ok((MessageType::SynapseResponse, _)) => Err(LightningError::Stream(
-                "received non-streaming SynapseResponse on streaming path".to_string(),
-            )),
+            Ok((MessageType::SynapseResponse, payload)) => {
+                let detail = rmp_serde::from_slice::<SynapseResponse>(&payload)
+                    .ok()
+                    .and_then(|r| r.error)
+                    .unwrap_or_else(|| "no detail".to_string());
+                Err(LightningError::Stream(format!(
+                    "server returned SynapseResponse error on streaming path: {}",
+                    detail
+                )))
+            }
             Ok((msg_type, _)) => Err(LightningError::Stream(format!(
                 "unexpected message type during streaming: {:?}",
                 msg_type
@@ -82,7 +89,15 @@ impl StreamingResponse {
 
     pub async fn collect_all(&mut self) -> Result<Vec<Vec<u8>>> {
         let mut chunks = Vec::new();
+        let mut total_size: usize = 0;
         while let Some(chunk) = self.next_chunk().await? {
+            total_size += chunk.len();
+            if total_size > MAX_RESPONSE_SIZE {
+                return Err(LightningError::Stream(format!(
+                    "streaming response exceeded {} byte limit",
+                    MAX_RESPONSE_SIZE
+                )));
+            }
             chunks.push(chunk);
         }
         Ok(chunks)
@@ -685,15 +700,7 @@ async fn send_handshake(
     Ok(response)
 }
 
-async fn send_synapse_packet(
-    connection: &Connection,
-    request: QuicRequest,
-) -> Result<QuicResponse> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| LightningError::Connection(format!("Failed to open stream: {}", e)))?;
-
+async fn send_synapse_frame(send: &mut quinn::SendStream, request: QuicRequest) -> Result<()> {
     let synapse_packet = SynapsePacket {
         synapse_type: request.synapse_type,
         data: request.data,
@@ -704,15 +711,27 @@ async fn send_synapse_packet(
         LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
     })?;
 
+    write_frame_and_finish(send, MessageType::SynapsePacket, &packet_bytes).await
+}
+
+async fn send_synapse_packet(
+    connection: &Connection,
+    request: QuicRequest,
+) -> Result<QuicResponse> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| LightningError::Connection(format!("Failed to open stream: {}", e)))?;
+
     let start = Instant::now();
 
-    write_frame_and_finish(&mut send, MessageType::SynapsePacket, &packet_bytes).await?;
+    send_synapse_frame(&mut send, request).await?;
 
     let (msg_type, payload) = read_frame(&mut recv).await?;
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     match msg_type {
         MessageType::SynapseResponse => {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             let synapse_response: SynapseResponse =
                 rmp_serde::from_slice(&payload).map_err(|e| {
                     LightningError::Serialization(format!(
@@ -728,8 +747,6 @@ async fn send_synapse_packet(
             })
         }
         MessageType::StreamChunk => {
-            const MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
-
             let first_chunk: StreamChunk = rmp_serde::from_slice(&payload).map_err(|e| {
                 LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
             })?;
@@ -801,17 +818,7 @@ async fn open_streaming_synapse(
         .await
         .map_err(|e| LightningError::Connection(format!("Failed to open stream: {}", e)))?;
 
-    let synapse_packet = SynapsePacket {
-        synapse_type: request.synapse_type,
-        data: request.data,
-        timestamp: unix_timestamp_secs(),
-    };
-
-    let packet_bytes = rmp_serde::to_vec(&synapse_packet).map_err(|e| {
-        LightningError::Serialization(format!("Failed to serialize synapse packet: {}", e))
-    })?;
-
-    write_frame_and_finish(&mut send, MessageType::SynapsePacket, &packet_bytes).await?;
+    send_synapse_frame(&mut send, request).await?;
 
     Ok(StreamingResponse { recv })
 }

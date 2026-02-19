@@ -429,9 +429,12 @@ impl LightningServer {
         ctx: &ServerContext,
     ) {
         if let Err(err_response) = Self::verify_synapse_auth(&connection, ctx).await {
-            if let Ok(bytes) = rmp_serde::to_vec(&err_response) {
-                let _ =
-                    write_frame_and_finish(&mut send, MessageType::SynapseResponse, &bytes).await;
+            let end = StreamEnd {
+                success: false,
+                error: err_response.error,
+            };
+            if let Ok(bytes) = rmp_serde::to_vec(&end) {
+                let _ = write_frame_and_finish(&mut send, MessageType::StreamEnd, &bytes).await;
             }
             return;
         }

@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional, Iterator
+from typing import Callable, Dict, Any, List, Optional, Iterator
 
 from btlightning._native import (
     RustLightning,
@@ -71,10 +71,14 @@ class LightningServer:
     def __init__(self, miner_hotkey: str, host: str = "0.0.0.0", port: int = 8443):
         self._rust_server = RustLightningServer(miner_hotkey, host, port)
 
-    def register_synapse_handler(self, synapse_type: str, handler) -> None:
+    def register_synapse_handler(
+        self, synapse_type: str, handler: Callable[[Dict[str, Any]], Dict[str, Any]]
+    ) -> None:
         return self._rust_server.register_synapse_handler(synapse_type, handler)
 
-    def register_streaming_handler(self, synapse_type: str, handler) -> None:
+    def register_streaming_handler(
+        self, synapse_type: str, handler: Callable[[Dict[str, Any]], Iterator[bytes]]
+    ) -> None:
         return self._rust_server.register_streaming_handler(synapse_type, handler)
 
     def start(self) -> None:

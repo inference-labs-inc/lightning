@@ -177,6 +177,8 @@ pub fn py_to_msgpack_value(value: &PyAny) -> PyResult<rmpv::Value> {
         Ok(rmpv::Value::Boolean(b))
     } else if let Ok(i) = value.extract::<i64>() {
         Ok(rmpv::Value::Integer(rmpv::Integer::from(i)))
+    } else if let Ok(u) = value.extract::<u64>() {
+        Ok(rmpv::Value::Integer(rmpv::Integer::from(u)))
     } else if let Ok(f) = value.extract::<f64>() {
         Ok(rmpv::Value::F64(f))
     } else if let Ok(s) = value.extract::<String>() {
