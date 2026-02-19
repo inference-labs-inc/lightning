@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct LightningServerConfig {
     pub max_signature_age_secs: u64,
     pub idle_timeout_secs: u64,
@@ -143,6 +143,16 @@ impl LightningServer {
         port: u16,
         config: LightningServerConfig,
     ) -> Result<Self> {
+        if config.max_signature_age_secs == 0 {
+            return Err(LightningError::Config(
+                "max_signature_age_secs must be non-zero".to_string(),
+            ));
+        }
+        if config.nonce_cleanup_interval_secs == 0 {
+            return Err(LightningError::Config(
+                "nonce_cleanup_interval_secs must be non-zero".to_string(),
+            ));
+        }
         if config.keep_alive_interval_secs >= config.idle_timeout_secs {
             return Err(LightningError::Config(format!(
                 "keep_alive_interval_secs ({}) must be less than idle_timeout_secs ({})",
@@ -977,5 +987,25 @@ mod tests {
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_rejects_zero_max_signature_age() {
+        let config = LightningServerConfig {
+            max_signature_age_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_nonce_cleanup_interval() {
+        let config = LightningServerConfig {
+            nonce_cleanup_interval_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
     }
 }
