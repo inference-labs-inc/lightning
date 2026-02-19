@@ -12,6 +12,7 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -37,14 +38,27 @@ pub trait StreamingSynapseHandler: Send + Sync {
     ) -> Result<()>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ValidatorConnection {
     pub validator_hotkey: String,
     pub connection_id: String,
     pub established_at: u64,
-    pub last_activity: u64,
+    pub last_activity: AtomicU64,
     pub verified: bool,
     pub connection: Arc<quinn::Connection>,
+}
+
+impl Clone for ValidatorConnection {
+    fn clone(&self) -> Self {
+        Self {
+            validator_hotkey: self.validator_hotkey.clone(),
+            connection_id: self.connection_id.clone(),
+            established_at: self.established_at,
+            last_activity: AtomicU64::new(self.last_activity.load(Ordering::Relaxed)),
+            verified: self.verified,
+            connection: self.connection.clone(),
+        }
+    }
 }
 
 impl ValidatorConnection {
@@ -58,7 +72,7 @@ impl ValidatorConnection {
             validator_hotkey,
             connection_id,
             established_at: now,
-            last_activity: now,
+            last_activity: AtomicU64::new(now),
             verified: false,
             connection: conn,
         }
@@ -69,8 +83,9 @@ impl ValidatorConnection {
         self.update_activity();
     }
 
-    pub fn update_activity(&mut self) {
-        self.last_activity = unix_timestamp_secs();
+    pub fn update_activity(&self) {
+        self.last_activity
+            .store(unix_timestamp_secs(), Ordering::Relaxed);
     }
 }
 
@@ -378,8 +393,8 @@ impl LightningServer {
         };
 
         {
-            let mut connections_guard = ctx.connections.write().await;
-            if let Some(conn) = connections_guard.get_mut(&validator_hotkey) {
+            let connections_guard = ctx.connections.read().await;
+            if let Some(conn) = connections_guard.get(&validator_hotkey) {
                 if !conn.verified {
                     error!(
                         "Connection not verified for validator: {}",
@@ -749,7 +764,9 @@ impl LightningServer {
 
         let mut to_remove = Vec::new();
         for (validator, connection) in connections.iter() {
-            if now.saturating_sub(connection.last_activity) > max_idle_seconds {
+            if now.saturating_sub(connection.last_activity.load(Ordering::Relaxed))
+                > max_idle_seconds
+            {
                 to_remove.push((validator.clone(), connection.connection.remote_address()));
             }
         }

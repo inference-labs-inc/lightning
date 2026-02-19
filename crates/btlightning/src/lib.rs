@@ -10,4 +10,7 @@ pub use client::{ClientConfig_, LightningClient, StreamingResponse};
 pub use error::{LightningError, Result};
 pub use server::{LightningServer, StreamingSynapseHandler, SynapseHandler};
 pub use signing::{CallbackSigner, Signer, Sr25519Signer};
-pub use types::*;
+pub use types::{
+    HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket,
+    SynapseResponse,
+};

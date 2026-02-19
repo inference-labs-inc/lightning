@@ -29,7 +29,8 @@ impl SynapseHandler for PythonSynapseHandler {
             let py_dict = pyo3::types::PyDict::new(py);
 
             for (key, value) in &data {
-                let py_value = msgpack_value_to_py(py, value);
+                let py_value = msgpack_value_to_py(py, value)
+                    .map_err(|e| LightningError::Handler(e.to_string()))?;
                 py_dict
                     .set_item(key, py_value)
                     .map_err(|e| LightningError::Handler(e.to_string()))?;
@@ -88,7 +89,8 @@ impl StreamingSynapseHandler for PythonStreamingSynapseHandler {
             Python::with_gil(|py| {
                 let py_dict = pyo3::types::PyDict::new(py);
                 for (key, value) in &data {
-                    let py_value = msgpack_value_to_py(py, value);
+                    let py_value = msgpack_value_to_py(py, value)
+                        .map_err(|e| LightningError::Handler(e.to_string()))?;
                     py_dict
                         .set_item(key, py_value)
                         .map_err(|e| LightningError::Handler(e.to_string()))?;
@@ -128,43 +130,43 @@ impl StreamingSynapseHandler for PythonStreamingSynapseHandler {
     }
 }
 
-pub fn msgpack_value_to_py(py: Python, value: &rmpv::Value) -> PyObject {
+pub fn msgpack_value_to_py(py: Python, value: &rmpv::Value) -> PyResult<PyObject> {
     match value {
-        rmpv::Value::Nil => py.None(),
-        rmpv::Value::Boolean(b) => b.to_object(py),
+        rmpv::Value::Nil => Ok(py.None()),
+        rmpv::Value::Boolean(b) => Ok(b.to_object(py)),
         rmpv::Value::Integer(i) => {
             if let Some(v) = i.as_i64() {
-                v.to_object(py)
+                Ok(v.to_object(py))
             } else if let Some(v) = i.as_u64() {
-                v.to_object(py)
+                Ok(v.to_object(py))
             } else {
-                py.None()
+                Ok(py.None())
             }
         }
-        rmpv::Value::F32(f) => f.to_object(py),
-        rmpv::Value::F64(f) => f.to_object(py),
+        rmpv::Value::F32(f) => Ok(f.to_object(py)),
+        rmpv::Value::F64(f) => Ok(f.to_object(py)),
         rmpv::Value::String(s) => match s.as_str() {
-            Some(st) => st.to_object(py),
-            None => s.as_bytes().to_object(py),
+            Some(st) => Ok(st.to_object(py)),
+            None => Ok(s.as_bytes().to_object(py)),
         },
-        rmpv::Value::Binary(b) => pyo3::types::PyBytes::new(py, b).to_object(py),
+        rmpv::Value::Binary(b) => Ok(pyo3::types::PyBytes::new(py, b).to_object(py)),
         rmpv::Value::Array(arr) => {
             let py_list = pyo3::types::PyList::empty(py);
             for item in arr {
-                let _ = py_list.append(msgpack_value_to_py(py, item));
+                py_list.append(msgpack_value_to_py(py, item)?)?;
             }
-            py_list.to_object(py)
+            Ok(py_list.to_object(py))
         }
         rmpv::Value::Map(entries) => {
             let py_dict = pyo3::types::PyDict::new(py);
             for (k, v) in entries {
-                let py_key = msgpack_value_to_py(py, k);
-                let py_val = msgpack_value_to_py(py, v);
-                let _ = py_dict.set_item(py_key, py_val);
+                let py_key = msgpack_value_to_py(py, k)?;
+                let py_val = msgpack_value_to_py(py, v)?;
+                py_dict.set_item(py_key, py_val)?;
             }
-            py_dict.to_object(py)
+            Ok(py_dict.to_object(py))
         }
-        rmpv::Value::Ext(_type_id, data) => pyo3::types::PyBytes::new(py, data).to_object(py),
+        rmpv::Value::Ext(_type_id, data) => Ok(pyo3::types::PyBytes::new(py, data).to_object(py)),
     }
 }
 
@@ -179,8 +181,6 @@ pub fn py_to_msgpack_value(value: &PyAny) -> PyResult<rmpv::Value> {
         Ok(rmpv::Value::F64(f))
     } else if let Ok(s) = value.extract::<String>() {
         Ok(rmpv::Value::String(rmpv::Utf8String::from(s.as_str())))
-    } else if let Ok(b) = value.extract::<Vec<u8>>() {
-        Ok(rmpv::Value::Binary(b))
     } else if let Ok(list) = value.downcast::<pyo3::types::PyList>() {
         let mut arr = Vec::new();
         for item in list.iter() {
@@ -193,6 +193,8 @@ pub fn py_to_msgpack_value(value: &PyAny) -> PyResult<rmpv::Value> {
             entries.push((py_to_msgpack_value(k)?, py_to_msgpack_value(v)?));
         }
         Ok(rmpv::Value::Map(entries))
+    } else if let Ok(b) = value.extract::<Vec<u8>>() {
+        Ok(rmpv::Value::Binary(b))
     } else {
         let s: String = value.str()?.extract()?;
         Ok(rmpv::Value::String(rmpv::Utf8String::from(s.as_str())))

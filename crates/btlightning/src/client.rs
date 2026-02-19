@@ -728,6 +728,8 @@ async fn send_synapse_packet(
             })
         }
         MessageType::StreamChunk => {
+            const MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
+
             let first_chunk: StreamChunk = rmp_serde::from_slice(&payload).map_err(|e| {
                 LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
             })?;
@@ -744,6 +746,12 @@ async fn send_synapse_packet(
                                     e
                                 ))
                             })?;
+                        if all_data.len() + chunk.data.len() > MAX_RESPONSE_SIZE {
+                            return Err(LightningError::Stream(format!(
+                                "streaming response exceeded {} byte limit",
+                                MAX_RESPONSE_SIZE
+                            )));
+                        }
                         all_data.extend_from_slice(&chunk.data);
                     }
                     MessageType::StreamEnd => {

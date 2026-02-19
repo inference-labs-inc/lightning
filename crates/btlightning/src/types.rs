@@ -3,6 +3,8 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicAxonInfo {
     pub hotkey: String,
@@ -88,6 +90,7 @@ pub struct SynapseResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -156,6 +159,13 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
     let msg_type = MessageType::try_from(header[0])?;
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
+    if payload_len > MAX_FRAME_SIZE {
+        return Err(LightningError::Transport(format!(
+            "frame payload {} bytes exceeds maximum {}",
+            payload_len, MAX_FRAME_SIZE
+        )));
+    }
+
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
         read_exact_from_recv(recv, &mut payload).await?;
@@ -169,10 +179,16 @@ pub async fn write_frame(
     msg_type: MessageType,
     payload: &[u8],
 ) -> Result<()> {
+    let payload_len: u32 = payload.len().try_into().map_err(|_| {
+        LightningError::Transport(format!(
+            "frame payload {} bytes exceeds u32::MAX",
+            payload.len()
+        ))
+    })?;
+
     let mut header = [0u8; FRAME_HEADER_SIZE];
     header[0] = msg_type as u8;
-    let len_bytes = (payload.len() as u32).to_be_bytes();
-    header[1..5].copy_from_slice(&len_bytes);
+    header[1..5].copy_from_slice(&payload_len.to_be_bytes());
 
     send.write_all(&header)
         .await

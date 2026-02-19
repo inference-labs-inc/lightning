@@ -193,7 +193,7 @@ impl RustLightning {
         result_dict.set_item("latency_ms", response.latency_ms)?;
 
         for (key, value) in &response.data {
-            let py_value = msgpack_value_to_py(py, value);
+            let py_value = msgpack_value_to_py(py, value)?;
             result_dict.set_item(key, py_value)?;
         }
 

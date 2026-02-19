@@ -262,6 +262,7 @@ dependencies = [
  "rmpv",
  "rustls",
  "serde",
+ "serde_bytes",
  "sp-core",
  "tokio",
  "tracing",
