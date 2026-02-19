@@ -3,11 +3,11 @@ use pyo3::prelude::*;
 use std::sync::Mutex;
 
 pub struct PythonSigner {
-    callback: Mutex<PyObject>,
+    callback: Mutex<Py<PyAny>>,
 }
 
 impl PythonSigner {
-    pub fn new(callback: PyObject) -> Self {
+    pub fn new(callback: Py<PyAny>) -> Self {
         Self {
             callback: Mutex::new(callback),
         }
@@ -20,7 +20,7 @@ impl Signer for PythonSigner {
             .callback
             .lock()
             .map_err(|e| LightningError::Signing(format!("lock poisoned: {}", e)))?;
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let message_str =
                 std::str::from_utf8(message).map_err(|e| LightningError::Signing(e.to_string()))?;
             let result = callback.call1(py, (message_str,)).map_err(|e| {

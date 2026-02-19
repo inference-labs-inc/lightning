@@ -1,4 +1,7 @@
 use crate::error::{LightningError, Result};
+#[cfg(feature = "btwallet")]
+use crate::signing::BtWalletSigner;
+use crate::signing::{Signer, Sr25519Signer};
 use crate::types::{
     read_frame, write_frame, write_frame_and_finish, HandshakeRequest, HandshakeResponse,
     MessageType, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
@@ -97,7 +100,7 @@ struct ServerContext {
     streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     miner_hotkey: String,
-    miner_keypair: Option<sr25519::Pair>,
+    miner_signer: Option<Arc<dyn Signer>>,
     cert_fingerprint: Arc<RwLock<Option<[u8; 32]>>>,
 }
 
@@ -120,7 +123,7 @@ impl LightningServer {
                 streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
                 miner_hotkey,
-                miner_keypair: None,
+                miner_signer: None,
                 cert_fingerprint: Arc::new(RwLock::new(None)),
             },
             endpoint: None,
@@ -128,7 +131,23 @@ impl LightningServer {
     }
 
     pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
-        self.ctx.miner_keypair = Some(sr25519::Pair::from_seed(&keypair_bytes));
+        self.ctx.miner_signer = Some(Arc::new(Sr25519Signer::from_seed(keypair_bytes)));
+    }
+
+    pub fn set_miner_signer(&mut self, signer: Box<dyn Signer>) {
+        self.ctx.miner_signer = Some(Arc::from(signer));
+    }
+
+    #[cfg(feature = "btwallet")]
+    pub fn set_miner_wallet(
+        &mut self,
+        wallet_name: &str,
+        wallet_path: &str,
+        hotkey_name: &str,
+    ) -> Result<()> {
+        let signer = BtWalletSigner::from_wallet(wallet_name, wallet_path, hotkey_name)?;
+        self.ctx.miner_signer = Some(Arc::new(signer));
+        Ok(())
     }
 
     pub async fn register_synapse_handler(
@@ -558,7 +577,7 @@ impl LightningServer {
                 signature: Self::sign_handshake_response(
                     &request,
                     &ctx.miner_hotkey,
-                    &ctx.miner_keypair,
+                    &ctx.miner_signer,
                     now,
                     &cert_fp,
                 ),
@@ -659,7 +678,7 @@ impl LightningServer {
     fn sign_handshake_response(
         request: &HandshakeRequest,
         miner_hotkey: &str,
-        miner_keypair: &Option<sr25519::Pair>,
+        miner_signer: &Option<Arc<dyn Signer>>,
         timestamp: u64,
         cert_fingerprint: &Option<[u8; 32]>,
     ) -> String {
@@ -672,13 +691,16 @@ impl LightningServer {
             request.validator_hotkey, miner_hotkey, timestamp, request.nonce, fp_b64
         );
 
-        match miner_keypair {
-            Some(pair) => {
-                let signature = pair.sign(message.as_bytes());
-                BASE64_STANDARD.encode(signature.0)
-            }
+        match miner_signer {
+            Some(signer) => match signer.sign(message.as_bytes()) {
+                Ok(sig) => BASE64_STANDARD.encode(sig),
+                Err(e) => {
+                    error!("Failed to sign handshake response: {}", e);
+                    String::new()
+                }
+            },
             None => {
-                warn!("No miner keypair configured, using empty signature");
+                warn!("No miner signer configured, using empty signature");
                 String::new()
             }
         }
