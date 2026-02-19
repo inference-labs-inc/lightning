@@ -1,8 +1,9 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Iterator
 
 from btlightning._native import (
     RustLightning,
     RustLightningServer,
+    PyStreamingResponse,
     QuicAxonInfo,
 )
 
@@ -45,6 +46,14 @@ class Lightning:
     ) -> Dict[str, Any]:
         return self._rust_client.query_axon(axon_info, request)
 
+    def query_axon_stream(
+        self, axon_info: Dict[str, Any], request: Dict[str, Any]
+    ) -> Iterator[bytes]:
+        return self._rust_client.query_axon_stream(axon_info, request)
+
+    def update_miner_registry(self, miners: List[Dict[str, Any]]) -> None:
+        return self._rust_client.update_miner_registry(miners)
+
     def get_connection_stats(self) -> Dict[str, str]:
         return self._rust_client.get_connection_stats()
 
@@ -64,6 +73,9 @@ class LightningServer:
 
     def register_synapse_handler(self, synapse_type: str, handler) -> None:
         return self._rust_server.register_synapse_handler(synapse_type, handler)
+
+    def register_streaming_handler(self, synapse_type: str, handler) -> None:
+        return self._rust_server.register_streaming_handler(synapse_type, handler)
 
     def start(self) -> None:
         return self._rust_server.start()
@@ -86,6 +98,7 @@ __all__ = [
     "LightningServer",
     "RustLightning",
     "RustLightningServer",
+    "PyStreamingResponse",
     "QuicAxonInfo",
     "LIGHTNING_AVAILABLE",
 ]

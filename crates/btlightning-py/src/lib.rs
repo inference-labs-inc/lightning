@@ -1,6 +1,7 @@
 #![allow(non_local_definitions)]
 
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,9 @@ mod handler;
 mod signer;
 mod types;
 
-use handler::PythonSynapseHandler;
+use handler::{
+    msgpack_value_to_py, py_to_msgpack_value, PythonStreamingSynapseHandler, PythonSynapseHandler,
+};
 use signer::PythonSigner;
 use types::PyQuicAxonInfo;
 
@@ -28,7 +31,39 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
         btlightning::LightningError::Handler(msg) => {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("handler error: {}", msg))
         }
+        btlightning::LightningError::Stream(msg) => {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("stream error: {}", msg))
+        }
         _ => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()),
+    }
+}
+
+#[pyclass]
+pub struct PyStreamingResponse {
+    response: Arc<tokio::sync::Mutex<btlightning::StreamingResponse>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl PyStreamingResponse {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let response = self.response.clone();
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut resp = response.lock().await;
+                resp.next_chunk().await
+            })
+        });
+        match result {
+            Ok(Some(bytes)) => Ok(Some(PyBytes::new(py, &bytes).into())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(to_pyerr(e)),
+        }
     }
 }
 
@@ -140,36 +175,8 @@ impl RustLightning {
         axon_data: PyObject,
         request_data: PyObject,
     ) -> PyResult<PyObject> {
-        let request_dict = request_data.extract::<HashMap<String, PyObject>>(py)?;
         let axon_info = extract_quic_axon_info(py, &axon_data)?;
-
-        let synapse_type = request_dict
-            .get("synapse_type")
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Missing 'synapse_type' field")
-            })?
-            .extract::<String>(py)?;
-
-        let mut data = HashMap::new();
-        if let Some(data_obj) = request_dict.get("data") {
-            let data_dict = data_obj.extract::<HashMap<String, PyObject>>(py)?;
-            let json_module = py.import("json")?;
-            for (key, value) in data_dict {
-                let json_str = json_module
-                    .call_method1("dumps", (value,))?
-                    .extract::<String>()?;
-                let json_value: serde_json::Value =
-                    serde_json::from_str(&json_str).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                            "Failed to parse JSON from Python: {}",
-                            e
-                        ))
-                    })?;
-                data.insert(key, json_value);
-            }
-        }
-
-        let request = btlightning::QuicRequest::new(synapse_type, data);
+        let request = extract_quic_request(py, &request_data)?;
 
         let runtime = Arc::clone(&self.runtime);
         let response = py
@@ -185,27 +192,37 @@ impl RustLightning {
         result_dict.set_item("success", response.success)?;
         result_dict.set_item("latency_ms", response.latency_ms)?;
 
-        for (key, value) in response.data {
-            let py_value = match value {
-                serde_json::Value::String(s) => s.into_py(py),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        i.into_py(py)
-                    } else if let Some(f) = n.as_f64() {
-                        f.into_py(py)
-                    } else {
-                        n.to_string().into_py(py)
-                    }
-                }
-                serde_json::Value::Bool(b) => b.into_py(py),
-                _ => serde_json::to_string(&value)
-                    .unwrap_or_default()
-                    .into_py(py),
-            };
+        for (key, value) in &response.data {
+            let py_value = msgpack_value_to_py(py, value);
             result_dict.set_item(key, py_value)?;
         }
 
         Ok(result_dict.into())
+    }
+
+    pub fn query_axon_stream(
+        &self,
+        py: Python<'_>,
+        axon_data: PyObject,
+        request_data: PyObject,
+    ) -> PyResult<PyStreamingResponse> {
+        let axon_info = extract_quic_axon_info(py, &axon_data)?;
+        let request = extract_quic_request(py, &request_data)?;
+
+        let runtime = Arc::clone(&self.runtime);
+        let streaming_response = py
+            .allow_threads(|| {
+                runtime.block_on(async {
+                    let client = self.client.read().await;
+                    client.query_axon_stream(axon_info, request).await
+                })
+            })
+            .map_err(to_pyerr)?;
+
+        Ok(PyStreamingResponse {
+            response: Arc::new(tokio::sync::Mutex::new(streaming_response)),
+            runtime: Arc::clone(&self.runtime),
+        })
     }
 
     pub fn update_miner_registry(&self, py: Python<'_>, miners: Vec<PyObject>) -> PyResult<()> {
@@ -300,6 +317,27 @@ impl RustLightningServer {
         .map_err(to_pyerr)
     }
 
+    pub fn register_streaming_handler(
+        &self,
+        py: Python<'_>,
+        synapse_type: String,
+        handler: PyObject,
+    ) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let server = self.server.read().await;
+                server
+                    .register_streaming_handler(
+                        synapse_type,
+                        Arc::new(PythonStreamingSynapseHandler::new(handler)),
+                    )
+                    .await
+            })
+        })
+        .map_err(to_pyerr)
+    }
+
     pub fn start(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
         py.allow_threads(|| {
@@ -363,6 +401,34 @@ impl RustLightningServer {
     }
 }
 
+fn extract_quic_request(py: Python, request_data: &PyObject) -> PyResult<btlightning::QuicRequest> {
+    let request_dict = request_data.extract::<HashMap<String, PyObject>>(py)?;
+
+    let synapse_type = request_dict
+        .get("synapse_type")
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>("Missing 'synapse_type' field")
+        })?
+        .extract::<String>(py)?;
+
+    let mut data = HashMap::new();
+    if let Some(data_obj) = request_dict.get("data") {
+        let data_dict = data_obj.extract::<HashMap<String, PyObject>>(py)?;
+        for (key, value) in data_dict {
+            let val = value.as_ref(py);
+            let msgpack_value = py_to_msgpack_value(val).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to convert Python value to msgpack: {}",
+                    e
+                ))
+            })?;
+            data.insert(key, msgpack_value);
+        }
+    }
+
+    Ok(btlightning::QuicRequest::new(synapse_type, data))
+}
+
 fn extract_quic_axon_info(py: Python, miner_obj: &PyObject) -> PyResult<btlightning::QuicAxonInfo> {
     let miner_dict = miner_obj.extract::<HashMap<String, PyObject>>(py)?;
 
@@ -411,6 +477,7 @@ fn extract_quic_axon_info(py: Python, miner_obj: &PyObject) -> PyResult<btlightn
 fn _native(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<RustLightning>()?;
     m.add_class::<RustLightningServer>()?;
+    m.add_class::<PyStreamingResponse>()?;
     m.add_class::<PyQuicAxonInfo>()?;
     Ok(())
 }
