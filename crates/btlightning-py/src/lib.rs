@@ -162,11 +162,10 @@ impl RustLightning {
         py.detach(|| {
             runtime.block_on(async {
                 let mut client = self.client.write().await;
-                client
-                    .set_wallet(&wallet_name, &wallet_path, &hotkey_name)
-                    .map_err(to_pyerr)
+                client.set_wallet(&wallet_name, &wallet_path, &hotkey_name)
             })
         })
+        .map_err(to_pyerr)
     }
 
     pub fn initialize_connections(&self, py: Python<'_>, miners: Vec<Py<PyAny>>) -> PyResult<()> {
@@ -334,11 +333,10 @@ impl RustLightningServer {
         py.detach(|| {
             runtime.block_on(async {
                 let mut server = self.server.write().await;
-                server
-                    .set_miner_wallet(&wallet_name, &wallet_path, &hotkey_name)
-                    .map_err(to_pyerr)
+                server.set_miner_wallet(&wallet_name, &wallet_path, &hotkey_name)
             })
         })
+        .map_err(to_pyerr)
     }
 
     pub fn register_synapse_handler(

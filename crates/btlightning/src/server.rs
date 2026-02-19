@@ -571,19 +571,32 @@ impl LightningServer {
                 connection_id
             );
 
-            HandshakeResponse {
-                miner_hotkey: ctx.miner_hotkey.clone(),
-                timestamp: now,
-                signature: Self::sign_handshake_response(
-                    &request,
-                    &ctx.miner_hotkey,
-                    &ctx.miner_signer,
-                    now,
-                    &cert_fp,
-                ),
-                accepted: true,
-                connection_id,
-                cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
+            match Self::sign_handshake_response(
+                &request,
+                &ctx.miner_hotkey,
+                ctx.miner_signer.as_deref(),
+                now,
+                &cert_fp,
+            ) {
+                Ok(signature) => HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: now,
+                    signature,
+                    accepted: true,
+                    connection_id,
+                    cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
+                },
+                Err(e) => {
+                    error!("Handshake signing failed: {}", e);
+                    HandshakeResponse {
+                        miner_hotkey: ctx.miner_hotkey.clone(),
+                        timestamp: unix_timestamp_secs(),
+                        signature: String::new(),
+                        accepted: false,
+                        connection_id: String::new(),
+                        cert_fingerprint: None,
+                    }
+                }
             }
         } else {
             error!("Handshake failed: invalid signature");
@@ -678,10 +691,12 @@ impl LightningServer {
     fn sign_handshake_response(
         request: &HandshakeRequest,
         miner_hotkey: &str,
-        miner_signer: &Option<Arc<dyn Signer>>,
+        miner_signer: Option<&dyn Signer>,
         timestamp: u64,
         cert_fingerprint: &Option<[u8; 32]>,
-    ) -> String {
+    ) -> Result<String> {
+        let signer = miner_signer
+            .ok_or_else(|| LightningError::Signing("no miner signer configured".to_string()))?;
         let fp_b64 = cert_fingerprint
             .as_ref()
             .map(|fp| BASE64_STANDARD.encode(fp))
@@ -690,20 +705,8 @@ impl LightningServer {
             "handshake_response:{}:{}:{}:{}:{}",
             request.validator_hotkey, miner_hotkey, timestamp, request.nonce, fp_b64
         );
-
-        match miner_signer {
-            Some(signer) => match signer.sign(message.as_bytes()) {
-                Ok(sig) => BASE64_STANDARD.encode(sig),
-                Err(e) => {
-                    error!("Failed to sign handshake response: {}", e);
-                    String::new()
-                }
-            },
-            None => {
-                warn!("No miner signer configured, using empty signature");
-                String::new()
-            }
-        }
+        let sig = signer.sign(message.as_bytes())?;
+        Ok(BASE64_STANDARD.encode(sig))
     }
 
     async fn process_synapse_packet(
