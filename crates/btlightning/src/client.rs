@@ -254,7 +254,7 @@ impl LightningClient {
         Ok(())
     }
 
-    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon(
         &self,
         axon_info: QuicAxonInfo,
@@ -278,7 +278,7 @@ impl LightningClient {
         }
     }
 
-    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port), timeout_ms = timeout.as_millis() as u64))]
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port, timeout_ms = timeout.as_millis() as u64))]
     pub async fn query_axon_with_timeout(
         &self,
         axon_info: QuicAxonInfo,
@@ -290,7 +290,7 @@ impl LightningClient {
             .map_err(|_| LightningError::Transport("query timed out".into()))?
     }
 
-    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon_stream(
         &self,
         axon_info: QuicAxonInfo,

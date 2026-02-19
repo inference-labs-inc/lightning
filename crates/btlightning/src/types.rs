@@ -653,6 +653,15 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
     let mut payload = Vec::with_capacity(INCREMENTAL_READ_THRESHOLD);
     let mut remaining = payload_len;
     while remaining > 0 {
+        let next_capacity = payload
+            .capacity()
+            .saturating_mul(2)
+            .max(INCREMENTAL_READ_THRESHOLD)
+            .min(payload_len)
+            .min(MAX_FRAME_PAYLOAD);
+        if payload.capacity() < next_capacity {
+            payload.reserve(next_capacity - payload.len());
+        }
         let chunk_size = remaining.min(READ_CHUNK_SIZE);
         let start = payload.len();
         payload.resize(start + chunk_size, 0);

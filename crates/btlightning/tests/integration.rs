@@ -5,6 +5,7 @@ use btlightning::{
 };
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -42,12 +43,26 @@ async fn setup() -> TestEnv {
 }
 
 async fn setup_with_config(config: LightningServerConfig) -> TestEnv {
-    let mut server =
-        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    setup_with_register(|_| Box::pin(async { Ok(()) }), Some(config)).await
+}
+
+async fn setup_with_register<F>(register: F, config: Option<LightningServerConfig>) -> TestEnv
+where
+    F: for<'a> FnOnce(
+        &'a LightningServer,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
+{
+    let mut server = LightningServer::with_config(
+        miner_hotkey(),
+        "127.0.0.1".into(),
+        0,
+        config.unwrap_or_default(),
+    )
+    .unwrap();
     server.set_miner_keypair(MINER_SEED);
+    register(&server).await.unwrap();
     server.start().await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let port = addr.port();
+    let port = server.local_addr().unwrap().port();
 
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
@@ -75,108 +90,27 @@ async fn setup_with_handler<H: SynapseHandler + 'static>(
     synapse_type: &str,
     handler: H,
 ) -> TestEnv {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_synapse_handler(synapse_type.to_string(), Arc::new(handler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let port = addr.port();
-
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-
-    let axon_info = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    TestEnv {
-        server_handle,
-        client,
-        axon_info,
-    }
+    let st = synapse_type.to_string();
+    let h = Arc::new(handler);
+    setup_with_register(|s| Box::pin(s.register_synapse_handler(st, h)), None).await
 }
 
 async fn setup_with_async_handler<H: AsyncSynapseHandler + 'static>(
     synapse_type: &str,
     handler: H,
 ) -> TestEnv {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_async_synapse_handler(synapse_type.to_string(), Arc::new(handler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let port = addr.port();
-
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-
-    let axon_info = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    TestEnv {
-        server_handle,
-        client,
-        axon_info,
-    }
+    let st = synapse_type.to_string();
+    let h = Arc::new(handler);
+    setup_with_register(|s| Box::pin(s.register_async_synapse_handler(st, h)), None).await
 }
 
 async fn setup_with_streaming_handler<H: StreamingSynapseHandler + 'static>(
     synapse_type: &str,
     handler: H,
 ) -> TestEnv {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler(synapse_type.to_string(), Arc::new(handler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let port = addr.port();
-
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-
-    let axon_info = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    TestEnv {
-        server_handle,
-        client,
-        axon_info,
-    }
+    let st = synapse_type.to_string();
+    let h = Arc::new(handler);
+    setup_with_register(|s| Box::pin(s.register_streaming_handler(st, h)), None).await
 }
 
 struct EchoHandler;
@@ -327,23 +261,25 @@ async fn client_handshake_succeeds() {
     env.shutdown().await;
 }
 
+// The client uses a different validator keypair that the server has never seen,
+// but the keypair is valid for its own claimed hotkey so the sr25519 handshake
+// signature verifies and the connection succeeds.
 #[tokio::test]
-async fn client_wrong_key_rejected() {
+async fn client_with_different_validator_key_connects() {
     let env = setup().await;
 
-    let wrong_seed = [99u8; 32];
-    let wrong_hotkey = sr25519::Pair::from_seed(&wrong_seed)
+    let other_seed = [99u8; 32];
+    let other_hotkey = sr25519::Pair::from_seed(&other_seed)
         .public()
         .to_ss58check();
 
-    let mut client = LightningClient::new(wrong_hotkey);
-    client.set_signer(Box::new(Sr25519Signer::from_seed(wrong_seed)));
+    let mut client = LightningClient::new(other_hotkey);
+    client.set_signer(Box::new(Sr25519Signer::from_seed(other_seed)));
     client.create_endpoint().await.unwrap();
 
-    let mut bad_axon = env.axon_info.clone();
-    bad_axon.hotkey = miner_hotkey();
-    let miners = vec![bad_axon];
-    client.initialize_connections(miners).await.unwrap();
+    let mut axon = env.axon_info.clone();
+    axon.hotkey = miner_hotkey();
+    client.initialize_connections(vec![axon]).await.unwrap();
 
     let stats = client.get_connection_stats().await.unwrap();
     assert_eq!(stats.get("total_connections").unwrap(), "1");
@@ -450,8 +386,11 @@ async fn client_reconnects_after_disconnect() {
 
 // --- Handshake Security ---
 
+// Nonce replay rejection is tested at the unit level in
+// server::tests::verify_rejects_nonce_replay. This integration test verifies
+// that successive handshakes each consume a unique nonce on the server side.
 #[tokio::test]
-async fn nonce_replay_rejected() {
+async fn nonce_accounting_increments() {
     let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
     server.set_miner_keypair(MINER_SEED);
     server

@@ -1,6 +1,7 @@
 import sys
 import traceback
 from typing import Callable, Dict, Any, List, Optional, Iterator, TypedDict
+from typing_extensions import NotRequired
 
 from btlightning._native import (
     RustLightning,
@@ -16,9 +17,9 @@ class AxonInfo(TypedDict):
     hotkey: str
     ip: str
     port: int
-    protocol: int  # IP protocol version (4 = IPv4, 6 = IPv6)
-    placeholder1: int  # Reserved for future use (Bittensor metagraph field)
-    placeholder2: int  # Reserved for future use (Bittensor metagraph field)
+    protocol: NotRequired[int]  # IP protocol version (default 4 = IPv4)
+    placeholder1: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
+    placeholder2: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
 
 
 class SynapseRequest(TypedDict):
