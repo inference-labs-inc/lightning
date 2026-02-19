@@ -16,9 +16,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-const MAX_SIGNATURE_AGE: u64 = 300;
+pub struct LightningServerConfig {
+    pub max_signature_age_secs: u64,
+    pub idle_timeout_secs: u64,
+    pub keep_alive_interval_secs: u64,
+    pub nonce_cleanup_interval_secs: u64,
+}
+
+impl Default for LightningServerConfig {
+    fn default() -> Self {
+        Self {
+            max_signature_age_secs: 300,
+            idle_timeout_secs: 150,
+            keep_alive_interval_secs: 30,
+            nonce_cleanup_interval_secs: 60,
+        }
+    }
+}
+
+impl Clone for LightningServerConfig {
+    fn clone(&self) -> Self {
+        Self {
+            max_signature_age_secs: self.max_signature_age_secs,
+            idle_timeout_secs: self.idle_timeout_secs,
+            keep_alive_interval_secs: self.keep_alive_interval_secs,
+            nonce_cleanup_interval_secs: self.nonce_cleanup_interval_secs,
+        }
+    }
+}
 
 pub trait SynapseHandler: Send + Sync {
     fn handle(
@@ -99,6 +127,7 @@ struct ServerContext {
     miner_hotkey: String,
     miner_keypair: Option<sr25519::Pair>,
     cert_fingerprint: Arc<RwLock<Option<[u8; 32]>>>,
+    config: LightningServerConfig,
 }
 
 pub struct LightningServer {
@@ -106,10 +135,20 @@ pub struct LightningServer {
     port: u16,
     ctx: ServerContext,
     endpoint: Option<Endpoint>,
+    cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl LightningServer {
     pub fn new(miner_hotkey: String, host: String, port: u16) -> Self {
+        Self::with_config(miner_hotkey, host, port, LightningServerConfig::default())
+    }
+
+    pub fn with_config(
+        miner_hotkey: String,
+        host: String,
+        port: u16,
+        config: LightningServerConfig,
+    ) -> Self {
         Self {
             host,
             port,
@@ -122,8 +161,10 @@ impl LightningServer {
                 miner_hotkey,
                 miner_keypair: None,
                 cert_fingerprint: Arc::new(RwLock::new(None)),
+                config,
             },
             endpoint: None,
+            cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -187,10 +228,14 @@ impl LightningServer {
 
         server_config.alpn_protocols = vec![b"btlightning".to_vec()];
         let mut transport_config = TransportConfig::default();
-        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(150))
-            .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
+        let idle_timeout = IdleTimeout::try_from(Duration::from_secs(
+            self.ctx.config.idle_timeout_secs,
+        ))
+        .map_err(|e| LightningError::Config(format!("Failed to set idle timeout: {}", e)))?;
         transport_config.max_idle_timeout(Some(idle_timeout));
-        transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
+        transport_config.keep_alive_interval(Some(Duration::from_secs(
+            self.ctx.config.keep_alive_interval_secs,
+        )));
 
         let mut server_config = ServerConfig::with_crypto(Arc::new(server_config));
         server_config.transport_config(Arc::new(transport_config));
@@ -211,15 +256,19 @@ impl LightningServer {
     pub async fn serve_forever(&self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
             let nonces_for_cleanup = self.ctx.used_nonces.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let cleanup_interval_secs = self.ctx.config.nonce_cleanup_interval_secs;
+            let max_sig_age = self.ctx.config.max_signature_age_secs;
+            let handle = tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
                 loop {
                     interval.tick().await;
                     let mut nonces = nonces_for_cleanup.write().await;
-                    let cutoff = unix_timestamp_secs().saturating_sub(MAX_SIGNATURE_AGE);
+                    let cutoff = unix_timestamp_secs().saturating_sub(max_sig_age);
                     nonces.retain(|_, ts| *ts > cutoff);
                 }
             });
+            *self.cleanup_handle.lock().await = Some(handle);
 
             while let Some(conn) = endpoint.accept().await {
                 let ctx = self.ctx.clone();
@@ -253,11 +302,24 @@ impl LightningServer {
                     });
                 }
                 Err(e) => {
-                    error!("Stream error: {}", e);
+                    debug!("Connection ended: {}", e);
                     break;
                 }
             }
         }
+
+        let remote_addr = connection.remote_address();
+        let hotkey = {
+            let addr_index = ctx.addr_to_hotkey.read().await;
+            addr_index.get(&remote_addr).cloned()
+        };
+        if let Some(hotkey) = hotkey {
+            let mut connections = ctx.connections.write().await;
+            let mut addr_index = ctx.addr_to_hotkey.write().await;
+            connections.remove(&hotkey);
+            addr_index.remove(&remote_addr);
+        }
+        connection.close(0u32.into(), b"done");
     }
 
     async fn handle_stream(
@@ -319,6 +381,20 @@ impl LightningServer {
                         }
                         Err(e) => {
                             error!("Failed to serialize SynapseResponse: {}", e);
+                            let fallback = SynapseResponse {
+                                success: false,
+                                data: HashMap::new(),
+                                timestamp: unix_timestamp_secs(),
+                                error: Some("internal serialization error".to_string()),
+                            };
+                            if let Ok(bytes) = rmp_serde::to_vec(&fallback) {
+                                let _ = write_frame_and_finish(
+                                    &mut send,
+                                    MessageType::SynapseResponse,
+                                    &bytes,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -360,6 +436,22 @@ impl LightningServer {
                     }
                     Err(e) => {
                         error!("Failed to serialize HandshakeResponse: {}", e);
+                        let fallback = HandshakeResponse {
+                            miner_hotkey: ctx.miner_hotkey.clone(),
+                            timestamp: unix_timestamp_secs(),
+                            signature: String::new(),
+                            accepted: false,
+                            connection_id: String::new(),
+                            cert_fingerprint: None,
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec(&fallback) {
+                            let _ = write_frame_and_finish(
+                                &mut send,
+                                MessageType::HandshakeResponse,
+                                &bytes,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -512,70 +604,90 @@ impl LightningServer {
         ctx: &ServerContext,
     ) -> HandshakeResponse {
         let cert_fp: Option<[u8; 32]> = *ctx.cert_fingerprint.read().await;
-        let is_valid =
-            Self::verify_validator_signature(&request, ctx.used_nonces.clone(), &cert_fp).await;
+        let is_valid = Self::verify_validator_signature(
+            &request,
+            ctx.used_nonces.clone(),
+            &cert_fp,
+            ctx.config.max_signature_age_secs,
+        )
+        .await;
 
-        if is_valid {
-            let now = unix_timestamp_secs();
-            let connection_id = format!(
-                "conn_{}_{}",
-                request.validator_hotkey,
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO)
-                    .as_millis()
-            );
-
-            let remote_addr = connection.remote_address();
-            let mut connections_guard = ctx.connections.write().await;
-            let mut addr_index = ctx.addr_to_hotkey.write().await;
-            let mut validator_conn = ValidatorConnection::new(
-                request.validator_hotkey.clone(),
-                connection_id.clone(),
-                connection.clone(),
-            );
-            validator_conn.verify();
-            if let Some(prev_conn) =
-                connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
-            {
-                let prev_addr = prev_conn.connection.remote_address();
-                if prev_addr != remote_addr {
-                    addr_index.remove(&prev_addr);
-                }
-            }
-            addr_index.insert(remote_addr, request.validator_hotkey.clone());
-            drop(addr_index);
-            drop(connections_guard);
-
-            info!(
-                "Handshake successful, established connection: {}",
-                connection_id
-            );
-
-            HandshakeResponse {
-                miner_hotkey: ctx.miner_hotkey.clone(),
-                timestamp: now,
-                signature: Self::sign_handshake_response(
-                    &request,
-                    &ctx.miner_hotkey,
-                    &ctx.miner_keypair,
-                    now,
-                    &cert_fp,
-                ),
-                accepted: true,
-                connection_id,
-                cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
-            }
-        } else {
+        if !is_valid {
             error!("Handshake failed: invalid signature");
-            HandshakeResponse {
+            return HandshakeResponse {
                 miner_hotkey: ctx.miner_hotkey.clone(),
                 timestamp: unix_timestamp_secs(),
                 signature: String::new(),
                 accepted: false,
                 connection_id: String::new(),
                 cert_fingerprint: None,
+            };
+        }
+
+        let now = unix_timestamp_secs();
+        let signature = match Self::sign_handshake_response(
+            &request,
+            &ctx.miner_hotkey,
+            ctx.miner_keypair.as_ref(),
+            now,
+            &cert_fp,
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                error!("Handshake signing failed: {}", e);
+                return HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: now,
+                    signature: String::new(),
+                    accepted: false,
+                    connection_id: String::new(),
+                    cert_fingerprint: None,
+                };
             }
+        };
+
+        let connection_id = format!(
+            "conn_{}_{}",
+            request.validator_hotkey,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis()
+        );
+
+        let remote_addr = connection.remote_address();
+        let mut connections_guard = ctx.connections.write().await;
+        let mut addr_index = ctx.addr_to_hotkey.write().await;
+        let mut validator_conn = ValidatorConnection::new(
+            request.validator_hotkey.clone(),
+            connection_id.clone(),
+            connection.clone(),
+        );
+        validator_conn.verify();
+        if let Some(prev_conn) =
+            connections_guard.insert(request.validator_hotkey.clone(), validator_conn)
+        {
+            let prev_addr = prev_conn.connection.remote_address();
+            if prev_addr != remote_addr {
+                addr_index.remove(&prev_addr);
+            }
+        }
+        addr_index.insert(remote_addr, request.validator_hotkey.clone());
+        drop(addr_index);
+        drop(connections_guard);
+
+        info!(
+            "Handshake successful, established connection: {}",
+            connection_id
+        );
+
+        HandshakeResponse {
+            miner_hotkey: ctx.miner_hotkey.clone(),
+            timestamp: now,
+            signature,
+            accepted: true,
+            connection_id,
+            cert_fingerprint: cert_fp.map(|fp| BASE64_STANDARD.encode(fp)),
         }
     }
 
@@ -583,11 +695,12 @@ impl LightningServer {
         request: &HandshakeRequest,
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         cert_fingerprint: &Option<[u8; 32]>,
+        max_signature_age: u64,
     ) -> bool {
         let current_time = unix_timestamp_secs();
 
         if current_time > request.timestamp
-            && (current_time - request.timestamp) > MAX_SIGNATURE_AGE
+            && (current_time - request.timestamp) > max_signature_age
         {
             error!(
                 "Signature timestamp too old: {} (current: {})",
@@ -659,10 +772,10 @@ impl LightningServer {
     fn sign_handshake_response(
         request: &HandshakeRequest,
         miner_hotkey: &str,
-        miner_keypair: &Option<sr25519::Pair>,
+        miner_keypair: Option<&sr25519::Pair>,
         timestamp: u64,
         cert_fingerprint: &Option<[u8; 32]>,
-    ) -> String {
+    ) -> Result<String> {
         let fp_b64 = cert_fingerprint
             .as_ref()
             .map(|fp| BASE64_STANDARD.encode(fp))
@@ -675,12 +788,11 @@ impl LightningServer {
         match miner_keypair {
             Some(pair) => {
                 let signature = pair.sign(message.as_bytes());
-                BASE64_STANDARD.encode(signature.0)
+                Ok(BASE64_STANDARD.encode(signature.0))
             }
-            None => {
-                warn!("No miner keypair configured, using empty signature");
-                String::new()
-            }
+            None => Err(LightningError::Signing(
+                "no miner keypair configured".to_string(),
+            )),
         }
     }
 
@@ -788,11 +900,15 @@ impl LightningServer {
 
     pub async fn cleanup_expired_nonces(&self) {
         let mut nonces = self.ctx.used_nonces.write().await;
-        let cutoff = unix_timestamp_secs().saturating_sub(MAX_SIGNATURE_AGE);
+        let cutoff = unix_timestamp_secs().saturating_sub(self.ctx.config.max_signature_age_secs);
         nonces.retain(|_, ts| *ts > cutoff);
     }
 
     pub async fn stop(&self) -> Result<()> {
+        if let Some(handle) = self.cleanup_handle.lock().await.take() {
+            handle.abort();
+        }
+
         let mut connections = self.ctx.connections.write().await;
         let mut addr_index = self.ctx.addr_to_hotkey.write().await;
         for (_, connection) in connections.drain() {

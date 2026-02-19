@@ -96,6 +96,12 @@ class LightningServer:
     def stop(self) -> None:
         return self._rust_server.stop()
 
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+
 
 __all__ = [
     "Lightning",

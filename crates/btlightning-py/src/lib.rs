@@ -22,8 +22,23 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
         btlightning::LightningError::Connection(msg) => {
             PyErr::new::<pyo3::exceptions::PyConnectionError, _>(msg)
         }
+        btlightning::LightningError::Handshake(msg) => {
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "handshake error: {}",
+                msg
+            ))
+        }
         btlightning::LightningError::Config(msg) => {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
+        }
+        btlightning::LightningError::Serialization(msg) => {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("serialization error: {}", msg))
+        }
+        btlightning::LightningError::Transport(msg) => {
+            PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                "transport error: {}",
+                msg
+            ))
         }
         btlightning::LightningError::Signing(msg) => {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("signing error: {}", msg))
@@ -34,7 +49,6 @@ fn to_pyerr(err: btlightning::LightningError) -> PyErr {
         btlightning::LightningError::Stream(msg) => {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("stream error: {}", msg))
         }
-        _ => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()),
     }
 }
 

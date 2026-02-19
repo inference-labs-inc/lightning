@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-pub const MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
+pub const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicAxonInfo {
