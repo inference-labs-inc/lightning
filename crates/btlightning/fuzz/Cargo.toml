@@ -1,0 +1,19 @@
+[package]
+name = "btlightning-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "fuzz_read_frame"
+path = "fuzz_targets/fuzz_read_frame.rs"
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+btlightning = { path = ".." }
+
+[workspace]

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Debug, Copy, Clone)]
 pub struct LightningServerConfig {
@@ -30,6 +30,7 @@ pub struct LightningServerConfig {
     pub keep_alive_interval_secs: u64,
     pub nonce_cleanup_interval_secs: u64,
     pub max_connections: usize,
+    pub max_nonce_entries: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -40,6 +41,7 @@ impl Default for LightningServerConfig {
             keep_alive_interval_secs: 30,
             nonce_cleanup_interval_secs: 60,
             max_connections: 128,
+            max_nonce_entries: 100_000,
         }
     }
 }
@@ -178,6 +180,11 @@ impl LightningServer {
                 "max_connections must be non-zero".to_string(),
             ));
         }
+        if config.max_nonce_entries == 0 {
+            return Err(LightningError::Config(
+                "max_nonce_entries must be non-zero".to_string(),
+            ));
+        }
         Ok(Self {
             host,
             port,
@@ -218,6 +225,7 @@ impl LightningServer {
         Ok(())
     }
 
+    #[instrument(skip(self, handler), fields(%synapse_type))]
     pub async fn register_synapse_handler(
         &self,
         synapse_type: String,
@@ -229,6 +237,7 @@ impl LightningServer {
         Ok(())
     }
 
+    #[instrument(skip(self, handler), fields(%synapse_type))]
     pub async fn register_async_synapse_handler(
         &self,
         synapse_type: String,
@@ -240,6 +249,7 @@ impl LightningServer {
         Ok(())
     }
 
+    #[instrument(skip(self, handler), fields(%synapse_type))]
     pub async fn register_streaming_handler(
         &self,
         synapse_type: String,
@@ -267,6 +277,17 @@ impl LightningServer {
         ))
     }
 
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .as_ref()
+            .ok_or_else(|| {
+                LightningError::Config("server not started: call start() first".to_string())
+            })?
+            .local_addr()
+            .map_err(|e| LightningError::Config(format!("failed to get local address: {}", e)))
+    }
+
+    #[instrument(skip(self), fields(host = %self.host, port = self.port))]
     pub async fn start(&mut self) -> Result<()> {
         info!(
             "Starting Lightning QUIC server on {}:{}",
@@ -310,6 +331,7 @@ impl LightningServer {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn serve_forever(&self) -> Result<()> {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             LightningError::Config("server not started: call start() first".to_string())
@@ -691,6 +713,7 @@ impl LightningServer {
             ctx.used_nonces.clone(),
             &cert_fp,
             ctx.config.max_signature_age_secs,
+            ctx.config.max_nonce_entries,
         )
         .await;
 
@@ -710,10 +733,12 @@ impl LightningServer {
         let signature = match Self::sign_handshake_response(
             &request,
             &ctx.miner_hotkey,
-            ctx.miner_signer.as_deref(),
+            ctx.miner_signer.clone(),
             now,
             &cert_fp,
-        ) {
+        )
+        .await
+        {
             Ok(sig) => sig,
             Err(e) => {
                 error!("Handshake signing failed: {}", e);
@@ -798,6 +823,7 @@ impl LightningServer {
         used_nonces: Arc<RwLock<HashMap<String, u64>>>,
         cert_fingerprint: &Option<[u8; 32]>,
         max_signature_age: u64,
+        max_nonce_entries: usize,
     ) -> bool {
         let current_time = unix_timestamp_secs();
 
@@ -817,6 +843,19 @@ impl LightningServer {
                 request.timestamp, current_time
             );
             return false;
+        }
+
+        {
+            let mut nonces = used_nonces.write().await;
+            if nonces.contains_key(&request.nonce) {
+                error!("Nonce already used: {}", request.nonce);
+                return false;
+            }
+            nonces.insert(request.nonce.clone(), current_time);
+            if nonces.len() > max_nonce_entries {
+                let cutoff = current_time.saturating_sub(max_signature_age);
+                nonces.retain(|_, ts| *ts >= cutoff);
+            }
         }
 
         let fp_b64 = cert_fingerprint
@@ -855,7 +894,7 @@ impl LightningServer {
         signature_array.copy_from_slice(&signature_bytes);
         let signature = sr25519::Signature::from_raw(signature_array);
 
-        let valid = match tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
         })
         .await
@@ -863,26 +902,15 @@ impl LightningServer {
             Ok(v) => v,
             Err(e) => {
                 error!("signature verification task failed: {}", e);
-                return false;
+                false
             }
-        };
-
-        if valid {
-            let mut nonces = used_nonces.write().await;
-            if nonces.contains_key(&request.nonce) {
-                error!("Nonce already used: {}", request.nonce);
-                return false;
-            }
-            nonces.insert(request.nonce.clone(), current_time);
         }
-
-        valid
     }
 
-    fn sign_handshake_response(
+    async fn sign_handshake_response(
         request: &HandshakeRequest,
         miner_hotkey: &str,
-        miner_signer: Option<&dyn Signer>,
+        miner_signer: Option<Arc<dyn Signer>>,
         timestamp: u64,
         cert_fingerprint: &Option<[u8; 32]>,
     ) -> Result<String> {
@@ -899,7 +927,10 @@ impl LightningServer {
             &request.nonce,
             &fp_b64,
         );
-        let sig = signer.sign(message.as_bytes())?;
+        let msg_bytes = message.into_bytes();
+        let sig = tokio::task::spawn_blocking(move || signer.sign(&msg_bytes))
+            .await
+            .map_err(|e| LightningError::Signing(format!("signer task failed: {}", e)))??;
         Ok(BASE64_STANDARD.encode(sig))
     }
 
@@ -978,6 +1009,7 @@ impl LightningServer {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
         let connections = self.ctx.connections.read().await;
         let mut stats = HashMap::new();
@@ -1007,6 +1039,7 @@ impl LightningServer {
         Ok(stats)
     }
 
+    #[instrument(skip(self))]
     pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> Result<()> {
         let mut connections = self.ctx.connections.write().await;
         let now = unix_timestamp_secs();
@@ -1032,12 +1065,14 @@ impl LightningServer {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn cleanup_expired_nonces(&self) {
         let mut nonces = self.ctx.used_nonces.write().await;
         let cutoff = unix_timestamp_secs().saturating_sub(self.ctx.config.max_signature_age_secs);
         nonces.retain(|_, ts| *ts >= cutoff);
     }
 
+    #[instrument(skip(self))]
     pub async fn stop(&self) -> Result<()> {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
             handle.abort();
@@ -1227,9 +1262,14 @@ mod tests {
             signature: String::new(),
         };
         let nonces = Arc::new(RwLock::new(HashMap::new()));
-        let result =
-            LightningServer::verify_validator_signature(&request, nonces, &None, max_signature_age)
-                .await;
+        let result = LightningServer::verify_validator_signature(
+            &request,
+            nonces,
+            &None,
+            max_signature_age,
+            100_000,
+        )
+        .await;
         assert!(!result, "timestamp exactly at boundary must be rejected");
     }
 
