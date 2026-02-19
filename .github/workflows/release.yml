@@ -25,9 +25,6 @@ jobs:
             target: aarch64
             zig: true
           - os: macos-14
-            target: x86_64
-            zig: false
-          - os: macos-14
             target: aarch64
             zig: false
 
@@ -53,7 +50,7 @@ jobs:
           container: "off"
           working-directory: crates/btlightning-py
         env:
-          LDFLAGS: ${{ startsWith(matrix.os, 'macos') && '-ld_classic' || '' }}
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.os == 'macos-14' && '-C link-arg=-ld_classic' || '' }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v6
