@@ -641,6 +641,9 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
         return Ok((msg_type, Vec::new()));
     }
 
+    // Payloads up to 1MB are allocated in one shot. Larger payloads are read
+    // incrementally in 64KB chunks to bound peak memory when the declared
+    // payload_len has not yet been validated against actual stream data.
     if payload_len <= INCREMENTAL_READ_THRESHOLD {
         let mut payload = vec![0u8; payload_len];
         read_exact_from_recv(recv, &mut payload).await?;
@@ -928,9 +931,10 @@ mod tests {
             for (k, v) in keys.into_iter().zip(vals.into_iter()) {
                 map.insert(k, v);
             }
-            let rmpv_map = hashmap_to_rmpv_map(map.clone());
+            let rmpv_map = hashmap_to_rmpv_map(map);
             let bytes = rmp_serde::to_vec(&rmpv_map).unwrap();
-            let _: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+            let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+            prop_assert_eq!(rmpv_map, decoded);
         }
 
         #[test]

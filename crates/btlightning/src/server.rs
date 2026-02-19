@@ -855,6 +855,12 @@ impl LightningServer {
             if nonces.len() > max_nonce_entries {
                 let cutoff = current_time.saturating_sub(max_signature_age);
                 nonces.retain(|_, ts| *ts >= cutoff);
+                if nonces.len() > max_nonce_entries {
+                    let mut entries: Vec<(String, u64)> = nonces.drain().collect();
+                    entries.sort_by_key(|(_, ts)| *ts);
+                    let keep_from = entries.len().saturating_sub(max_nonce_entries);
+                    *nonces = entries.into_iter().skip(keep_from).collect();
+                }
             }
         }
 
@@ -1063,6 +1069,10 @@ impl LightningServer {
         }
 
         Ok(())
+    }
+
+    pub async fn get_active_nonce_count(&self) -> usize {
+        self.ctx.used_nonces.read().await.len()
     }
 
     #[instrument(skip(self))]
@@ -1387,5 +1397,80 @@ mod tests {
     fn default_config_is_valid() {
         let result = LightningServer::new("test".into(), "0.0.0.0".into(), 8443);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_nonce_replay() {
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "replay-test-nonce".to_string(),
+            signature: String::new(),
+        };
+
+        let _ = LightningServer::verify_validator_signature(
+            &request,
+            nonces.clone(),
+            &None,
+            300,
+            100_000,
+        )
+        .await;
+
+        assert!(
+            nonces.read().await.contains_key("replay-test-nonce"),
+            "nonce must be consumed even when signature verification fails"
+        );
+
+        let result = LightningServer::verify_validator_signature(
+            &request,
+            nonces.clone(),
+            &None,
+            300,
+            100_000,
+        )
+        .await;
+        assert!(!result, "replayed nonce must be rejected");
+    }
+
+    #[tokio::test]
+    async fn nonce_hard_cap_evicts_oldest() {
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        for i in 0..5u64 {
+            nonces
+                .write()
+                .await
+                .insert(format!("nonce-{}", i), 1000 + i);
+        }
+
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "trigger-eviction".to_string(),
+            signature: String::new(),
+        };
+
+        let _ =
+            LightningServer::verify_validator_signature(&request, nonces.clone(), &None, 300, 3)
+                .await;
+
+        let nonces_guard = nonces.read().await;
+        assert!(
+            nonces_guard.len() <= 3,
+            "hard cap must enforce max_nonce_entries"
+        );
+        assert!(
+            !nonces_guard.contains_key("nonce-0"),
+            "oldest nonce should be evicted first"
+        );
+        assert!(
+            !nonces_guard.contains_key("nonce-1"),
+            "second-oldest nonce should be evicted"
+        );
+        assert!(
+            !nonces_guard.contains_key("nonce-2"),
+            "third-oldest nonce should be evicted"
+        );
     }
 }

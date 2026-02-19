@@ -16,9 +16,9 @@ class AxonInfo(TypedDict):
     hotkey: str
     ip: str
     port: int
-    protocol: int
-    placeholder1: int
-    placeholder2: int
+    protocol: int  # IP protocol version (4 = IPv4, 6 = IPv6)
+    placeholder1: int  # Reserved for future use (Bittensor metagraph field)
+    placeholder2: int  # Reserved for future use (Bittensor metagraph field)
 
 
 class SynapseRequest(TypedDict):
@@ -33,7 +33,12 @@ class SynapseResponse(TypedDict):
     error: Optional[str]
 
 
-class ConnectionStats(TypedDict):
+class ClientConnectionStats(TypedDict):
+    total_connections: str
+    active_miners: str
+
+
+class ServerConnectionStats(TypedDict):
     total_connections: str
     verified_connections: str
 
@@ -93,7 +98,7 @@ class Lightning:
     def update_miner_registry(self, miners: List[AxonInfo]) -> None:
         return self._rust_client.update_miner_registry(miners)
 
-    def get_connection_stats(self) -> ConnectionStats:
+    def get_connection_stats(self) -> ClientConnectionStats:
         return self._rust_client.get_connection_stats()
 
     def close(self) -> None:
@@ -116,6 +121,7 @@ class LightningServer:
         idle_timeout_secs: Optional[int] = None,
         keep_alive_interval_secs: Optional[int] = None,
         nonce_cleanup_interval_secs: Optional[int] = None,
+        max_nonce_entries: Optional[int] = None,
     ):
         self._rust_server = RustLightningServer(
             miner_hotkey,
@@ -125,6 +131,7 @@ class LightningServer:
             idle_timeout_secs=idle_timeout_secs,
             keep_alive_interval_secs=keep_alive_interval_secs,
             nonce_cleanup_interval_secs=nonce_cleanup_interval_secs,
+            max_nonce_entries=max_nonce_entries,
         )
 
     def set_miner_keypair(self, keypair_seed: bytes) -> None:
@@ -154,7 +161,7 @@ class LightningServer:
     def serve_forever(self) -> None:
         return self._rust_server.serve_forever()
 
-    def get_connection_stats(self) -> ConnectionStats:
+    def get_connection_stats(self) -> ServerConnectionStats:
         return self._rust_server.get_connection_stats()
 
     def cleanup_stale_connections(self, max_idle_seconds: int = 300) -> None:
@@ -172,7 +179,7 @@ class LightningServer:
 
 __all__ = [
     "AxonInfo",
-    "ConnectionStats",
+    "ClientConnectionStats",
     "Lightning",
     "LightningServer",
     "LIGHTNING_AVAILABLE",
@@ -180,6 +187,7 @@ __all__ = [
     "QuicAxonInfo",
     "RustLightning",
     "RustLightningServer",
+    "ServerConnectionStats",
     "SynapseRequest",
     "SynapseResponse",
 ]

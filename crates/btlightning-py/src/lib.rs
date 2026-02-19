@@ -246,10 +246,12 @@ impl RustLightning {
             .map_err(to_pyerr)?;
 
         let result_dict = PyDict::new(py);
+        let data_dict = PyDict::new(py);
         for (key, value) in &response.data {
             let py_value = msgpack_value_to_py(py, value)?;
-            result_dict.set_item(key, py_value)?;
+            data_dict.set_item(key, py_value)?;
         }
+        result_dict.set_item("data", data_dict)?;
         result_dict.set_item("success", response.success)?;
         result_dict.set_item("latency_ms", response.latency_ms)?;
         match &response.error {
@@ -349,6 +351,7 @@ impl RustLightningServer {
         keep_alive_interval_secs=None,
         nonce_cleanup_interval_secs=None,
         max_connections=None,
+        max_nonce_entries=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -360,6 +363,7 @@ impl RustLightningServer {
         keep_alive_interval_secs: Option<u64>,
         nonce_cleanup_interval_secs: Option<u64>,
         max_connections: Option<usize>,
+        max_nonce_entries: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -383,6 +387,9 @@ impl RustLightningServer {
         }
         if let Some(v) = max_connections {
             config.max_connections = v;
+        }
+        if let Some(v) = max_nonce_entries {
+            config.max_nonce_entries = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)

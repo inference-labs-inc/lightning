@@ -107,6 +107,78 @@ async fn setup_with_handler<H: SynapseHandler + 'static>(
     }
 }
 
+async fn setup_with_async_handler<H: AsyncSynapseHandler + 'static>(
+    synapse_type: &str,
+    handler: H,
+) -> TestEnv {
+    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_async_synapse_handler(synapse_type.to_string(), Arc::new(handler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let port = addr.port();
+
+    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let axon_info = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+        placeholder1: 0,
+        placeholder2: 0,
+    };
+
+    TestEnv {
+        server_handle,
+        client,
+        axon_info,
+    }
+}
+
+async fn setup_with_streaming_handler<H: StreamingSynapseHandler + 'static>(
+    synapse_type: &str,
+    handler: H,
+) -> TestEnv {
+    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_streaming_handler(synapse_type.to_string(), Arc::new(handler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let port = addr.port();
+
+    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let axon_info = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+        placeholder1: 0,
+        placeholder2: 0,
+    };
+
+    TestEnv {
+        server_handle,
+        client,
+        axon_info,
+    }
+}
+
 struct EchoHandler;
 impl SynapseHandler for EchoHandler {
     fn handle(
@@ -380,23 +452,57 @@ async fn client_reconnects_after_disconnect() {
 
 #[tokio::test]
 async fn nonce_replay_rejected() {
-    let env = setup_with_handler("echo", EchoHandler).await;
+    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+        placeholder1: 0,
+        placeholder2: 0,
+    };
 
     let mut client = LightningClient::new(validator_hotkey());
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
     client
-        .initialize_connections(vec![env.axon_info.clone()])
+        .initialize_connections(vec![axon.clone()])
         .await
         .unwrap();
 
-    let resp = client
-        .query_axon(env.axon_info.clone(), build_request("echo"))
-        .await;
-    assert!(resp.is_ok());
+    let count_after_first = server.get_active_nonce_count().await;
+    assert!(
+        count_after_first >= 1,
+        "handshake must record at least one nonce"
+    );
 
     client.close_all_connections().await.unwrap();
-    env.shutdown().await;
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+
+    let count_after_second = server.get_active_nonce_count().await;
+    assert!(
+        count_after_second >= 2,
+        "each handshake must consume a unique nonce, got {}",
+        count_after_second
+    );
+
+    client.close_all_connections().await.unwrap();
+    server_handle.abort();
 }
 
 // --- Sync Handler Dispatch ---
@@ -521,40 +627,23 @@ async fn multiple_synapse_handlers() {
 
 #[tokio::test]
 async fn async_handler_echo_roundtrip() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_async_synapse_handler("async_echo".to_string(), Arc::new(AsyncEchoHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
-
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
+    let env = setup_with_async_handler("async_echo", AsyncEchoHandler).await;
 
     let mut client = LightningClient::new(validator_hotkey());
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
     client
-        .initialize_connections(vec![axon.clone()])
+        .initialize_connections(vec![env.axon_info.clone()])
         .await
         .unwrap();
 
     let req = build_request_with_data("async_echo", "key", "value");
-    let resp = client.query_axon(axon, req).await.unwrap();
+    let resp = client.query_axon(env.axon_info.clone(), req).await.unwrap();
     assert!(resp.success);
     assert_eq!(resp.data.get("key").unwrap().as_str().unwrap(), "value");
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
@@ -704,35 +793,18 @@ async fn streaming_handler_receives_chunks() {
 
 #[tokio::test]
 async fn streaming_handler_zero_chunks() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler("empty".to_string(), Arc::new(EmptyStreamHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
-
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
+    let env = setup_with_streaming_handler("empty", EmptyStreamHandler).await;
 
     let mut client = LightningClient::new(validator_hotkey());
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
     client
-        .initialize_connections(vec![axon.clone()])
+        .initialize_connections(vec![env.axon_info.clone()])
         .await
         .unwrap();
 
     let mut stream = client
-        .query_axon_stream(axon, build_request("empty"))
+        .query_axon_stream(env.axon_info.clone(), build_request("empty"))
         .await
         .unwrap();
 
@@ -743,7 +815,7 @@ async fn streaming_handler_zero_chunks() {
     );
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
@@ -1079,7 +1151,10 @@ async fn nonce_cleanup_removes_expired() {
     server.set_miner_keypair(MINER_SEED);
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let axon = QuicAxonInfo {
         hotkey: miner_hotkey(),
@@ -1098,7 +1173,19 @@ async fn nonce_cleanup_removes_expired() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let count_before = server.get_active_nonce_count().await;
+    assert!(
+        count_before > 0,
+        "handshake should record at least one nonce"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let count_after = server.get_active_nonce_count().await;
+    assert_eq!(
+        count_after, 0,
+        "expired nonces should be cleaned up by background task"
+    );
 
     client.close_all_connections().await.unwrap();
     server_handle.abort();

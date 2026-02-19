@@ -254,7 +254,7 @@ impl LightningClient {
         Ok(())
     }
 
-    #[instrument(skip(self, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
+    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
     pub async fn query_axon(
         &self,
         axon_info: QuicAxonInfo,
@@ -278,7 +278,7 @@ impl LightningClient {
         }
     }
 
-    #[instrument(skip(self, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port), timeout_ms = timeout.as_millis() as u64))]
+    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port), timeout_ms = timeout.as_millis() as u64))]
     pub async fn query_axon_with_timeout(
         &self,
         axon_info: QuicAxonInfo,
@@ -290,7 +290,7 @@ impl LightningClient {
             .map_err(|_| LightningError::Transport("query timed out".into()))?
     }
 
-    #[instrument(skip(self, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
+    #[instrument(skip(self, axon_info, request), fields(miner = %format!("{}:{}", axon_info.ip, axon_info.port)))]
     pub async fn query_axon_stream(
         &self,
         axon_info: QuicAxonInfo,
@@ -492,6 +492,7 @@ impl LightningClient {
                 .clone();
             let timeout = self.config.connect_timeout;
 
+            let pending_keys: Vec<String> = new_miner_keys.iter().map(|(k, _)| k.clone()).collect();
             let mut set = tokio::task::JoinSet::new();
             for (key, miner) in new_miner_keys {
                 info!("New miner detected, establishing QUIC connection: {}", key);
@@ -531,6 +532,12 @@ impl LightningClient {
                     Err(e) => {
                         error!("Connection task panicked: {}", e);
                     }
+                }
+            }
+
+            for key in &pending_keys {
+                if !state.established_connections.contains_key(key) {
+                    state.active_miners.remove(key);
                 }
             }
         }
