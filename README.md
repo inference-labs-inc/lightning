@@ -73,6 +73,9 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 | ![lightning-py](https://img.shields.io/badge/-FF8C00?style=flat-square) | lightning (Python) |
 | ![lightning](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning (Rust) |
 
+> [!NOTE]
+> Charts use log10 scale. Refer to the tables below for raw values.
+
 ### Latency p50
 
 ```mermaid
