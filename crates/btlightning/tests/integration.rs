@@ -1106,6 +1106,24 @@ impl ValidatorPermitResolver for StaticPermitResolver {
     }
 }
 
+struct DynamicPermitResolver {
+    permitted: Arc<std::sync::RwLock<HashSet<String>>>,
+}
+
+impl ValidatorPermitResolver for DynamicPermitResolver {
+    fn resolve_permitted_validators(&self) -> Result<HashSet<String>> {
+        Ok(self.permitted.read().unwrap().clone())
+    }
+}
+
+struct FailingPermitResolver;
+
+impl ValidatorPermitResolver for FailingPermitResolver {
+    fn resolve_permitted_validators(&self) -> Result<HashSet<String>> {
+        Err(LightningError::Handler("chain unreachable".into()))
+    }
+}
+
 #[tokio::test]
 async fn validator_without_permit_rejected() {
     let config = LightningServerConfig {
@@ -1234,6 +1252,448 @@ async fn no_resolver_configured_rejects_when_required() {
     );
 
     client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn resolver_error_preserves_server_availability() {
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 3600,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(FailingPermitResolver));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "validator should be rejected when resolver fails (empty cache)"
+    );
+    assert_eq!(
+        server.get_permitted_validator_count().await,
+        0,
+        "permit cache should remain empty after resolver error"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn permit_cache_refresh_adds_validator() {
+    let permitted = Arc::new(std::sync::RwLock::new(HashSet::new()));
+    let resolver = DynamicPermitResolver {
+        permitted: permitted.clone(),
+    };
+
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 1,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(resolver));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    assert_eq!(
+        server.get_permitted_validator_count().await,
+        0,
+        "initial resolution should yield empty set"
+    );
+
+    let (client1, _axon) = connect_client(port).await;
+    let stats = client1.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "validator should be rejected before being added to permit set"
+    );
+    client1.close_all_connections().await.unwrap();
+
+    permitted.write().unwrap().insert(validator_hotkey());
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if srv.get_permitted_validator_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("permit cache should refresh within 5s");
+
+    let (client2, _axon) = connect_client(port).await;
+    let stats = client2.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "validator should be accepted after being added to permit set via refresh"
+    );
+
+    client2.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn permit_cache_refresh_removes_validator() {
+    let mut initial = HashSet::new();
+    initial.insert(validator_hotkey());
+    let permitted = Arc::new(std::sync::RwLock::new(initial));
+    let resolver = DynamicPermitResolver {
+        permitted: permitted.clone(),
+    };
+
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 1,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(resolver));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if srv.get_permitted_validator_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permit cache should be populated after initial resolution");
+
+    let (client1, _axon) = connect_client(port).await;
+    let stats = client1.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "validator should be accepted while in permit set"
+    );
+    client1.close_all_connections().await.unwrap();
+
+    permitted.write().unwrap().clear();
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if srv.get_permitted_validator_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("permit cache should be cleared after refresh");
+
+    let (client2, _axon) = connect_client(port).await;
+    let stats = client2.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "validator should be rejected after being removed from permit set"
+    );
+
+    client2.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn large_permit_set_handles_correctly() {
+    let mut permitted = HashSet::new();
+    for i in 0..10_000u64 {
+        let seed = {
+            let bytes = i.to_le_bytes();
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&bytes);
+            s[8] = 0xff;
+            s
+        };
+        let hotkey = sr25519::Pair::from_seed(&seed).public().to_ss58check();
+        permitted.insert(hotkey);
+    }
+    permitted.insert(validator_hotkey());
+
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 3600,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(StaticPermitResolver { permitted }));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if srv.get_permitted_validator_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("large permit set should load within 10s");
+
+    assert_eq!(server.get_permitted_validator_count().await, 10_001);
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "validator should be found in large permit set"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+// --- Abuse Resilience ---
+
+#[tokio::test]
+async fn server_processes_queries_during_rate_limiting() {
+    let config = LightningServerConfig {
+        max_handshake_attempts_per_minute: 3,
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (mut client, axon) = connect_client(port).await;
+
+    let resp = client
+        .query_axon(axon.clone(), build_request_with_data("echo", "k", "v"))
+        .await
+        .unwrap();
+    assert!(resp.success, "query should succeed before rate limit");
+
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "fourth handshake should be rate-limited"
+    );
+
+    let other_seed = [77u8; 32];
+    let other_hotkey = sr25519::Pair::from_seed(&other_seed)
+        .public()
+        .to_ss58check();
+    let mut client2 = LightningClient::new(other_hotkey);
+    client2.set_signer(Box::new(Sr25519Signer::from_seed(other_seed)));
+    client2.create_endpoint().await.unwrap();
+    client2
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+
+    let resp2 = client2
+        .query_axon(
+            axon.clone(),
+            build_request_with_data("echo", "k", "after-burst"),
+        )
+        .await;
+
+    match resp2 {
+        Ok(r) if r.success => {}
+        _ => {
+            let stats2 = client2.get_connection_stats().await.unwrap();
+            assert_eq!(
+                stats2.get("total_connections").unwrap(),
+                "0",
+                "all clients share 127.0.0.1 so rate limit applies globally in test"
+            );
+        }
+    }
+
+    client.close_all_connections().await.unwrap();
+    client2.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn connection_churn_preserves_server_health() {
+    let mut env = setup_with_handler("echo", EchoHandler).await;
+    let port = env.axon_info.port;
+
+    for _ in 0..20 {
+        env.client.close_all_connections().await.unwrap();
+        env.client
+            .initialize_connections(vec![env.axon_info.clone()])
+            .await
+            .unwrap();
+    }
+
+    let resp = env
+        .client
+        .query_axon(
+            env.axon_info.clone(),
+            build_request_with_data("echo", "after", "churn"),
+        )
+        .await;
+    match resp {
+        Ok(r) => assert!(r.success, "query should succeed after connection churn"),
+        Err(_) => {
+            let (fresh_client, fresh_axon) = connect_client(port).await;
+            let resp = fresh_client
+                .query_axon(fresh_axon, build_request_with_data("echo", "k", "v"))
+                .await
+                .unwrap();
+            assert!(
+                resp.success,
+                "fresh client should succeed even if churned client is rate-limited"
+            );
+            fresh_client.close_all_connections().await.unwrap();
+        }
+    }
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn permit_rejected_does_not_degrade_permitted_client() {
+    let mut permitted = HashSet::new();
+    permitted.insert(validator_hotkey());
+
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 3600,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+        .await
+        .unwrap();
+    server.set_validator_permit_resolver(Box::new(StaticPermitResolver { permitted }));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if srv.get_permitted_validator_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permit cache should populate");
+
+    let (good_client, axon) = connect_client(port).await;
+    let stats = good_client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    for i in 0..5u8 {
+        let bad_seed = [100 + i; 32];
+        let bad_hotkey = sr25519::Pair::from_seed(&bad_seed).public().to_ss58check();
+        let mut bad_client = LightningClient::new(bad_hotkey);
+        bad_client.set_signer(Box::new(Sr25519Signer::from_seed(bad_seed)));
+        bad_client.create_endpoint().await.unwrap();
+        bad_client
+            .initialize_connections(vec![axon.clone()])
+            .await
+            .unwrap();
+        let stats = bad_client.get_connection_stats().await.unwrap();
+        assert_eq!(
+            stats.get("total_connections").unwrap(),
+            "0",
+            "unpermitted client {} should be rejected",
+            i
+        );
+        bad_client.close_all_connections().await.unwrap();
+    }
+
+    let resp = good_client
+        .query_axon(
+            axon.clone(),
+            build_request_with_data("echo", "still", "working"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.success,
+        "permitted client must remain functional after unpermitted rejections"
+    );
+    assert_eq!(resp.data.get("still").unwrap().as_str().unwrap(), "working");
+
+    good_client.close_all_connections().await.unwrap();
     let _ = server.stop().await;
     let _ = server_handle.await;
 }

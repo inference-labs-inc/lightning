@@ -1,0 +1,22 @@
+[advisories]
+ignore = [
+    # curve25519-dalek timing variability — transitive via sp-core 21.0 (schnorrkel 0.9.1, ed25519-zebra 3.1.0).
+    # Cannot upgrade without breaking sp-core major version. Not exploitable in our usage: sr25519
+    # signature verification is not constant-time-critical on the server side.
+    "RUSTSEC-2024-0344",
+
+    # ring AES panic with overflow checking — transitive via quinn 0.10.
+    # Only triggers with overflow checks enabled (debug builds). Production builds use release mode.
+    "RUSTSEC-2025-0009",
+
+    # tracing-subscriber ANSI escape injection — transitive via sp-core 21.0 (sp-tracing 10.0.0).
+    # We do not log untrusted user input through this tracing-subscriber version.
+    "RUSTSEC-2025-0055",
+
+    # wasmtime miscompilation/sandbox/soundness — transitive via sp-core 21.0 (sp-wasm-interface).
+    # btlightning does not execute any WebAssembly. The wasm runtime is pulled as an unused
+    # transitive dependency of sp-core's runtime interface machinery.
+    "RUSTSEC-2023-0091",
+    "RUSTSEC-2024-0438",
+    "RUSTSEC-2025-0118",
+]

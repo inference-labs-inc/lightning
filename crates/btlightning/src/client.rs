@@ -819,6 +819,123 @@ fn generate_nonce() -> String {
     format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sp_core::crypto::Ss58Codec;
+
+    const MINER_SEED: [u8; 32] = [1u8; 32];
+    const VALIDATOR_SEED: [u8; 32] = [2u8; 32];
+
+    fn make_signed_response(
+        miner_seed: [u8; 32],
+        validator_hotkey: &str,
+        nonce: &str,
+        cert_fp_b64: &str,
+    ) -> HandshakeResponse {
+        let pair = sr25519::Pair::from_seed(&miner_seed);
+        let miner_hotkey = pair.public().to_ss58check();
+        let timestamp = unix_timestamp_secs();
+        let message = handshake_response_message(
+            validator_hotkey,
+            &miner_hotkey,
+            timestamp,
+            nonce,
+            cert_fp_b64,
+        );
+        let signature = pair.sign(message.as_bytes());
+        HandshakeResponse {
+            miner_hotkey,
+            timestamp,
+            signature: BASE64_STANDARD.encode(signature.0),
+            accepted: true,
+            connection_id: "test".to_string(),
+            cert_fingerprint: Some(cert_fp_b64.to_string()),
+        }
+    }
+
+    fn validator_hotkey() -> String {
+        sr25519::Pair::from_seed(&VALIDATOR_SEED)
+            .public()
+            .to_ss58check()
+    }
+
+    #[tokio::test]
+    async fn verify_valid_miner_signature() {
+        let nonce = "test-nonce";
+        let fp = "dGVzdC1mcA==";
+        let resp = make_signed_response(MINER_SEED, &validator_hotkey(), nonce, fp);
+        assert!(
+            verify_miner_response_signature(&resp, &validator_hotkey(), nonce, fp)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_empty_signature() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = String::new();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty signature"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_invalid_base64() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = "not-valid-base64!!!".to_string();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("decode miner signature"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_wrong_signature_length() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = BASE64_STANDARD.encode([0u8; 32]);
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid miner signature length"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_bad_ss58_address() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.miner_hotkey = "not_a_valid_ss58".to_string();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid miner SS58 address"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_wrong_signer() {
+        let nonce = "n";
+        let fp = "fp";
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), nonce, fp);
+        let wrong_pair = sr25519::Pair::from_seed(&[99u8; 32]);
+        resp.miner_hotkey = wrong_pair.public().to_ss58check();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), nonce, fp)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_tampered_nonce() {
+        let fp = "fp";
+        let resp = make_signed_response(MINER_SEED, &validator_hotkey(), "original-nonce", fp);
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "tampered-nonce", fp)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+}
+
 // Deliberately disables TLS PKI certificate validation. TLS still provides transport
 // encryption but not identity authentication. Authenticity is instead enforced at the
 // application layer: the handshake exchanges certificate fingerprints and verifies

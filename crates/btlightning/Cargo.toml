@@ -6,6 +6,7 @@ description = "QUIC transport layer for Bittensor"
 license = "MIT"
 repository = "https://github.com/inference-labs-inc/lightning"
 edition = "2021"
+rust-version = "1.75"
 
 [lib]
 name = "btlightning"
@@ -32,3 +33,9 @@ proptest = "1"
 
 [features]
 btwallet = ["bittensor_wallet"]
+subtensor-tests = ["dep:subxt"]
+
+[dependencies.subxt]
+version = "0.38"
+optional = true
+features = ["substrate-compat"]
