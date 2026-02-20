@@ -476,7 +476,9 @@ async fn multiple_synapse_handlers() {
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
 
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, axon) = connect_client(port).await;
 
@@ -493,7 +495,8 @@ async fn multiple_synapse_handlers() {
     assert!(!resp2.success);
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 // --- Async Handler Dispatch ---
@@ -543,7 +546,10 @@ async fn mixed_sync_async_handlers() {
         .unwrap();
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, axon) = connect_client(port).await;
 
@@ -560,7 +566,8 @@ async fn mixed_sync_async_handlers() {
     assert!(r2.success);
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 // --- Streaming Handler Dispatch ---
@@ -772,7 +779,10 @@ async fn typed_sync_handler_integration() {
         .unwrap();
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, axon) = connect_client(port).await;
 
@@ -783,7 +793,8 @@ async fn typed_sync_handler_integration() {
     assert_eq!(result.sum, 7);
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 #[tokio::test]
@@ -811,7 +822,10 @@ async fn typed_async_handler_integration() {
         .unwrap();
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, axon) = connect_client(port).await;
 
@@ -822,7 +836,8 @@ async fn typed_async_handler_integration() {
     assert_eq!(result.doubled, 42);
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 // --- Nonce Management ---
@@ -875,5 +890,6 @@ async fn nonce_cleanup_removes_expired() {
     );
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
