@@ -43,5 +43,5 @@ wildcards = "warn"
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "allow"
+unknown-git = "deny"
 allow-git = ["https://github.com/opentensor/btwallet"]

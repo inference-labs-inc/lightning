@@ -1583,7 +1583,6 @@ async fn server_processes_queries_during_rate_limiting() {
 #[tokio::test]
 async fn connection_churn_preserves_server_health() {
     let mut env = setup_with_handler("echo", EchoHandler).await;
-    let port = env.axon_info.port;
 
     for _ in 0..20 {
         env.client.close_all_connections().await.unwrap();
@@ -1603,7 +1602,7 @@ async fn connection_churn_preserves_server_health() {
     match resp {
         Ok(r) => assert!(r.success, "query should succeed after connection churn"),
         Err(_) => {
-            let (fresh_client, fresh_axon) = connect_client(port).await;
+            let (fresh_client, fresh_axon) = connect_client(env.axon_info.port).await;
             let resp = fresh_client
                 .query_axon(fresh_axon, build_request_with_data("echo", "k", "v"))
                 .await
