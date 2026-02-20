@@ -200,6 +200,9 @@ yarn-error.log*
 
 # Project specific
 benchmark_results/
+benchmarks/results_*.json
+benchmarks/results.md
+benchmarks/uv.lock
 *.png
 *.jpg
 *.jpeg
