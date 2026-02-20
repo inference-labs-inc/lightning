@@ -1,10 +1,11 @@
 use btlightning::{
-    typed_async_handler, typed_handler, AsyncSynapseHandler, LightningClient, LightningError,
-    LightningServer, LightningServerConfig, QuicAxonInfo, QuicRequest, Result, Sr25519Signer,
-    StreamingSynapseHandler, SynapseHandler,
+    typed_async_handler, typed_handler, AsyncSynapseHandler, CallbackSigner, LightningClient,
+    LightningError, LightningServer, LightningServerConfig, QuicAxonInfo, QuicRequest, Result,
+    Signer, Sr25519Signer, StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
 };
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,13 +55,23 @@ where
         &'a LightningServer,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
 {
-    let mut server = LightningServer::with_config(
-        miner_hotkey(),
-        "127.0.0.1".into(),
-        0,
-        config.unwrap_or_default(),
-    )
-    .unwrap();
+    let cfg = match config {
+        Some(c) => {
+            assert!(
+                !c.require_validator_permit,
+                "setup_with_register disables permit checking; \
+                 permit-enabled servers must be constructed explicitly"
+            );
+            c
+        }
+        None => {
+            let mut c = LightningServerConfig::default();
+            c.require_validator_permit = false;
+            c
+        }
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, cfg).unwrap();
     server.set_miner_keypair(MINER_SEED);
     register(&server).await.unwrap();
     server.start().await.unwrap();
@@ -777,7 +788,12 @@ async fn typed_sync_handler_integration() {
         Ok(AddResp { sum: req.a + req.b })
     });
 
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
+    let config = LightningServerConfig {
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
     server
         .register_synapse_handler("add".to_string(), handler)
@@ -820,7 +836,12 @@ async fn typed_async_handler_integration() {
         })
     });
 
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
+    let config = LightningServerConfig {
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
     server
         .register_async_synapse_handler("double".to_string(), handler)
@@ -893,6 +914,323 @@ async fn nonce_cleanup_removes_expired() {
     assert!(
         drained.is_ok(),
         "expired nonces should be cleaned up by background task"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+// --- Error Sanitization ---
+
+#[tokio::test]
+async fn handler_error_does_not_leak_internal_details() {
+    let env = setup_with_handler("fail", ErrorHandler).await;
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("fail"))
+        .await
+        .unwrap();
+    assert!(!resp.success);
+    let error_msg = resp.error.unwrap();
+    assert_eq!(error_msg, "request processing failed");
+    assert!(
+        !error_msg.contains("deliberate error"),
+        "handler error details must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn unregistered_synapse_type_uses_generic_error() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("nonexistent"))
+        .await
+        .unwrap();
+    assert!(!resp.success);
+    let error_msg = resp.error.unwrap();
+    assert_eq!(error_msg, "unrecognized synapse type");
+    assert!(
+        !error_msg.contains("nonexistent"),
+        "synapse type name must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn streaming_error_does_not_leak_handler_details() {
+    let env = setup_with_streaming_handler("errstream", ErrorStreamHandler).await;
+
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("errstream"))
+        .await
+        .unwrap();
+
+    let mut found_error = false;
+    let mut error_msg = String::new();
+    for _ in 0..100 {
+        match stream.next_chunk().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(e) => {
+                error_msg = e.to_string();
+                found_error = true;
+                break;
+            }
+        }
+    }
+    assert!(found_error, "should receive error from streaming handler");
+    assert!(
+        error_msg.contains("stream processing failed"),
+        "wire error should use generic message, got: {}",
+        error_msg
+    );
+    assert!(
+        !error_msg.contains("stream error mid-way"),
+        "handler error details must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+// --- Rate Limiting ---
+
+#[tokio::test]
+async fn handshake_rate_limiting_rejects_excess_attempts() {
+    let config = LightningServerConfig {
+        max_handshake_attempts_per_minute: 2,
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (mut client, axon) = connect_client(port).await;
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "third handshake attempt should be rejected by rate limiter"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+// --- Handshake Timeout ---
+
+#[tokio::test]
+async fn handshake_timeout_rejects_slow_signing() {
+    let real_signer = Sr25519Signer::from_seed(MINER_SEED);
+    // std::thread::sleep is intentional: the signer runs via spawn_blocking
+    // on the blocking thread pool, so tokio::time::sleep would not work.
+    let slow_signer = CallbackSigner::new(move |msg: &[u8]| {
+        let sig = real_signer.sign(msg);
+        std::thread::sleep(Duration::from_millis(1100));
+        sig
+    });
+
+    let config = LightningServerConfig {
+        handshake_timeout_secs: 1,
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_signer(Box::new(slow_signer));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "handshake should be rejected when signing exceeds timeout"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+// --- Validator Permit Checking ---
+
+struct StaticPermitResolver {
+    permitted: HashSet<String>,
+}
+
+impl ValidatorPermitResolver for StaticPermitResolver {
+    fn resolve_permitted_validators(&self) -> Result<HashSet<String>> {
+        Ok(self.permitted.clone())
+    }
+}
+
+#[tokio::test]
+async fn validator_without_permit_rejected() {
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 3600,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(StaticPermitResolver {
+        permitted: HashSet::new(),
+    }));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    assert_eq!(
+        server.get_permitted_validator_count().await,
+        0,
+        "permit cache should be empty when resolver returns no validators"
+    );
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "validator without permit should be rejected"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn validator_with_permit_accepted() {
+    let mut permitted = HashSet::new();
+    permitted.insert(validator_hotkey());
+
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        validator_permit_refresh_secs: 3600,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.set_validator_permit_resolver(Box::new(StaticPermitResolver { permitted }));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let srv = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if srv.get_permitted_validator_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permit cache should be populated within 5s");
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "validator with permit should be accepted"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn permit_check_bypassed_when_disabled() {
+    let config = LightningServerConfig {
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let env = setup_with_config(config).await;
+
+    let stats = env.client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "handshake should succeed when require_validator_permit is false"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_resolver_configured_rejects_when_required() {
+    let config = LightningServerConfig {
+        require_validator_permit: true,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "handshake should be rejected when permit required but no resolver configured (fail closed)"
     );
 
     client.close_all_connections().await.unwrap();

@@ -11,17 +11,20 @@ use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
+    VarInt,
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
+
+const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, Copy, Clone)]
 pub struct LightningServerConfig {
@@ -31,6 +34,12 @@ pub struct LightningServerConfig {
     pub nonce_cleanup_interval_secs: u64,
     pub max_connections: usize,
     pub max_nonce_entries: usize,
+    pub handshake_timeout_secs: u64,
+    pub max_handshake_attempts_per_minute: u32,
+    pub max_concurrent_bidi_streams: u32,
+    pub require_validator_permit: bool,
+    pub validator_permit_refresh_secs: u64,
+    pub max_tracked_rate_ips: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -42,8 +51,18 @@ impl Default for LightningServerConfig {
             nonce_cleanup_interval_secs: 60,
             max_connections: 128,
             max_nonce_entries: 100_000,
+            handshake_timeout_secs: 10,
+            max_handshake_attempts_per_minute: 30,
+            max_concurrent_bidi_streams: 128,
+            require_validator_permit: false,
+            validator_permit_refresh_secs: 1800,
+            max_tracked_rate_ips: 10_000,
         }
     }
+}
+
+pub trait ValidatorPermitResolver: Send + Sync {
+    fn resolve_permitted_validators(&self) -> Result<HashSet<String>>;
 }
 
 pub trait SynapseHandler: Send + Sync {
@@ -119,6 +138,9 @@ struct ServerContext {
     async_handlers: Arc<RwLock<HashMap<String, Arc<dyn AsyncSynapseHandler>>>>,
     streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
+    handshake_rate: Arc<RwLock<HashMap<IpAddr, Vec<u64>>>>,
+    permit_resolver: Option<Arc<dyn ValidatorPermitResolver>>,
+    permitted_validators: Arc<RwLock<HashSet<String>>>,
     miner_hotkey: String,
     miner_signer: Option<Arc<dyn Signer>>,
     cert_fingerprint: Arc<RwLock<Option<[u8; 32]>>>,
@@ -131,6 +153,7 @@ pub struct LightningServer {
     ctx: ServerContext,
     endpoint: Option<Endpoint>,
     cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    permit_refresh_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl LightningServer {
@@ -185,6 +208,37 @@ impl LightningServer {
                 "max_nonce_entries must be non-zero".to_string(),
             ));
         }
+        if config.handshake_timeout_secs == 0 {
+            return Err(LightningError::Config(
+                "handshake_timeout_secs must be non-zero".to_string(),
+            ));
+        }
+        if config.handshake_timeout_secs >= config.idle_timeout_secs {
+            return Err(LightningError::Config(format!(
+                "handshake_timeout_secs ({}) must be less than idle_timeout_secs ({})",
+                config.handshake_timeout_secs, config.idle_timeout_secs
+            )));
+        }
+        if config.max_handshake_attempts_per_minute == 0 {
+            return Err(LightningError::Config(
+                "max_handshake_attempts_per_minute must be non-zero".to_string(),
+            ));
+        }
+        if config.max_concurrent_bidi_streams == 0 {
+            return Err(LightningError::Config(
+                "max_concurrent_bidi_streams must be non-zero".to_string(),
+            ));
+        }
+        if config.validator_permit_refresh_secs == 0 {
+            return Err(LightningError::Config(
+                "validator_permit_refresh_secs must be non-zero".to_string(),
+            ));
+        }
+        if config.max_tracked_rate_ips == 0 {
+            return Err(LightningError::Config(
+                "max_tracked_rate_ips must be non-zero".to_string(),
+            ));
+        }
         Ok(Self {
             host,
             port,
@@ -195,6 +249,9 @@ impl LightningServer {
                 async_handlers: Arc::new(RwLock::new(HashMap::new())),
                 streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
+                handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+                permit_resolver: None,
+                permitted_validators: Arc::new(RwLock::new(HashSet::new())),
                 miner_hotkey,
                 miner_signer: None,
                 cert_fingerprint: Arc::new(RwLock::new(None)),
@@ -202,6 +259,7 @@ impl LightningServer {
             },
             endpoint: None,
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            permit_refresh_handle: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -211,6 +269,10 @@ impl LightningServer {
 
     pub fn set_miner_signer(&mut self, signer: Box<dyn Signer>) {
         self.ctx.miner_signer = Some(Arc::from(signer));
+    }
+
+    pub fn set_validator_permit_resolver(&mut self, resolver: Box<dyn ValidatorPermitResolver>) {
+        self.ctx.permit_resolver = Some(Arc::from(resolver));
     }
 
     #[cfg(feature = "btwallet")]
@@ -314,6 +376,10 @@ impl LightningServer {
         transport_config.keep_alive_interval(Some(Duration::from_secs(
             self.ctx.config.keep_alive_interval_secs,
         )));
+        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
+            self.ctx.config.max_concurrent_bidi_streams,
+        ));
+        transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
 
         let mut server_config = ServerConfig::with_crypto(Arc::new(server_config));
         server_config.transport_config(Arc::new(transport_config));
@@ -344,18 +410,91 @@ impl LightningServer {
         }
 
         let nonces_for_cleanup = self.ctx.used_nonces.clone();
+        let rate_for_cleanup = self.ctx.handshake_rate.clone();
         let cleanup_interval_secs = self.ctx.config.nonce_cleanup_interval_secs;
         let max_sig_age = self.ctx.config.max_signature_age_secs;
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
             loop {
                 interval.tick().await;
+                let now = unix_timestamp_secs();
+                let cutoff = now.saturating_sub(max_sig_age);
                 let mut nonces = nonces_for_cleanup.write().await;
-                let cutoff = unix_timestamp_secs().saturating_sub(max_sig_age);
                 nonces.retain(|_, ts| *ts >= cutoff);
+                drop(nonces);
+                let rate_cutoff = now.saturating_sub(HANDSHAKE_RATE_WINDOW_SECS);
+                let mut rates = rate_for_cleanup.write().await;
+                rates.retain(|_, attempts| {
+                    attempts.retain(|ts| *ts >= rate_cutoff);
+                    !attempts.is_empty()
+                });
             }
         });
         *self.cleanup_handle.lock().await = Some(handle);
+
+        if self.ctx.config.require_validator_permit && self.ctx.permit_resolver.is_none() {
+            error!("require_validator_permit is enabled but no ValidatorPermitResolver is configured -- all handshakes will be rejected");
+        }
+
+        if !self.ctx.config.require_validator_permit {
+            info!("Validator permit checking is disabled -- any hotkey with a valid signature can connect");
+        }
+
+        {
+            let mut guard = self.permit_refresh_handle.lock().await;
+            if let Some(old) = guard.take() {
+                old.abort();
+            }
+        }
+
+        if let Some(resolver) = &self.ctx.permit_resolver {
+            let r = resolver.clone();
+            match tokio::task::spawn_blocking(move || r.resolve_permitted_validators()).await {
+                Ok(Ok(set)) => {
+                    info!(
+                        "Initial validator permit resolution: {} permitted validators",
+                        set.len()
+                    );
+                    *self.ctx.permitted_validators.write().await = set;
+                }
+                Ok(Err(e)) => {
+                    error!("Initial validator permit resolution failed: {}", e);
+                }
+                Err(e) => {
+                    error!("Initial validator permit resolution task panicked: {}", e);
+                }
+            }
+
+            let resolver = resolver.clone();
+            let permitted = self.ctx.permitted_validators.clone();
+            let refresh_secs = self.ctx.config.validator_permit_refresh_secs;
+            let permit_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let r = resolver.clone();
+                    match tokio::task::spawn_blocking(move || r.resolve_permitted_validators())
+                        .await
+                    {
+                        Ok(Ok(set)) => {
+                            info!(
+                                "Refreshed validator permit cache: {} permitted validators",
+                                set.len()
+                            );
+                            *permitted.write().await = set;
+                        }
+                        Ok(Err(e)) => {
+                            error!("Validator permit resolution failed: {}", e);
+                        }
+                        Err(e) => {
+                            error!("Validator permit resolution task panicked: {}", e);
+                        }
+                    }
+                }
+            });
+            *self.permit_refresh_handle.lock().await = Some(permit_handle);
+        }
 
         while let Some(conn) = endpoint.accept().await {
             let ctx = self.ctx.clone();
@@ -450,7 +589,7 @@ impl LightningServer {
                             success: false,
                             data: HashMap::new(),
                             timestamp: unix_timestamp_secs(),
-                            error: Some(e.to_string()),
+                            error: Some("invalid request format".to_string()),
                         };
                         if let Ok(bytes) = rmp_serde::to_vec(&err_response) {
                             let _ = write_frame_and_finish(
@@ -504,12 +643,37 @@ impl LightningServer {
                 }
             }
             (MessageType::HandshakeRequest, payload) => {
+                let remote_ip = connection.remote_address().ip();
+                if !Self::check_handshake_rate(&ctx, remote_ip).await {
+                    warn!("Handshake rate limit exceeded for {}", remote_ip);
+                    // Pre-auth rejection: omit miner_hotkey to avoid identity disclosure
+                    // to unauthenticated peers.
+                    let reject = HandshakeResponse {
+                        miner_hotkey: String::new(),
+                        timestamp: unix_timestamp_secs(),
+                        signature: String::new(),
+                        accepted: false,
+                        connection_id: String::new(),
+                        cert_fingerprint: None,
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec(&reject) {
+                        let _ = write_frame_and_finish(
+                            &mut send,
+                            MessageType::HandshakeResponse,
+                            &bytes,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+
                 let request: HandshakeRequest = match rmp_serde::from_slice(&payload) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!("Failed to parse handshake request: {}", e);
+                        // Pre-auth rejection: omit miner_hotkey (same rationale as rate-limit path).
                         let err_response = HandshakeResponse {
-                            miner_hotkey: ctx.miner_hotkey,
+                            miner_hotkey: String::new(),
                             timestamp: unix_timestamp_secs(),
                             signature: String::new(),
                             accepted: false,
@@ -528,7 +692,26 @@ impl LightningServer {
                     }
                 };
 
-                let response = Self::process_handshake(request, connection.clone(), &ctx).await;
+                let timeout_duration = Duration::from_secs(ctx.config.handshake_timeout_secs);
+                let response = match tokio::time::timeout(
+                    timeout_duration,
+                    Self::process_handshake(request, connection.clone(), &ctx),
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        warn!("Handshake processing timed out for {}", remote_ip);
+                        HandshakeResponse {
+                            miner_hotkey: ctx.miner_hotkey.clone(),
+                            timestamp: unix_timestamp_secs(),
+                            signature: String::new(),
+                            accepted: false,
+                            connection_id: String::new(),
+                            cert_fingerprint: None,
+                        }
+                    }
+                };
                 match rmp_serde::to_vec(&response) {
                     Ok(bytes) => {
                         let _ = write_frame_and_finish(
@@ -582,7 +765,7 @@ impl LightningServer {
                         success: false,
                         data: HashMap::new(),
                         timestamp: unix_timestamp_secs(),
-                        error: Some("Unknown or unauthenticated validator".to_string()),
+                        error: Some("authentication failed".to_string()),
                     });
                 }
             }
@@ -600,7 +783,7 @@ impl LightningServer {
                         success: false,
                         data: HashMap::new(),
                         timestamp: unix_timestamp_secs(),
-                        error: Some("Connection not verified".to_string()),
+                        error: Some("authentication failed".to_string()),
                     });
                 }
                 conn.update_activity();
@@ -610,12 +793,34 @@ impl LightningServer {
                     success: false,
                     data: HashMap::new(),
                     timestamp: unix_timestamp_secs(),
-                    error: Some("Unknown or unauthenticated validator".to_string()),
+                    error: Some("authentication failed".to_string()),
                 });
             }
         }
 
         Ok(validator_hotkey)
+    }
+
+    async fn check_handshake_rate(ctx: &ServerContext, ip: IpAddr) -> bool {
+        let now = unix_timestamp_secs();
+        let cutoff = now.saturating_sub(HANDSHAKE_RATE_WINDOW_SECS);
+        let mut rates = ctx.handshake_rate.write().await;
+        if !rates.contains_key(&ip) && rates.len() >= ctx.config.max_tracked_rate_ips {
+            let oldest_ip = rates
+                .iter()
+                .min_by_key(|(_, attempts)| attempts.iter().copied().max().unwrap_or(0))
+                .map(|(ip, _)| *ip);
+            if let Some(evict_ip) = oldest_ip {
+                rates.remove(&evict_ip);
+            }
+        }
+        let attempts = rates.entry(ip).or_default();
+        attempts.retain(|ts| *ts >= cutoff);
+        if attempts.len() >= ctx.config.max_handshake_attempts_per_minute as usize {
+            return false;
+        }
+        attempts.push(now);
+        true
     }
 
     async fn handle_streaming_synapse(
@@ -646,10 +851,7 @@ impl LightningServer {
                     );
                     let end = StreamEnd {
                         success: false,
-                        error: Some(format!(
-                            "No handler for synapse type: {}",
-                            packet.synapse_type
-                        )),
+                        error: Some("unrecognized synapse type".to_string()),
                     };
                     if let Ok(bytes) = rmp_serde::to_vec(&end) {
                         let _ =
@@ -687,14 +889,20 @@ impl LightningServer {
                 success: true,
                 error: None,
             },
-            Ok(Err(e)) => StreamEnd {
-                success: false,
-                error: Some(e.to_string()),
-            },
-            Err(e) => StreamEnd {
-                success: false,
-                error: Some(format!("handler panicked: {}", e)),
-            },
+            Ok(Err(e)) => {
+                error!("Streaming handler error: {}", e);
+                StreamEnd {
+                    success: false,
+                    error: Some("stream processing failed".to_string()),
+                }
+            }
+            Err(e) => {
+                error!("Streaming handler panicked: {}", e);
+                StreamEnd {
+                    success: false,
+                    error: Some("stream processing failed".to_string()),
+                }
+            }
         };
 
         if let Ok(bytes) = rmp_serde::to_vec(&end) {
@@ -727,6 +935,38 @@ impl LightningServer {
                 connection_id: String::new(),
                 cert_fingerprint: None,
             };
+        }
+
+        if ctx.config.require_validator_permit {
+            if ctx.permit_resolver.is_none() {
+                error!(
+                    "Validator permit required but no resolver configured, rejecting {}",
+                    request.validator_hotkey
+                );
+                return HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: unix_timestamp_secs(),
+                    signature: String::new(),
+                    accepted: false,
+                    connection_id: String::new(),
+                    cert_fingerprint: None,
+                };
+            }
+            let permitted = ctx.permitted_validators.read().await;
+            if !permitted.contains(&request.validator_hotkey) {
+                warn!(
+                    "Handshake rejected: hotkey {} does not hold a validator permit",
+                    request.validator_hotkey
+                );
+                return HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: unix_timestamp_secs(),
+                    signature: String::new(),
+                    accepted: false,
+                    connection_id: String::new(),
+                    cert_fingerprint: None,
+                };
+            }
         }
 
         let now = unix_timestamp_secs();
@@ -971,7 +1211,7 @@ impl LightningServer {
                         success: false,
                         data: HashMap::new(),
                         timestamp: unix_timestamp_secs(),
-                        error: Some(e.to_string()),
+                        error: Some("request processing failed".to_string()),
                     }
                 }
             }
@@ -993,7 +1233,7 @@ impl LightningServer {
                             success: false,
                             data: HashMap::new(),
                             timestamp: unix_timestamp_secs(),
-                            error: Some(e.to_string()),
+                            error: Some("request processing failed".to_string()),
                         }
                     }
                 }
@@ -1006,10 +1246,7 @@ impl LightningServer {
                     success: false,
                     data: HashMap::new(),
                     timestamp: unix_timestamp_secs(),
-                    error: Some(format!(
-                        "No handler for synapse type: {}",
-                        packet.synapse_type
-                    )),
+                    error: Some("unrecognized synapse type".to_string()),
                 }
             }
         }
@@ -1075,6 +1312,10 @@ impl LightningServer {
         self.ctx.used_nonces.read().await.len()
     }
 
+    pub async fn get_permitted_validator_count(&self) -> usize {
+        self.ctx.permitted_validators.read().await.len()
+    }
+
     #[instrument(skip(self))]
     pub async fn cleanup_expired_nonces(&self) {
         let mut nonces = self.ctx.used_nonces.write().await;
@@ -1085,6 +1326,9 @@ impl LightningServer {
     #[instrument(skip(self))]
     pub async fn stop(&self) -> Result<()> {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.permit_refresh_handle.lock().await.take() {
             handle.abort();
         }
 
@@ -1110,6 +1354,11 @@ impl LightningServer {
 impl Drop for LightningServer {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.cleanup_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut guard) = self.permit_refresh_handle.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
@@ -1432,6 +1681,166 @@ mod tests {
         )
         .await;
         assert!(!result, "replayed nonce must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_zero_handshake_timeout() {
+        let config = LightningServerConfig {
+            handshake_timeout_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_handshake_timeout_ge_idle_timeout() {
+        let config = LightningServerConfig {
+            handshake_timeout_secs: 150,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+
+        let config = LightningServerConfig {
+            handshake_timeout_secs: 200,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_max_handshake_attempts() {
+        let config = LightningServerConfig {
+            max_handshake_attempts_per_minute: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_max_concurrent_bidi_streams() {
+        let config = LightningServerConfig {
+            max_concurrent_bidi_streams: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    fn test_server_context(config: LightningServerConfig) -> ServerContext {
+        ServerContext {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
+            synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+            async_handlers: Arc::new(RwLock::new(HashMap::new())),
+            streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
+            used_nonces: Arc::new(RwLock::new(HashMap::new())),
+            handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+            permit_resolver: None,
+            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
+            miner_hotkey: String::new(),
+            miner_signer: None,
+            cert_fingerprint: Arc::new(RwLock::new(None)),
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_allows_within_limit() {
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 3,
+            ..Default::default()
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip).await);
+        assert!(LightningServer::check_handshake_rate(&ctx, ip).await);
+        assert!(LightningServer::check_handshake_rate(&ctx, ip).await);
+        assert!(
+            !LightningServer::check_handshake_rate(&ctx, ip).await,
+            "fourth attempt must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_isolates_ips() {
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 1,
+            ..Default::default()
+        });
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip1).await);
+        assert!(
+            !LightningServer::check_handshake_rate(&ctx, ip1).await,
+            "ip1 must be rate limited"
+        );
+        assert!(
+            LightningServer::check_handshake_rate(&ctx, ip2).await,
+            "ip2 must not be affected by ip1 rate limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_evicts_oldest_ip_at_cap() {
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 10,
+            max_tracked_rate_ips: 2,
+            ..Default::default()
+        });
+
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip1).await);
+        assert!(LightningServer::check_handshake_rate(&ctx, ip2).await);
+        assert_eq!(ctx.handshake_rate.read().await.len(), 2);
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip3).await);
+        let rates = ctx.handshake_rate.read().await;
+        assert!(
+            rates.len() <= 2,
+            "map must not exceed max_tracked_rate_ips, got {}",
+            rates.len()
+        );
+        assert!(
+            rates.contains_key(&ip3),
+            "newly inserted IP must be present"
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_max_tracked_rate_ips() {
+        let config = LightningServerConfig {
+            max_tracked_rate_ips: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_defaults_validator_permit_disabled() {
+        let config = LightningServerConfig::default();
+        assert!(!config.require_validator_permit);
+        assert_eq!(config.validator_permit_refresh_secs, 1800);
+    }
+
+    #[test]
+    fn config_rejects_zero_validator_permit_refresh() {
+        let config = LightningServerConfig {
+            validator_permit_refresh_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
     }
 
     #[tokio::test]

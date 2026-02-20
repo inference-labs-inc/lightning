@@ -9,7 +9,7 @@ pub use client::{LightningClient, LightningClientConfig, StreamingResponse};
 pub use error::{LightningError, Result};
 pub use server::{
     typed_async_handler, typed_handler, AsyncSynapseHandler, LightningServer,
-    LightningServerConfig, StreamingSynapseHandler, SynapseHandler,
+    LightningServerConfig, StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
 };
 #[cfg(feature = "btwallet")]
 pub use signing::BtWalletSigner;
