@@ -705,7 +705,6 @@ pub async fn write_frame_and_finish(
 ) -> Result<()> {
     write_frame(send, msg_type, payload).await?;
     send.finish()
-        .await
         .map_err(|e| LightningError::Transport(format!("failed to finish stream: {}", e)))?;
     Ok(())
 }

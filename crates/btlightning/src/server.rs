@@ -13,7 +13,8 @@ use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
     VarInt,
 };
-use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -324,17 +325,23 @@ impl LightningServer {
     }
 
     #[allow(clippy::type_complexity)]
-    fn create_self_signed_cert(
-    ) -> std::result::Result<(Vec<Certificate>, PrivateKey, [u8; 32]), Box<dyn std::error::Error>>
-    {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let cert_der = cert.serialize_der()?;
-        let priv_key = cert.serialize_private_key_der();
+    fn create_self_signed_cert() -> std::result::Result<
+        (
+            Vec<CertificateDer<'static>>,
+            PrivateKeyDer<'static>,
+            [u8; 32],
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let key_pair = rcgen::KeyPair::generate()?;
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
+        let cert = params.self_signed(&key_pair)?;
+        let cert_der = cert.der().to_vec();
         let fingerprint = blake2_256(&cert_der);
 
         Ok((
-            vec![Certificate(cert_der)],
-            PrivateKey(priv_key),
+            vec![CertificateDer::from(cert_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
             fingerprint,
         ))
     }
@@ -361,7 +368,6 @@ impl LightningServer {
         *self.ctx.cert_fingerprint.write().await = Some(fingerprint);
 
         let mut server_config = RustlsServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
@@ -381,7 +387,11 @@ impl LightningServer {
         ));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
 
-        let mut server_config = ServerConfig::with_crypto(Arc::new(server_config));
+        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+            .map_err(|e| {
+                LightningError::Config(format!("Failed to create QUIC crypto config: {}", e))
+            })?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
         server_config.transport_config(Arc::new(transport_config));
         let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
