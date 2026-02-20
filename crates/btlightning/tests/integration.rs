@@ -1,7 +1,7 @@
 use btlightning::{
-    typed_async_handler, typed_handler, AsyncSynapseHandler, LightningClient, LightningError,
-    LightningServer, LightningServerConfig, QuicAxonInfo, QuicRequest, Result, Sr25519Signer,
-    StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
+    typed_async_handler, typed_handler, AsyncSynapseHandler, CallbackSigner, LightningClient,
+    LightningError, LightningServer, LightningServerConfig, QuicAxonInfo, QuicRequest, Result,
+    Signer, Sr25519Signer, StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
 };
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
@@ -975,6 +975,11 @@ async fn streaming_error_does_not_leak_handler_details() {
     }
     assert!(found_error, "should receive error from streaming handler");
     assert!(
+        error_msg.contains("stream processing failed"),
+        "wire error should use generic message, got: {}",
+        error_msg
+    );
+    assert!(
         !error_msg.contains("stream error mid-way"),
         "handler error details must not appear in wire response"
     );
@@ -1028,6 +1033,45 @@ async fn handshake_rate_limiting_rejects_excess_attempts() {
         stats.get("total_connections").unwrap(),
         "0",
         "third handshake attempt should be rejected by rate limiter"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
+
+// --- Handshake Timeout ---
+
+#[tokio::test]
+async fn handshake_timeout_rejects_slow_signing() {
+    let real_signer = Sr25519Signer::from_seed(MINER_SEED);
+    let slow_signer = CallbackSigner::new(move |msg: &[u8]| {
+        let sig = real_signer.sign(msg);
+        std::thread::sleep(Duration::from_secs(3));
+        sig
+    });
+
+    let config = LightningServerConfig {
+        handshake_timeout_secs: 1,
+        require_validator_permit: false,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_signer(Box::new(slow_signer));
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (client, _axon) = connect_client(port).await;
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "handshake should be rejected when signing exceeds timeout"
     );
 
     client.close_all_connections().await.unwrap();

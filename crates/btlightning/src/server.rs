@@ -17,6 +17,8 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+
+const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -411,7 +413,7 @@ impl LightningServer {
                 let mut nonces = nonces_for_cleanup.write().await;
                 nonces.retain(|_, ts| *ts >= cutoff);
                 drop(nonces);
-                let rate_cutoff = now.saturating_sub(60);
+                let rate_cutoff = now.saturating_sub(HANDSHAKE_RATE_WINDOW_SECS);
                 let mut rates = rate_for_cleanup.write().await;
                 rates.retain(|_, attempts| {
                     attempts.retain(|ts| *ts >= rate_cutoff);
@@ -717,7 +719,7 @@ impl LightningServer {
                         success: false,
                         data: HashMap::new(),
                         timestamp: unix_timestamp_secs(),
-                        error: Some("Unknown or unauthenticated validator".to_string()),
+                        error: Some("authentication failed".to_string()),
                     });
                 }
             }
@@ -735,7 +737,7 @@ impl LightningServer {
                         success: false,
                         data: HashMap::new(),
                         timestamp: unix_timestamp_secs(),
-                        error: Some("Connection not verified".to_string()),
+                        error: Some("authentication failed".to_string()),
                     });
                 }
                 conn.update_activity();
@@ -745,7 +747,7 @@ impl LightningServer {
                     success: false,
                     data: HashMap::new(),
                     timestamp: unix_timestamp_secs(),
-                    error: Some("Unknown or unauthenticated validator".to_string()),
+                    error: Some("authentication failed".to_string()),
                 });
             }
         }
@@ -755,7 +757,7 @@ impl LightningServer {
 
     async fn check_handshake_rate(ctx: &ServerContext, ip: IpAddr) -> bool {
         let now = unix_timestamp_secs();
-        let cutoff = now.saturating_sub(60);
+        let cutoff = now.saturating_sub(HANDSHAKE_RATE_WINDOW_SECS);
         let mut rates = ctx.handshake_rate.write().await;
         let attempts = rates.entry(ip).or_default();
         attempts.retain(|ts| *ts >= cutoff);
