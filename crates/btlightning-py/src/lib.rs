@@ -12,7 +12,7 @@ mod types;
 use handler::{
     msgpack_value_to_py, py_to_msgpack_value, PythonStreamingSynapseHandler, PythonSynapseHandler,
 };
-use signer::PythonSigner;
+use signer::{PythonPermitResolver, PythonSigner};
 use types::PyQuicAxonInfo;
 
 fn to_pyerr(err: btlightning::LightningError) -> PyErr {
@@ -355,6 +355,8 @@ impl RustLightningServer {
         handshake_timeout_secs=None,
         max_handshake_attempts_per_minute=None,
         max_concurrent_bidi_streams=None,
+        require_validator_permit=None,
+        validator_permit_refresh_secs=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -370,6 +372,8 @@ impl RustLightningServer {
         handshake_timeout_secs: Option<u64>,
         max_handshake_attempts_per_minute: Option<u32>,
         max_concurrent_bidi_streams: Option<u32>,
+        require_validator_permit: Option<bool>,
+        validator_permit_refresh_secs: Option<u64>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -405,6 +409,12 @@ impl RustLightningServer {
         }
         if let Some(v) = max_concurrent_bidi_streams {
             config.max_concurrent_bidi_streams = v;
+        }
+        if let Some(v) = require_validator_permit {
+            config.require_validator_permit = v;
+        }
+        if let Some(v) = validator_permit_refresh_secs {
+            config.validator_permit_refresh_secs = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
@@ -442,6 +452,23 @@ impl RustLightningServer {
             })
         })
         .map_err(to_pyerr)
+    }
+
+    pub fn set_validator_permit_resolver(
+        &self,
+        py: Python<'_>,
+        resolver_callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(|| {
+            runtime.block_on(async {
+                let mut server = self.server.write().await;
+                server.set_validator_permit_resolver(Box::new(PythonPermitResolver::new(
+                    resolver_callback,
+                )));
+            })
+        });
+        Ok(())
     }
 
     pub fn register_synapse_handler(

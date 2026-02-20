@@ -15,7 +15,7 @@ use quinn::{
 };
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,6 +35,8 @@ pub struct LightningServerConfig {
     pub handshake_timeout_secs: u64,
     pub max_handshake_attempts_per_minute: u32,
     pub max_concurrent_bidi_streams: u32,
+    pub require_validator_permit: bool,
+    pub validator_permit_refresh_secs: u64,
 }
 
 impl Default for LightningServerConfig {
@@ -49,8 +51,14 @@ impl Default for LightningServerConfig {
             handshake_timeout_secs: 10,
             max_handshake_attempts_per_minute: 30,
             max_concurrent_bidi_streams: 128,
+            require_validator_permit: true,
+            validator_permit_refresh_secs: 1800,
         }
     }
+}
+
+pub trait ValidatorPermitResolver: Send + Sync {
+    fn resolve_permitted_validators(&self) -> Result<HashSet<String>>;
 }
 
 pub trait SynapseHandler: Send + Sync {
@@ -127,6 +135,8 @@ struct ServerContext {
     streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
     used_nonces: Arc<RwLock<HashMap<String, u64>>>,
     handshake_rate: Arc<RwLock<HashMap<IpAddr, Vec<u64>>>>,
+    permit_resolver: Option<Arc<dyn ValidatorPermitResolver>>,
+    permitted_validators: Arc<RwLock<HashSet<String>>>,
     miner_hotkey: String,
     miner_signer: Option<Arc<dyn Signer>>,
     cert_fingerprint: Arc<RwLock<Option<[u8; 32]>>>,
@@ -214,6 +224,11 @@ impl LightningServer {
                 "max_concurrent_bidi_streams must be non-zero".to_string(),
             ));
         }
+        if config.validator_permit_refresh_secs == 0 {
+            return Err(LightningError::Config(
+                "validator_permit_refresh_secs must be non-zero".to_string(),
+            ));
+        }
         Ok(Self {
             host,
             port,
@@ -225,6 +240,8 @@ impl LightningServer {
                 streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
                 used_nonces: Arc::new(RwLock::new(HashMap::new())),
                 handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+                permit_resolver: None,
+                permitted_validators: Arc::new(RwLock::new(HashSet::new())),
                 miner_hotkey,
                 miner_signer: None,
                 cert_fingerprint: Arc::new(RwLock::new(None)),
@@ -241,6 +258,10 @@ impl LightningServer {
 
     pub fn set_miner_signer(&mut self, signer: Box<dyn Signer>) {
         self.ctx.miner_signer = Some(Arc::from(signer));
+    }
+
+    pub fn set_validator_permit_resolver(&mut self, resolver: Box<dyn ValidatorPermitResolver>) {
+        self.ctx.permit_resolver = Some(Arc::from(resolver));
     }
 
     #[cfg(feature = "btwallet")]
@@ -399,6 +420,36 @@ impl LightningServer {
             }
         });
         *self.cleanup_handle.lock().await = Some(handle);
+
+        if let Some(resolver) = &self.ctx.permit_resolver {
+            let resolver = resolver.clone();
+            let permitted = self.ctx.permitted_validators.clone();
+            let refresh_secs = self.ctx.config.validator_permit_refresh_secs;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                loop {
+                    interval.tick().await;
+                    let r = resolver.clone();
+                    match tokio::task::spawn_blocking(move || r.resolve_permitted_validators())
+                        .await
+                    {
+                        Ok(Ok(set)) => {
+                            info!(
+                                "Refreshed validator permit cache: {} permitted validators",
+                                set.len()
+                            );
+                            *permitted.write().await = set;
+                        }
+                        Ok(Err(e)) => {
+                            error!("Validator permit resolution failed: {}", e);
+                        }
+                        Err(e) => {
+                            error!("Validator permit resolution task panicked: {}", e);
+                        }
+                    }
+                }
+            });
+        }
 
         while let Some(conn) = endpoint.accept().await {
             let ctx = self.ctx.clone();
@@ -827,6 +878,38 @@ impl LightningServer {
                 connection_id: String::new(),
                 cert_fingerprint: None,
             };
+        }
+
+        if ctx.config.require_validator_permit {
+            if ctx.permit_resolver.is_none() {
+                error!(
+                    "Validator permit required but no resolver configured, rejecting {}",
+                    request.validator_hotkey
+                );
+                return HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: unix_timestamp_secs(),
+                    signature: String::new(),
+                    accepted: false,
+                    connection_id: String::new(),
+                    cert_fingerprint: None,
+                };
+            }
+            let permitted = ctx.permitted_validators.read().await;
+            if !permitted.contains(&request.validator_hotkey) {
+                warn!(
+                    "Handshake rejected: hotkey {} does not hold a validator permit",
+                    request.validator_hotkey
+                );
+                return HandshakeResponse {
+                    miner_hotkey: ctx.miner_hotkey.clone(),
+                    timestamp: unix_timestamp_secs(),
+                    signature: String::new(),
+                    accepted: false,
+                    connection_id: String::new(),
+                    cert_fingerprint: None,
+                };
+            }
         }
 
         let now = unix_timestamp_secs();
@@ -1590,6 +1673,8 @@ mod tests {
             streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
             used_nonces: Arc::new(RwLock::new(HashMap::new())),
             handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+            permit_resolver: None,
+            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
             miner_hotkey: String::new(),
             miner_signer: None,
             cert_fingerprint: Arc::new(RwLock::new(None)),
@@ -1619,6 +1704,8 @@ mod tests {
             streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
             used_nonces: Arc::new(RwLock::new(HashMap::new())),
             handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+            permit_resolver: None,
+            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
             miner_hotkey: String::new(),
             miner_signer: None,
             cert_fingerprint: Arc::new(RwLock::new(None)),
@@ -1639,6 +1726,23 @@ mod tests {
             LightningServer::check_handshake_rate(&ctx, ip2).await,
             "ip2 must not be affected by ip1 rate limit"
         );
+    }
+
+    #[test]
+    fn config_defaults_require_validator_permit() {
+        let config = LightningServerConfig::default();
+        assert!(config.require_validator_permit);
+        assert_eq!(config.validator_permit_refresh_secs, 1800);
+    }
+
+    #[test]
+    fn config_rejects_zero_validator_permit_refresh() {
+        let config = LightningServerConfig {
+            validator_permit_refresh_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
     }
 
     #[tokio::test]
