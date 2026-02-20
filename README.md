@@ -23,34 +23,60 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 | Throughput (1KB) | 61 req/s | 67,210 req/s |
 | Wire size (1KB payload) | 2,052 bytes | 1,052 bytes |
 
-### Latency p50 (ms, log scale)
+**Legend:** <svg width="12" height="12"><rect width="12" height="12" fill="#808080"/></svg> bittensor &nbsp; <svg width="12" height="12"><rect width="12" height="12" fill="#FFE000"/></svg> lightning
+
+### Latency p50 (ms)
 
 ```mermaid
 ---
 config:
     xyChart:
-        yAxis:
-            type: log
+        plotReservedSpacePercent: 60
+    themeVariables:
+        xyChart:
+            backgroundColor: "#000000"
+            plotColorPalette: "#808080, #FFE000"
+            titleColor: "#ffffff"
+            xAxisLabelColor: "#aaaaaa"
+            xAxisTitleColor: "#cccccc"
+            xAxisTickColor: "#666666"
+            xAxisLineColor: "#444444"
+            yAxisLabelColor: "#aaaaaa"
+            yAxisTitleColor: "#cccccc"
+            yAxisTickColor: "#666666"
+            yAxisLineColor: "#444444"
 ---
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
-    y-axis "ms" 0.01 --> 300
+    y-axis "ms" 0 --> 300
     bar "bittensor" [196.09, 175.24, 30.31, 123.06, 227.43]
     bar "lightning" [0.05, 0.05, 0.11, 0.71, 7.71]
 ```
 
-### Throughput (req/s, log scale)
+### Throughput (req/s)
 
 ```mermaid
 ---
 config:
     xyChart:
-        yAxis:
-            type: log
+        plotReservedSpacePercent: 60
+    themeVariables:
+        xyChart:
+            backgroundColor: "#000000"
+            plotColorPalette: "#808080, #FFE000"
+            titleColor: "#ffffff"
+            xAxisLabelColor: "#aaaaaa"
+            xAxisTitleColor: "#cccccc"
+            xAxisTickColor: "#666666"
+            xAxisLineColor: "#444444"
+            yAxisLabelColor: "#aaaaaa"
+            yAxisTitleColor: "#cccccc"
+            yAxisTickColor: "#666666"
+            yAxisLineColor: "#444444"
 ---
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
-    y-axis "req/s" 10 --> 100000
+    y-axis "req/s" 0 --> 100000
     bar "bittensor" [49, 61, 60, 59, 57]
     bar "lightning" [90126, 67210, 18576, 1958, 193]
 ```

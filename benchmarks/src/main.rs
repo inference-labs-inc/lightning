@@ -70,7 +70,11 @@ struct BenchResults {
     wire_bytes: HashMap<String, usize>,
 }
 
-async fn start_server() -> (Arc<LightningServer>, tokio::task::JoinHandle<Result<()>>, u16) {
+async fn start_server() -> (
+    Arc<LightningServer>,
+    tokio::task::JoinHandle<Result<()>>,
+    u16,
+) {
     let config = LightningServerConfig {
         require_validator_permit: false,
         ..Default::default()
@@ -126,7 +130,7 @@ fn wire_size(data: &HashMap<String, rmpv::Value>) -> usize {
     5 + encoded.len()
 }
 
-const PAYLOAD_SIZES: &[(& str, usize)] = &[
+const PAYLOAD_SIZES: &[(&str, usize)] = &[
     ("256B", 256),
     ("1KB", 1024),
     ("10KB", 10240),
@@ -177,7 +181,10 @@ async fn main() {
         let mut times = Vec::with_capacity(LATENCY_ITERATIONS);
         for _ in 0..LATENCY_ITERATIONS {
             let start = Instant::now();
-            let resp = client.query_axon(axon.clone(), request(data.clone())).await.unwrap();
+            let resp = client
+                .query_axon(axon.clone(), request(data.clone()))
+                .await
+                .unwrap();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             assert!(resp.success);
             times.push(elapsed);
