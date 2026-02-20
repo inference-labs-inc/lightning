@@ -4440,6 +4440,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightning-bench"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "btlightning",
+ "rand 0.8.5",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "sp-core",
+ "tokio",
+]
+
+[[package]]
 name = "link-cplusplus"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
