@@ -161,6 +161,19 @@ impl AsyncSynapseHandler for AsyncEchoHandler {
     }
 }
 
+struct SlowHandler;
+#[async_trait::async_trait]
+impl AsyncSynapseHandler for SlowHandler {
+    async fn handle(
+        &self,
+        _synapse_type: &str,
+        _data: HashMap<String, rmpv::Value>,
+    ) -> Result<HashMap<String, rmpv::Value>> {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(HashMap::new())
+    }
+}
+
 struct AsyncErrorHandler;
 #[async_trait::async_trait]
 impl AsyncSynapseHandler for AsyncErrorHandler {
@@ -463,40 +476,35 @@ async fn unregistered_synapse_type_returns_error() {
 
 #[tokio::test]
 async fn multiple_synapse_handlers() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
-        .await
-        .unwrap();
-    server
-        .register_synapse_handler("fail".to_string(), Arc::new(ErrorHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
+    let env = setup_with_register(
+        |s| {
+            Box::pin(async {
+                s.register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+                    .await?;
+                s.register_synapse_handler("fail".to_string(), Arc::new(ErrorHandler))
+                    .await?;
+                Ok(())
+            })
+        },
+        None,
+    )
+    .await;
 
-    let server = Arc::new(server);
-    let s = server.clone();
-    let server_handle = tokio::spawn(async move { s.serve_forever().await });
-
-    let (client, axon) = connect_client(port).await;
-
-    let resp1 = client
-        .query_axon(axon.clone(), build_request("echo"))
+    let resp1 = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("echo"))
         .await
         .unwrap();
     assert!(resp1.success);
 
-    let resp2 = client
-        .query_axon(axon.clone(), build_request("fail"))
+    let resp2 = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("fail"))
         .await
         .unwrap();
     assert!(!resp2.success);
 
-    client.close_all_connections().await.unwrap();
-    let _ = server.stop().await;
-    let _ = server_handle.await;
+    env.shutdown().await;
 }
 
 // --- Async Handler Dispatch ---
@@ -732,25 +740,19 @@ async fn concurrent_requests_on_same_connection() {
 
 #[tokio::test]
 async fn query_timeout_triggers() {
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
+    let env = setup_with_async_handler("slow", SlowHandler).await;
 
-    let bad_axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "192.0.2.1".into(),
-        port: 1,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let result = client
-        .query_axon_with_timeout(bad_axon, build_request("echo"), Duration::from_millis(500))
+    let result = env
+        .client
+        .query_axon_with_timeout(
+            env.axon_info.clone(),
+            build_request("slow"),
+            Duration::from_millis(500),
+        )
         .await;
     assert!(result.is_err());
 
-    let _ = client.close_all_connections().await;
+    env.shutdown().await;
 }
 
 // --- Typed Handler Roundtrips ---
