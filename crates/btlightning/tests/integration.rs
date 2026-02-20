@@ -1050,7 +1050,7 @@ async fn handshake_timeout_rejects_slow_signing() {
     let real_signer = Sr25519Signer::from_seed(MINER_SEED);
     let slow_signer = CallbackSigner::new(move |msg: &[u8]| {
         let sig = real_signer.sign(msg);
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(1100));
         sig
     });
 
@@ -1114,18 +1114,7 @@ async fn validator_without_permit_rejected() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    let server_stats = server.clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let stats = server_stats.get_connection_stats().await.unwrap();
-            if stats.get("total_connections").is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("server should become ready within 5s");
+    tokio::task::yield_now().await;
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();
@@ -1161,18 +1150,17 @@ async fn validator_with_permit_accepted() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    let server_stats = server.clone();
+    let srv = server.clone();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let stats = server_stats.get_connection_stats().await.unwrap();
-            if stats.get("total_connections").is_some() {
+            if srv.get_permitted_validator_count().await > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("server should become ready within 5s");
+    .expect("permit cache should be populated within 5s");
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();

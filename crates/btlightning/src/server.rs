@@ -440,6 +440,13 @@ impl LightningServer {
             warn!("Validator permit checking is DISABLED -- any hotkey with a valid signature can connect");
         }
 
+        {
+            let mut guard = self.permit_refresh_handle.lock().await;
+            if let Some(old) = guard.take() {
+                old.abort();
+            }
+        }
+
         if let Some(resolver) = &self.ctx.permit_resolver {
             let resolver = resolver.clone();
             let permitted = self.ctx.permitted_validators.clone();
@@ -1282,6 +1289,10 @@ impl LightningServer {
 
     pub async fn get_active_nonce_count(&self) -> usize {
         self.ctx.used_nonces.read().await.len()
+    }
+
+    pub async fn get_permitted_validator_count(&self) -> usize {
+        self.ctx.permitted_validators.read().await.len()
     }
 
     #[instrument(skip(self))]
