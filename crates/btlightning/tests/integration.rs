@@ -26,6 +26,7 @@ fn validator_hotkey() -> String {
 }
 
 struct TestEnv {
+    server: Arc<LightningServer>,
     server_handle: tokio::task::JoinHandle<Result<()>>,
     client: LightningClient,
     axon_info: QuicAxonInfo,
@@ -33,7 +34,8 @@ struct TestEnv {
 
 impl TestEnv {
     async fn shutdown(self) {
-        self.server_handle.abort();
+        let _ = self.server.stop().await;
+        let _ = self.server_handle.await;
         let _ = self.client.close_all_connections().await;
     }
 }
@@ -64,11 +66,14 @@ where
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
 
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, axon_info) = connect_client(port).await;
 
     TestEnv {
+        server,
         server_handle,
         client,
         axon_info,
@@ -673,6 +678,7 @@ async fn streaming_client_drops_early() {
 #[tokio::test]
 async fn concurrent_requests_on_same_connection() {
     let TestEnv {
+        server,
         server_handle,
         client,
         axon_info,
@@ -700,7 +706,8 @@ async fn concurrent_requests_on_same_connection() {
     assert_eq!(successes, 10, "all concurrent requests should succeed");
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 #[tokio::test]
@@ -824,17 +831,31 @@ async fn nonce_cleanup_removes_expired() {
 
     let (client, _axon) = connect_client(port).await;
 
-    let count_before = server.get_active_nonce_count().await;
+    let populated = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.get_active_nonce_count().await > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
     assert!(
-        count_before > 0,
+        populated.is_ok(),
         "handshake should record at least one nonce"
     );
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let count_after = server.get_active_nonce_count().await;
-    assert_eq!(
-        count_after, 0,
+    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.get_active_nonce_count().await == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
         "expired nonces should be cleaned up by background task"
     );
 
