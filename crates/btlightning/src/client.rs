@@ -8,6 +8,8 @@ use crate::types::{
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig as RustlsClientConfig;
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::HashMap;
@@ -225,7 +227,7 @@ impl LightningClient {
     #[instrument(skip(self))]
     pub async fn create_endpoint(&mut self) -> Result<()> {
         let mut tls_config = RustlsClientConfig::builder()
-            .with_safe_defaults()
+            .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCertVerifier))
             .with_no_client_auth();
 
@@ -238,7 +240,11 @@ impl LightningClient {
         transport_config.max_idle_timeout(Some(idle_timeout));
         transport_config.keep_alive_interval(Some(self.config.keep_alive_interval));
 
-        let mut client_config = ClientConfig::new(Arc::new(tls_config));
+        let quic_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).map_err(|e| {
+                LightningError::Config(format!("Failed to create QUIC crypto config: {}", e))
+            })?;
+        let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
         client_config.transport_config(Arc::new(transport_config));
 
         let bind_addr: SocketAddr = "0.0.0.0:0"
@@ -586,9 +592,9 @@ impl LightningClient {
 
 fn get_peer_cert_fingerprint(connection: &Connection) -> Option<[u8; 32]> {
     let identity = connection.peer_identity()?;
-    let certs = identity.downcast::<Vec<rustls::Certificate>>().ok()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     let first = certs.first()?;
-    Some(blake2_256(&first.0))
+    Some(blake2_256(first.as_ref()))
 }
 
 async fn connect_and_handshake(
@@ -819,22 +825,163 @@ fn generate_nonce() -> String {
     format!("{:032x}", u128::from_be_bytes(bytes))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sp_core::crypto::Ss58Codec;
+
+    const MINER_SEED: [u8; 32] = [1u8; 32];
+    const VALIDATOR_SEED: [u8; 32] = [2u8; 32];
+
+    fn make_signed_response(
+        miner_seed: [u8; 32],
+        validator_hotkey: &str,
+        nonce: &str,
+        cert_fp_b64: &str,
+    ) -> HandshakeResponse {
+        let pair = sr25519::Pair::from_seed(&miner_seed);
+        let miner_hotkey = pair.public().to_ss58check();
+        let timestamp = unix_timestamp_secs();
+        let message = handshake_response_message(
+            validator_hotkey,
+            &miner_hotkey,
+            timestamp,
+            nonce,
+            cert_fp_b64,
+        );
+        let signature = pair.sign(message.as_bytes());
+        HandshakeResponse {
+            miner_hotkey,
+            timestamp,
+            signature: BASE64_STANDARD.encode(signature.0),
+            accepted: true,
+            connection_id: "test".to_string(),
+            cert_fingerprint: Some(cert_fp_b64.to_string()),
+        }
+    }
+
+    fn validator_hotkey() -> String {
+        sr25519::Pair::from_seed(&VALIDATOR_SEED)
+            .public()
+            .to_ss58check()
+    }
+
+    #[tokio::test]
+    async fn verify_valid_miner_signature() {
+        let nonce = "test-nonce";
+        let fp = "dGVzdC1mcA==";
+        let resp = make_signed_response(MINER_SEED, &validator_hotkey(), nonce, fp);
+        assert!(
+            verify_miner_response_signature(&resp, &validator_hotkey(), nonce, fp)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_empty_signature() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = String::new();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty signature"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_invalid_base64() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = "not-valid-base64!!!".to_string();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("decode miner signature"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_wrong_signature_length() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.signature = BASE64_STANDARD.encode([0u8; 32]);
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid miner signature length"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_bad_ss58_address() {
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), "n", "fp");
+        resp.miner_hotkey = "not_a_valid_ss58".to_string();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid miner SS58 address"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_wrong_signer() {
+        let nonce = "n";
+        let fp = "fp";
+        let mut resp = make_signed_response(MINER_SEED, &validator_hotkey(), nonce, fp);
+        let wrong_pair = sr25519::Pair::from_seed(&[99u8; 32]);
+        resp.miner_hotkey = wrong_pair.public().to_ss58check();
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), nonce, fp)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_tampered_nonce() {
+        let fp = "fp";
+        let resp = make_signed_response(MINER_SEED, &validator_hotkey(), "original-nonce", fp);
+        let err = verify_miner_response_signature(&resp, &validator_hotkey(), "tampered-nonce", fp)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+}
+
 // Deliberately disables TLS PKI certificate validation. TLS still provides transport
 // encryption but not identity authentication. Authenticity is instead enforced at the
 // application layer: the handshake exchanges certificate fingerprints and verifies
 // sr25519 signatures over them (see connect_and_handshake / process_handshake).
+#[derive(Debug)]
 struct AcceptAnyCertVerifier;
 
-impl rustls::client::ServerCertVerifier for AcceptAnyCertVerifier {
+impl ServerCertVerifier for AcceptAnyCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

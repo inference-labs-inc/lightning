@@ -36,3 +36,38 @@ impl LightningError {
 }
 
 pub type Result<T> = std::result::Result<T, LightningError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_formats_all_variants() {
+        let cases: Vec<(LightningError, &str)> = vec![
+            (
+                LightningError::Connection("x".into()),
+                "connection error: x",
+            ),
+            (LightningError::Handshake("x".into()), "handshake error: x"),
+            (LightningError::Signing("x".into()), "signing error: x"),
+            (
+                LightningError::Serialization("x".into()),
+                "serialization error: x",
+            ),
+            (LightningError::Transport("x".into()), "transport error: x"),
+            (LightningError::Handler("x".into()), "handler error: x"),
+            (LightningError::Config("x".into()), "config error: x"),
+            (LightningError::Stream("x".into()), "stream error: x"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(format!("{}", err), expected);
+        }
+    }
+
+    #[test]
+    fn handler_constructor() {
+        let err = LightningError::handler("something failed");
+        assert_eq!(format!("{}", err), "handler error: something failed");
+        assert!(matches!(err, LightningError::Handler(_)));
+    }
+}

@@ -40,6 +40,78 @@ impl<F: Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync> Signer for CallbackSigner<F>
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sr25519_signer_produces_valid_signature() {
+        let seed = [1u8; 32];
+        let signer = Sr25519Signer::from_seed(seed);
+        let message = b"test message";
+        let sig_bytes = signer.sign(message).unwrap();
+        assert_eq!(sig_bytes.len(), 64);
+        let public = sr25519::Pair::from_seed(&seed).public();
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&sig_bytes);
+        let signature = sr25519::Signature::from_raw(sig_array);
+        assert!(sr25519::Pair::verify(&signature, message, &public));
+    }
+
+    #[test]
+    fn sr25519_signer_same_seed_both_valid() {
+        let seed = [42u8; 32];
+        let message = b"both valid check";
+        let public = sr25519::Pair::from_seed(&seed).public();
+        let sig1 = Sr25519Signer::from_seed(seed).sign(message).unwrap();
+        let sig2 = Sr25519Signer::from_seed(seed).sign(message).unwrap();
+        for sig_bytes in [&sig1, &sig2] {
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(sig_bytes);
+            assert!(sr25519::Pair::verify(
+                &sr25519::Signature::from_raw(arr),
+                message,
+                &public
+            ));
+        }
+    }
+
+    #[test]
+    fn sr25519_signer_different_seeds_differ() {
+        let message = b"same message";
+        let sig1 = Sr25519Signer::from_seed([1u8; 32]).sign(message).unwrap();
+        let sig2 = Sr25519Signer::from_seed([2u8; 32]).sign(message).unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn callback_signer_invokes_callback() {
+        let signer = CallbackSigner::new(|msg: &[u8]| Ok(msg.to_vec()));
+        let result = signer.sign(b"hello").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn callback_signer_propagates_error() {
+        let signer = CallbackSigner::new(|_: &[u8]| Err(LightningError::Signing("boom".into())));
+        let err = signer.sign(b"x").unwrap_err();
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn callback_signer_wraps_as_signing_variant() {
+        let signer =
+            CallbackSigner::new(|_: &[u8]| Err(LightningError::Transport("network down".into())));
+        let err = signer.sign(b"x").unwrap_err();
+        assert!(
+            matches!(err, LightningError::Signing(_)),
+            "expected Signing variant, got: {:?}",
+            err
+        );
+        assert!(err.to_string().contains("network down"));
+    }
+}
+
 #[cfg(feature = "btwallet")]
 pub struct BtWalletSigner {
     keypair: bittensor_wallet::Keypair,

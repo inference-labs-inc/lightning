@@ -13,7 +13,8 @@ use quinn::{
     Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig,
     VarInt,
 };
-use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -324,17 +325,23 @@ impl LightningServer {
     }
 
     #[allow(clippy::type_complexity)]
-    fn create_self_signed_cert(
-    ) -> std::result::Result<(Vec<Certificate>, PrivateKey, [u8; 32]), Box<dyn std::error::Error>>
-    {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let cert_der = cert.serialize_der()?;
-        let priv_key = cert.serialize_private_key_der();
+    fn create_self_signed_cert() -> std::result::Result<
+        (
+            Vec<CertificateDer<'static>>,
+            PrivateKeyDer<'static>,
+            [u8; 32],
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let key_pair = rcgen::KeyPair::generate()?;
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
+        let cert = params.self_signed(&key_pair)?;
+        let cert_der = cert.der().to_vec();
         let fingerprint = blake2_256(&cert_der);
 
         Ok((
-            vec![Certificate(cert_der)],
-            PrivateKey(priv_key),
+            vec![CertificateDer::from(cert_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
             fingerprint,
         ))
     }
@@ -361,7 +368,6 @@ impl LightningServer {
         *self.ctx.cert_fingerprint.write().await = Some(fingerprint);
 
         let mut server_config = RustlsServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
@@ -381,7 +387,11 @@ impl LightningServer {
         ));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
 
-        let mut server_config = ServerConfig::with_crypto(Arc::new(server_config));
+        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+            .map_err(|e| {
+                LightningError::Config(format!("Failed to create QUIC crypto config: {}", e))
+            })?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
         server_config.transport_config(Arc::new(transport_config));
         let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
@@ -1881,5 +1891,148 @@ mod tests {
             !nonces_guard.contains_key("nonce-2"),
             "third-oldest nonce should be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_future_timestamp() {
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: unix_timestamp_secs() + 120,
+            nonce: "future-ts".to_string(),
+            signature: String::new(),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(!result, "timestamp > now + 60 must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_invalid_ss58() {
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: "not_valid_ss58".to_string(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "ss58-test".to_string(),
+            signature: BASE64_STANDARD.encode([0u8; 64]),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(!result, "invalid SS58 address must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_invalid_base64_signature() {
+        use sp_core::crypto::Ss58Codec;
+        let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
+        let hotkey = pair.public().to_ss58check();
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: hotkey,
+            timestamp: unix_timestamp_secs(),
+            nonce: "b64-test".to_string(),
+            signature: "not-valid-base64!!!".to_string(),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(!result, "invalid base64 signature must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_wrong_signature_length() {
+        use sp_core::crypto::Ss58Codec;
+        let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
+        let hotkey = pair.public().to_ss58check();
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: hotkey,
+            timestamp: unix_timestamp_secs(),
+            nonce: "len-test".to_string(),
+            signature: BASE64_STANDARD.encode([0u8; 32]),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(!result, "32-byte signature must be rejected (need 64)");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_cryptographically_invalid_signature() {
+        use sp_core::crypto::Ss58Codec;
+        let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
+        let hotkey = pair.public().to_ss58check();
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: hotkey,
+            timestamp: unix_timestamp_secs(),
+            nonce: "crypto-test".to_string(),
+            signature: BASE64_STANDARD.encode([0u8; 64]),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(!result, "wrong signature bytes must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_valid_signature() {
+        use crate::types::handshake_request_message;
+        use sp_core::crypto::Ss58Codec;
+
+        let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
+        let hotkey = pair.public().to_ss58check();
+        let timestamp = unix_timestamp_secs();
+        let nonce = "valid-sig-test";
+        let message = handshake_request_message(&hotkey, timestamp, nonce, "");
+        let signature = pair.sign(message.as_bytes());
+
+        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: hotkey,
+            timestamp,
+            nonce: nonce.to_string(),
+            signature: BASE64_STANDARD.encode(signature.0),
+        };
+        let result =
+            LightningServer::verify_validator_signature(&request, nonces, &None, 300, 100_000)
+                .await;
+        assert!(result, "correctly signed request must be accepted");
+    }
+
+    #[tokio::test]
+    async fn sign_handshake_response_fails_without_signer() {
+        let request = HandshakeRequest {
+            validator_hotkey: "test".to_string(),
+            timestamp: 0,
+            nonce: "n".to_string(),
+            signature: String::new(),
+        };
+        let result =
+            LightningServer::sign_handshake_response(&request, "miner", None, 0, &None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no miner signer configured"));
+    }
+
+    #[tokio::test]
+    async fn sign_handshake_response_succeeds_with_signer() {
+        let signer: Arc<dyn Signer> = Arc::new(crate::signing::Sr25519Signer::from_seed([1u8; 32]));
+        let request = HandshakeRequest {
+            validator_hotkey: "test".to_string(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "n".to_string(),
+            signature: String::new(),
+        };
+        let result =
+            LightningServer::sign_handshake_response(&request, "miner", Some(signer), 0, &None)
+                .await;
+        let b64 = result.unwrap();
+        let decoded = BASE64_STANDARD.decode(&b64).unwrap();
+        assert_eq!(decoded.len(), 64);
     }
 }
