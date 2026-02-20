@@ -84,7 +84,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov -p btlightning --lcov --output-path lcov.info
+      - run: cargo llvm-cov -p btlightning --tests --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           files: lcov.info

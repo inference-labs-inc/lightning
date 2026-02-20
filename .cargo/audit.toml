@@ -1,5 +1,6 @@
 [advisories]
 ignore = [
+    # wasmtime 8.0.1 — lockfile phantom from subxt -> polkadot-sdk -> sc-executor-wasmtime; never compiled (subtensor-tests feature off by default). Remove when subxt no longer pulls polkadot-sdk.
     "RUSTSEC-2023-0091",
     "RUSTSEC-2024-0438",
     "RUSTSEC-2025-0118",
