@@ -52,12 +52,12 @@ maturin develop --manifest-path crates/btlightning-py/Cargo.toml
 
 Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handler returns input unchanged. Connection setup includes first request-response round trip. Lightning authenticates once at connection time and amortizes over all subsequent requests; bittensor signs and verifies every request. Bittensor payloads are base64-encoded (JSON has no binary type), adding ~33% wire overhead beyond the nominal payload size. Source: [`benchmarks/`](benchmarks/).
 
-| | bittensor (dendrite/axon) | lightning (Python) | lightning (Rust) |
-|---|---|---|---|
-| Protocol | HTTP/1.1 | QUIC | QUIC |
-| Serialization | JSON | MessagePack | MessagePack |
-| Transport encryption | None | TLS 1.3 | TLS 1.3 |
-| Auth model | Per-request | Per-connection | Per-connection |
+| | bittensor (dendrite/axon) | lightning |
+|---|---|---|
+| Protocol | HTTP/1.1 | QUIC |
+| Serialization | JSON | MessagePack |
+| Transport encryption | None | TLS 1.3 |
+| Auth model | Per-request | Per-connection |
 
 | Metric | bittensor | lightning (Python) | lightning (Rust) |
 |---|---|---|---|
