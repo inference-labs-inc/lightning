@@ -326,11 +326,13 @@ async fn server_stop_closes_connections() {
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
 
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
     let (client, _axon) = connect_client(port).await;
 
-    server_handle.abort();
+    server.stop().await.unwrap();
     let _ = server_handle.await;
 
     client.close_all_connections().await.unwrap();
@@ -557,25 +559,17 @@ async fn mixed_sync_async_handlers() {
 #[tokio::test]
 async fn streaming_handler_receives_chunks() {
     let chunks = vec![b"chunk1".to_vec(), b"chunk2".to_vec(), b"chunk3".to_vec()];
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler(
-            "stream".to_string(),
-            Arc::new(ChunkStreamHandler {
-                chunks: chunks.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let env = setup_with_streaming_handler(
+        "stream",
+        ChunkStreamHandler {
+            chunks: chunks.clone(),
+        },
+    )
+    .await;
 
-    let (client, axon) = connect_client(port).await;
-
-    let mut stream = client
-        .query_axon_stream(axon, build_request("stream"))
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("stream"))
         .await
         .unwrap();
 
@@ -589,8 +583,7 @@ async fn streaming_handler_receives_chunks() {
     assert_eq!(received[1], b"chunk2");
     assert_eq!(received[2], b"chunk3");
 
-    client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
@@ -614,20 +607,11 @@ async fn streaming_handler_zero_chunks() {
 
 #[tokio::test]
 async fn streaming_handler_error_midstream() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler("errstream".to_string(), Arc::new(ErrorStreamHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let env = setup_with_streaming_handler("errstream", ErrorStreamHandler).await;
 
-    let (client, axon) = connect_client(port).await;
-
-    let mut stream = client
-        .query_axon_stream(axon, build_request("errstream"))
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("errstream"))
         .await
         .unwrap();
 
@@ -635,7 +619,7 @@ async fn streaming_handler_error_midstream() {
     assert!(first.is_some(), "should receive partial chunk before error");
 
     let mut found_error = false;
-    loop {
+    for _ in 0..100 {
         match stream.next_chunk().await {
             Ok(Some(_)) => continue,
             Ok(None) => break,
@@ -647,61 +631,33 @@ async fn streaming_handler_error_midstream() {
     }
     assert!(found_error, "should receive error after partial data");
 
-    client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
 async fn streaming_collect_all() {
     let chunks = vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()];
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler(
-            "stream".to_string(),
-            Arc::new(ChunkStreamHandler {
-                chunks: chunks.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let env = setup_with_streaming_handler("stream", ChunkStreamHandler { chunks }).await;
 
-    let (client, axon) = connect_client(port).await;
-
-    let mut stream = client
-        .query_axon_stream(axon, build_request("stream"))
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("stream"))
         .await
         .unwrap();
     let all = stream.collect_all().await.unwrap();
     assert_eq!(all.len(), 3);
 
-    client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
 async fn streaming_client_drops_early() {
     let chunks = vec![b"data".to_vec(); 100];
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_streaming_handler(
-            "bigstream".to_string(),
-            Arc::new(ChunkStreamHandler { chunks }),
-        )
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let env = setup_with_streaming_handler("bigstream", ChunkStreamHandler { chunks }).await;
 
-    let (client, axon) = connect_client(port).await;
-
-    let mut stream = client
-        .query_axon_stream(axon, build_request("bigstream"))
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("bigstream"))
         .await
         .unwrap();
     let _ = stream.next_chunk().await;
@@ -709,8 +665,7 @@ async fn streaming_client_drops_early() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 // --- Edge Cases ---
@@ -750,8 +705,6 @@ async fn concurrent_requests_on_same_connection() {
 
 #[tokio::test]
 async fn query_timeout_triggers() {
-    let env = setup_with_handler("echo", EchoHandler).await;
-
     let mut client = LightningClient::new(validator_hotkey());
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
@@ -769,8 +722,6 @@ async fn query_timeout_triggers() {
         .query_axon_with_timeout(bad_axon, build_request("echo"), Duration::from_millis(100))
         .await;
     assert!(result.is_err());
-
-    env.shutdown().await;
 }
 
 // --- Typed Handler Roundtrips ---
