@@ -53,7 +53,7 @@ impl Default for LightningServerConfig {
             handshake_timeout_secs: 10,
             max_handshake_attempts_per_minute: 30,
             max_concurrent_bidi_streams: 128,
-            require_validator_permit: true,
+            require_validator_permit: false,
             validator_permit_refresh_secs: 1800,
         }
     }
@@ -151,6 +151,7 @@ pub struct LightningServer {
     ctx: ServerContext,
     endpoint: Option<Endpoint>,
     cleanup_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    permit_refresh_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl LightningServer {
@@ -251,6 +252,7 @@ impl LightningServer {
             },
             endpoint: None,
             cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            permit_refresh_handle: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -423,11 +425,19 @@ impl LightningServer {
         });
         *self.cleanup_handle.lock().await = Some(handle);
 
+        if self.ctx.config.require_validator_permit && self.ctx.permit_resolver.is_none() {
+            warn!("require_validator_permit is enabled but no ValidatorPermitResolver is configured -- all handshakes will be rejected");
+        }
+
+        if !self.ctx.config.require_validator_permit {
+            warn!("Validator permit checking is DISABLED -- any hotkey with a valid signature can connect");
+        }
+
         if let Some(resolver) = &self.ctx.permit_resolver {
             let resolver = resolver.clone();
             let permitted = self.ctx.permitted_validators.clone();
             let refresh_secs = self.ctx.config.validator_permit_refresh_secs;
-            tokio::spawn(async move {
+            let permit_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
                 loop {
                     interval.tick().await;
@@ -451,6 +461,7 @@ impl LightningServer {
                     }
                 }
             });
+            *self.permit_refresh_handle.lock().await = Some(permit_handle);
         }
 
         while let Some(conn) = endpoint.accept().await {
@@ -1269,6 +1280,9 @@ impl LightningServer {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
             handle.abort();
         }
+        if let Some(handle) = self.permit_refresh_handle.lock().await.take() {
+            handle.abort();
+        }
 
         let mut connections = self.ctx.connections.write().await;
         let mut addr_index = self.ctx.addr_to_hotkey.write().await;
@@ -1292,6 +1306,11 @@ impl LightningServer {
 impl Drop for LightningServer {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.cleanup_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut guard) = self.permit_refresh_handle.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
@@ -1731,9 +1750,9 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_require_validator_permit() {
+    fn config_defaults_validator_permit_disabled() {
         let config = LightningServerConfig::default();
-        assert!(config.require_validator_permit);
+        assert!(!config.require_validator_permit);
         assert_eq!(config.validator_permit_refresh_secs, 1800);
     }
 

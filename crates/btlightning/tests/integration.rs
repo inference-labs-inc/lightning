@@ -56,6 +56,9 @@ where
     ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
 {
     let mut cfg = config.unwrap_or_default();
+    // Permit-specific tests construct their own servers; all other tests
+    // rely on permit checking being disabled so handshakes succeed without
+    // a resolver.
     cfg.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, cfg).unwrap();
