@@ -352,6 +352,9 @@ impl RustLightningServer {
         nonce_cleanup_interval_secs=None,
         max_connections=None,
         max_nonce_entries=None,
+        handshake_timeout_secs=None,
+        max_handshake_attempts_per_minute=None,
+        max_concurrent_bidi_streams=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -364,6 +367,9 @@ impl RustLightningServer {
         nonce_cleanup_interval_secs: Option<u64>,
         max_connections: Option<usize>,
         max_nonce_entries: Option<usize>,
+        handshake_timeout_secs: Option<u64>,
+        max_handshake_attempts_per_minute: Option<u32>,
+        max_concurrent_bidi_streams: Option<u32>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -390,6 +396,15 @@ impl RustLightningServer {
         }
         if let Some(v) = max_nonce_entries {
             config.max_nonce_entries = v;
+        }
+        if let Some(v) = handshake_timeout_secs {
+            config.handshake_timeout_secs = v;
+        }
+        if let Some(v) = max_handshake_attempts_per_minute {
+            config.max_handshake_attempts_per_minute = v;
+        }
+        if let Some(v) = max_concurrent_bidi_streams {
+            config.max_concurrent_bidi_streams = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)

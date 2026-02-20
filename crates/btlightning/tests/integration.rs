@@ -899,3 +899,129 @@ async fn nonce_cleanup_removes_expired() {
     let _ = server.stop().await;
     let _ = server_handle.await;
 }
+
+// --- Error Sanitization ---
+
+#[tokio::test]
+async fn handler_error_does_not_leak_internal_details() {
+    let env = setup_with_handler("fail", ErrorHandler).await;
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("fail"))
+        .await
+        .unwrap();
+    assert!(!resp.success);
+    let error_msg = resp.error.unwrap();
+    assert_eq!(error_msg, "request processing failed");
+    assert!(
+        !error_msg.contains("deliberate error"),
+        "handler error details must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn unregistered_synapse_type_uses_generic_error() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("nonexistent"))
+        .await
+        .unwrap();
+    assert!(!resp.success);
+    let error_msg = resp.error.unwrap();
+    assert_eq!(error_msg, "unrecognized synapse type");
+    assert!(
+        !error_msg.contains("nonexistent"),
+        "synapse type name must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn streaming_error_does_not_leak_handler_details() {
+    let env = setup_with_streaming_handler("errstream", ErrorStreamHandler).await;
+
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("errstream"))
+        .await
+        .unwrap();
+
+    let mut found_error = false;
+    let mut error_msg = String::new();
+    for _ in 0..100 {
+        match stream.next_chunk().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(e) => {
+                error_msg = e.to_string();
+                found_error = true;
+                break;
+            }
+        }
+    }
+    assert!(found_error, "should receive error from streaming handler");
+    assert!(
+        !error_msg.contains("stream error mid-way"),
+        "handler error details must not appear in wire response"
+    );
+
+    env.shutdown().await;
+}
+
+// --- Rate Limiting ---
+
+#[tokio::test]
+async fn handshake_rate_limiting_rejects_excess_attempts() {
+    let config = LightningServerConfig {
+        max_handshake_attempts_per_minute: 2,
+        ..Default::default()
+    };
+    let mut server =
+        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+    server.set_miner_keypair(MINER_SEED);
+    server
+        .register_synapse_handler("echo".to_string(), Arc::new(EchoHandler))
+        .await
+        .unwrap();
+    server.start().await.unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let server = Arc::new(server);
+    let s = server.clone();
+    let server_handle = tokio::spawn(async move { s.serve_forever().await });
+
+    let (mut client, axon) = connect_client(port).await;
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    client.close_all_connections().await.unwrap();
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "third handshake attempt should be rejected by rate limiter"
+    );
+
+    client.close_all_connections().await.unwrap();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
+}
