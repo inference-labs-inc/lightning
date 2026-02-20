@@ -448,11 +448,29 @@ impl LightningServer {
         }
 
         if let Some(resolver) = &self.ctx.permit_resolver {
+            let r = resolver.clone();
+            match tokio::task::spawn_blocking(move || r.resolve_permitted_validators()).await {
+                Ok(Ok(set)) => {
+                    info!(
+                        "Initial validator permit resolution: {} permitted validators",
+                        set.len()
+                    );
+                    *self.ctx.permitted_validators.write().await = set;
+                }
+                Ok(Err(e)) => {
+                    error!("Initial validator permit resolution failed: {}", e);
+                }
+                Err(e) => {
+                    error!("Initial validator permit resolution task panicked: {}", e);
+                }
+            }
+
             let resolver = resolver.clone();
             let permitted = self.ctx.permitted_validators.clone();
             let refresh_secs = self.ctx.config.validator_permit_refresh_secs;
             let permit_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                interval.tick().await;
                 loop {
                     interval.tick().await;
                     let r = resolver.clone();
@@ -628,6 +646,8 @@ impl LightningServer {
                 let remote_ip = connection.remote_address().ip();
                 if !Self::check_handshake_rate(&ctx, remote_ip).await {
                     warn!("Handshake rate limit exceeded for {}", remote_ip);
+                    // Pre-auth rejection: omit miner_hotkey to avoid identity disclosure
+                    // to unauthenticated peers.
                     let reject = HandshakeResponse {
                         miner_hotkey: String::new(),
                         timestamp: unix_timestamp_secs(),
@@ -651,6 +671,7 @@ impl LightningServer {
                     Ok(r) => r,
                     Err(e) => {
                         warn!("Failed to parse handshake request: {}", e);
+                        // Pre-auth rejection: omit miner_hotkey (same rationale as rate-limit path).
                         let err_response = HandshakeResponse {
                             miner_hotkey: String::new(),
                             timestamp: unix_timestamp_secs(),

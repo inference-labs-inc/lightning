@@ -55,11 +55,21 @@ where
         &'a LightningServer,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
 {
-    let mut cfg = config.unwrap_or_default();
-    // Permit-specific tests construct their own servers; all other tests
-    // rely on permit checking being disabled so handshakes succeed without
-    // a resolver.
-    cfg.require_validator_permit = false;
+    let cfg = match config {
+        Some(c) => {
+            assert!(
+                !c.require_validator_permit,
+                "setup_with_register disables permit checking; \
+                 permit-enabled servers must be constructed explicitly"
+            );
+            c
+        }
+        None => {
+            let mut c = LightningServerConfig::default();
+            c.require_validator_permit = false;
+            c
+        }
+    };
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, cfg).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1116,7 +1126,11 @@ async fn validator_without_permit_rejected() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        server.get_permitted_validator_count().await,
+        0,
+        "permit cache should be empty when resolver returns no validators"
+    );
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();
