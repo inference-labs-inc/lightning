@@ -73,7 +73,7 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 | ![lightning-py](https://img.shields.io/badge/-FF8C00?style=flat-square) | lightning (Python) |
 | ![lightning](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning (Rust) |
 
-### Latency p50 (ms)
+### Latency p50
 
 ```mermaid
 ---
@@ -96,10 +96,10 @@ config:
 ---
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
-    y-axis "ms" 0 --> 50
-    bar "bittensor" [24.50, 24.01, 24.70, 26.13, 40.72]
-    bar "lightning (Python)" [0.08, 0.08, 0.23, 1.88, 20.55]
-    bar "lightning (Rust)" [0.05, 0.05, 0.11, 0.69, 7.40]
+    y-axis "log10(us)" 0 --> 5
+    bar "bittensor" [4.39, 4.38, 4.39, 4.42, 4.61]
+    bar "lightning (Python)" [1.90, 1.90, 2.36, 3.27, 4.31]
+    bar "lightning (Rust)" [1.70, 1.70, 2.04, 2.84, 3.87]
 ```
 
 ### Throughput (req/s)

@@ -137,7 +137,7 @@ async def main():
             times = []
             for _ in range(LATENCY_ITERATIONS):
                 start = time.perf_counter()
-                resp = await dendrite.forward(
+                await dendrite.forward(
                     target,
                     synapse=EchoSynapse(data=data_str),
                     timeout=30.0,
