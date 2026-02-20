@@ -66,18 +66,7 @@ where
 
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-
-    let axon_info = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
+    let (client, axon_info) = connect_client(port).await;
 
     TestEnv {
         server_handle,
@@ -111,6 +100,25 @@ async fn setup_with_streaming_handler<H: StreamingSynapseHandler + 'static>(
     let st = synapse_type.to_string();
     let h = Arc::new(handler);
     setup_with_register(|s| Box::pin(s.register_streaming_handler(st, h)), None).await
+}
+
+async fn connect_client(port: u16) -> (LightningClient, QuicAxonInfo) {
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+    let axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+        placeholder1: 0,
+        placeholder2: 0,
+    };
+    client
+        .initialize_connections(vec![axon.clone()])
+        .await
+        .unwrap();
+    (client, axon)
 }
 
 struct EchoHandler;
@@ -248,16 +256,9 @@ async fn server_starts_and_binds() {
 async fn client_handshake_succeeds() {
     let env = setup().await;
 
-    let miners = vec![env.axon_info.clone()];
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client.initialize_connections(miners).await.unwrap();
-
-    let stats = client.get_connection_stats().await.unwrap();
+    let stats = env.client.get_connection_stats().await.unwrap();
     assert_eq!(stats.get("total_connections").unwrap(), "1");
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -296,14 +297,6 @@ async fn max_connections_enforcement() {
     };
     let env = setup_with_config(config).await;
 
-    let mut client1 = LightningClient::new(validator_hotkey());
-    client1.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client1.create_endpoint().await.unwrap();
-    client1
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
-
     let third_seed = [3u8; 32];
     let third_hotkey = sr25519::Pair::from_seed(&third_seed)
         .public()
@@ -322,7 +315,6 @@ async fn max_connections_enforcement() {
         "second client should be rejected when max_connections=1"
     );
 
-    client1.close_all_connections().await.unwrap();
     client2.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
@@ -332,23 +324,11 @@ async fn server_stop_closes_connections() {
     let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
     server.set_miner_keypair(MINER_SEED);
     server.start().await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let port = addr.port();
+    let port = server.local_addr().unwrap().port();
 
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-    client.initialize_connections(vec![axon]).await.unwrap();
+    let (client, _axon) = connect_client(port).await;
 
     server_handle.abort();
     let _ = server_handle.await;
@@ -360,27 +340,20 @@ async fn server_stop_closes_connections() {
 async fn client_reconnects_after_disconnect() {
     let env = setup_with_handler("echo", EchoHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
-
-    let resp = client
+    let resp = env
+        .client
         .query_axon(env.axon_info.clone(), build_request("echo"))
         .await;
     assert!(resp.is_ok(), "first query should succeed");
 
-    client.close_all_connections().await.unwrap();
+    env.client.close_all_connections().await.unwrap();
 
-    let resp2 = client
+    let resp2 = env
+        .client
         .query_axon(env.axon_info.clone(), build_request("echo"))
         .await;
     assert!(resp2.is_ok(), "query after reconnect should succeed");
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -404,22 +377,7 @@ async fn nonce_accounting_increments() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (mut client, axon) = connect_client(port).await;
 
     let count_after_first = server.get_active_nonce_count().await;
     assert!(
@@ -450,21 +408,16 @@ async fn nonce_accounting_increments() {
 async fn sync_handler_echo_roundtrip() {
     let env = setup_with_handler("echo", EchoHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
+    let req = build_request_with_data("echo", "greeting", "hello");
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), req)
         .await
         .unwrap();
-
-    let req = build_request_with_data("echo", "greeting", "hello");
-    let resp = client.query_axon(env.axon_info.clone(), req).await.unwrap();
     assert!(resp.success);
     let val = resp.data.get("greeting").unwrap();
     assert_eq!(val.as_str().unwrap(), "hello");
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -472,22 +425,14 @@ async fn sync_handler_echo_roundtrip() {
 async fn sync_handler_error_propagation() {
     let env = setup_with_handler("fail", ErrorHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
-
-    let resp = client
+    let resp = env
+        .client
         .query_axon(env.axon_info.clone(), build_request("fail"))
         .await
         .unwrap();
     assert!(!resp.success);
     assert!(resp.error.is_some());
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -495,21 +440,13 @@ async fn sync_handler_error_propagation() {
 async fn unregistered_synapse_type_returns_error() {
     let env = setup_with_handler("echo", EchoHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
-
-    let resp = client
+    let resp = env
+        .client
         .query_axon(env.axon_info.clone(), build_request("nonexistent"))
         .await
         .unwrap();
     assert!(!resp.success);
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -528,24 +465,9 @@ async fn multiple_synapse_handlers() {
     server.start().await.unwrap();
     let port = server.local_addr().unwrap().port();
 
-    let _server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let resp1 = client
         .query_axon(axon.clone(), build_request("echo"))
@@ -560,6 +482,7 @@ async fn multiple_synapse_handlers() {
     assert!(!resp2.success);
 
     client.close_all_connections().await.unwrap();
+    server_handle.abort();
 }
 
 // --- Async Handler Dispatch ---
@@ -568,61 +491,31 @@ async fn multiple_synapse_handlers() {
 async fn async_handler_echo_roundtrip() {
     let env = setup_with_async_handler("async_echo", AsyncEchoHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
+    let req = build_request_with_data("async_echo", "key", "value");
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), req)
         .await
         .unwrap();
-
-    let req = build_request_with_data("async_echo", "key", "value");
-    let resp = client.query_axon(env.axon_info.clone(), req).await.unwrap();
     assert!(resp.success);
     assert_eq!(resp.data.get("key").unwrap().as_str().unwrap(), "value");
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
 #[tokio::test]
 async fn async_handler_error_propagation() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_async_synapse_handler("async_fail".to_string(), Arc::new(AsyncErrorHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
-    let server_handle = tokio::spawn(async move { server.serve_forever().await });
+    let env = setup_with_async_handler("async_fail", AsyncErrorHandler).await;
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
-
-    let resp = client
-        .query_axon(axon, build_request("async_fail"))
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("async_fail"))
         .await
         .unwrap();
     assert!(!resp.success);
     assert!(resp.error.is_some());
 
-    client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    env.shutdown().await;
 }
 
 #[tokio::test]
@@ -641,22 +534,7 @@ async fn mixed_sync_async_handlers() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let r1 = client
         .query_axon(axon.clone(), build_request_with_data("sync_echo", "k", "v"))
@@ -694,22 +572,7 @@ async fn streaming_handler_receives_chunks() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let mut stream = client
         .query_axon_stream(axon, build_request("stream"))
@@ -734,15 +597,8 @@ async fn streaming_handler_receives_chunks() {
 async fn streaming_handler_zero_chunks() {
     let env = setup_with_streaming_handler("empty", EmptyStreamHandler).await;
 
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
-
-    let mut stream = client
+    let mut stream = env
+        .client
         .query_axon_stream(env.axon_info.clone(), build_request("empty"))
         .await
         .unwrap();
@@ -753,7 +609,6 @@ async fn streaming_handler_zero_chunks() {
         "empty stream should return None immediately"
     );
 
-    client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
 
@@ -769,22 +624,7 @@ async fn streaming_handler_error_midstream() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let mut stream = client
         .query_axon_stream(axon, build_request("errstream"))
@@ -829,22 +669,7 @@ async fn streaming_collect_all() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let mut stream = client
         .query_axon_stream(axon, build_request("stream"))
@@ -873,22 +698,7 @@ async fn streaming_client_drops_early() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let mut stream = client
         .query_axon_stream(axon, build_request("bigstream"))
@@ -907,21 +717,17 @@ async fn streaming_client_drops_early() {
 
 #[tokio::test]
 async fn concurrent_requests_on_same_connection() {
-    let env = setup_with_handler("echo", EchoHandler).await;
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![env.axon_info.clone()])
-        .await
-        .unwrap();
+    let TestEnv {
+        server_handle,
+        client,
+        axon_info,
+    } = setup_with_handler("echo", EchoHandler).await;
 
     let client = Arc::new(client);
     let mut handles = Vec::new();
     for i in 0..10 {
         let c = client.clone();
-        let axon = env.axon_info.clone();
+        let axon = axon_info.clone();
         handles.push(tokio::spawn(async move {
             let req = build_request_with_data("echo", "idx", &i.to_string());
             c.query_axon(axon, req).await
@@ -939,7 +745,7 @@ async fn concurrent_requests_on_same_connection() {
     assert_eq!(successes, 10, "all concurrent requests should succeed");
 
     client.close_all_connections().await.unwrap();
-    env.shutdown().await;
+    server_handle.abort();
 }
 
 #[tokio::test]
@@ -995,22 +801,7 @@ async fn typed_sync_handler_integration() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let req = QuicRequest::from_typed("add", &AddReq { a: 3, b: 4 }).unwrap();
     let resp = client.query_axon(axon, req).await.unwrap();
@@ -1049,22 +840,7 @@ async fn typed_async_handler_integration() {
     let port = server.local_addr().unwrap().port();
     let server_handle = tokio::spawn(async move { server.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, axon) = connect_client(port).await;
 
     let req = QuicRequest::from_typed("double", &DoubleReq { value: 21 }).unwrap();
     let resp = client.query_axon(axon, req).await.unwrap();
@@ -1095,22 +871,7 @@ async fn nonce_cleanup_removes_expired() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
-        ip: "127.0.0.1".into(),
-        port,
-        protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
-    };
-
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
-    client.create_endpoint().await.unwrap();
-    client
-        .initialize_connections(vec![axon.clone()])
-        .await
-        .unwrap();
+    let (client, _axon) = connect_client(port).await;
 
     let count_before = server.get_active_nonce_count().await;
     assert!(
