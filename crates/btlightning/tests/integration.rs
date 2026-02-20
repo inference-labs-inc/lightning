@@ -1114,7 +1114,18 @@ async fn validator_without_permit_rejected() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let server_stats = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = server_stats.get_connection_stats().await.unwrap();
+            if stats.get("total_connections").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server should become ready within 5s");
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();
@@ -1150,7 +1161,18 @@ async fn validator_with_permit_accepted() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let server_stats = server.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = server_stats.get_connection_stats().await.unwrap();
+            if stats.get("total_connections").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server should become ready within 5s");
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();

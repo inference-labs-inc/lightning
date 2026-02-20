@@ -17,14 +17,14 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-
-const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
+
+const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, Copy, Clone)]
 pub struct LightningServerConfig {
@@ -39,6 +39,7 @@ pub struct LightningServerConfig {
     pub max_concurrent_bidi_streams: u32,
     pub require_validator_permit: bool,
     pub validator_permit_refresh_secs: u64,
+    pub max_tracked_rate_ips: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -55,6 +56,7 @@ impl Default for LightningServerConfig {
             max_concurrent_bidi_streams: 128,
             require_validator_permit: false,
             validator_permit_refresh_secs: 1800,
+            max_tracked_rate_ips: 10_000,
         }
     }
 }
@@ -230,6 +232,11 @@ impl LightningServer {
         if config.validator_permit_refresh_secs == 0 {
             return Err(LightningError::Config(
                 "validator_permit_refresh_secs must be non-zero".to_string(),
+            ));
+        }
+        if config.max_tracked_rate_ips == 0 {
+            return Err(LightningError::Config(
+                "max_tracked_rate_ips must be non-zero".to_string(),
             ));
         }
         Ok(Self {
@@ -770,6 +777,15 @@ impl LightningServer {
         let now = unix_timestamp_secs();
         let cutoff = now.saturating_sub(HANDSHAKE_RATE_WINDOW_SECS);
         let mut rates = ctx.handshake_rate.write().await;
+        if !rates.contains_key(&ip) && rates.len() >= ctx.config.max_tracked_rate_ips {
+            let oldest_ip = rates
+                .iter()
+                .min_by_key(|(_, attempts)| attempts.iter().copied().max().unwrap_or(0))
+                .map(|(ip, _)| *ip);
+            if let Some(evict_ip) = oldest_ip {
+                rates.remove(&evict_ip);
+            }
+        }
         let attempts = rates.entry(ip).or_default();
         attempts.retain(|ts| *ts >= cutoff);
         if attempts.len() >= ctx.config.max_handshake_attempts_per_minute as usize {
@@ -1747,6 +1763,59 @@ mod tests {
             LightningServer::check_handshake_rate(&ctx, ip2).await,
             "ip2 must not be affected by ip1 rate limit"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_evicts_oldest_ip_at_cap() {
+        let ctx = ServerContext {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
+            synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
+            async_handlers: Arc::new(RwLock::new(HashMap::new())),
+            streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
+            used_nonces: Arc::new(RwLock::new(HashMap::new())),
+            handshake_rate: Arc::new(RwLock::new(HashMap::new())),
+            permit_resolver: None,
+            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
+            miner_hotkey: String::new(),
+            miner_signer: None,
+            cert_fingerprint: Arc::new(RwLock::new(None)),
+            config: LightningServerConfig {
+                max_handshake_attempts_per_minute: 10,
+                max_tracked_rate_ips: 2,
+                ..Default::default()
+            },
+        };
+
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip1).await);
+        assert!(LightningServer::check_handshake_rate(&ctx, ip2).await);
+        assert_eq!(ctx.handshake_rate.read().await.len(), 2);
+
+        assert!(LightningServer::check_handshake_rate(&ctx, ip3).await);
+        let rates = ctx.handshake_rate.read().await;
+        assert!(
+            rates.len() <= 2,
+            "map must not exceed max_tracked_rate_ips, got {}",
+            rates.len()
+        );
+        assert!(
+            rates.contains_key(&ip3),
+            "newly inserted IP must be present"
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_max_tracked_rate_ips() {
+        let config = LightningServerConfig {
+            max_tracked_rate_ips: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
     }
 
     #[test]
