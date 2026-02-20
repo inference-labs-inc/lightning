@@ -61,16 +61,16 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 
 | Metric | bittensor | lightning |
 |---|---|---|
-| Connection setup (p50) | 102.95 ms | 0.65 ms |
-| Latency p50 (1KB) | 175.24 ms | 0.05 ms |
-| Latency p99 (1KB) | 295.36 ms | 0.07 ms |
-| Throughput (1KB) | 61 req/s | 67,210 req/s |
-| Wire size (1KB payload) | 2,052 bytes | 1,052 bytes |
+| Connection setup (p50) | 114.46 ms | 0.71 ms |
+| Latency p50 (1KB) | 24.01 ms | 0.05 ms |
+| Latency p99 (1KB) | 28.80 ms | 0.07 ms |
+| Throughput (1KB) | 41 req/s | 68,650 req/s |
+| Wire size (1KB payload) | 2,032 bytes | 1,052 bytes |
 
 | Color | System |
 |---|---|
-| ![](https://img.shields.io/badge/-808080?style=flat-square) | bittensor |
-| ![](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning |
+| ![bittensor](https://img.shields.io/badge/-808080?style=flat-square) | bittensor |
+| ![lightning](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning |
 
 ### Latency p50 (ms)
 
@@ -95,9 +95,9 @@ config:
 ---
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
-    y-axis "ms" 0 --> 300
-    bar "bittensor" [196.09, 175.24, 30.31, 123.06, 227.43]
-    bar "lightning" [0.05, 0.05, 0.11, 0.71, 7.71]
+    y-axis "ms" 0 --> 50
+    bar "bittensor" [24.50, 24.01, 24.70, 26.13, 40.72]
+    bar "lightning" [0.05, 0.05, 0.11, 0.69, 7.40]
 ```
 
 ### Throughput (req/s)
@@ -123,42 +123,42 @@ config:
 ---
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
-    y-axis "req/s" 0 --> 100000
-    bar "bittensor" [49, 61, 60, 59, 57]
-    bar "lightning" [90126, 67210, 18576, 1958, 193]
+    y-axis "log10(req/s)" 0 --> 5
+    bar "bittensor" [1.61, 1.61, 1.60, 1.57, 1.40]
+    bar "lightning" [4.92, 4.84, 4.27, 3.26, 2.26]
 ```
 
 <details>
 <summary>Full results (all payload sizes)</summary>
 
-### Latency (ms)
+#### Latency (ms)
 
 | Payload | bittensor p50 | p95 | p99 | lightning p50 | p95 | p99 |
 |---|---|---|---|---|---|---|
-| 256B | 196.09 | 250.05 | 283.00 | 0.05 | 0.10 | 0.11 |
-| 1KB | 175.24 | 250.13 | 295.36 | 0.05 | 0.06 | 0.07 |
-| 10KB | 30.31 | 225.01 | 273.88 | 0.11 | 0.13 | 0.13 |
-| 100KB | 123.06 | 156.30 | 176.01 | 0.71 | 0.85 | 1.20 |
-| 1MB | 227.43 | 289.27 | 317.42 | 7.71 | 8.62 | 13.56 |
+| 256B | 24.50 | 28.04 | 35.05 | 0.05 | 0.06 | 0.07 |
+| 1KB | 24.01 | 25.57 | 28.80 | 0.05 | 0.06 | 0.07 |
+| 10KB | 24.70 | 25.70 | 26.59 | 0.11 | 0.12 | 0.13 |
+| 100KB | 26.13 | 27.31 | 29.42 | 0.69 | 0.73 | 0.75 |
+| 1MB | 40.72 | 43.11 | 48.00 | 7.40 | 12.36 | 17.02 |
 
-### Throughput (req/s)
-
-| Payload | bittensor | lightning |
-|---|---|---|
-| 256B | 49 | 90,126 |
-| 1KB | 61 | 67,210 |
-| 10KB | 60 | 18,576 |
-| 100KB | 59 | 1,958 |
-| 1MB | 57 | 193 |
-
-### Wire overhead (bytes)
+#### Throughput (req/s)
 
 | Payload | bittensor | lightning |
 |---|---|---|
-| 256B | 1,028 | 284 |
-| 1KB | 2,052 | 1,052 |
-| 10KB | 14,341 | 10,268 |
-| 100KB | 137,222 | 102,430 |
-| 1MB | 1,398,791 | 1,048,606 |
+| 256B | 41 | 83,460 |
+| 1KB | 41 | 68,650 |
+| 10KB | 40 | 18,686 |
+| 100KB | 38 | 1,819 |
+| 1MB | 25 | 181 |
+
+#### Wire overhead (bytes)
+
+| Payload | bittensor | lightning |
+|---|---|---|
+| 256B | 1,008 | 284 |
+| 1KB | 2,032 | 1,052 |
+| 10KB | 14,321 | 10,268 |
+| 100KB | 137,202 | 102,430 |
+| 1MB | 1,398,771 | 1,048,606 |
 
 </details>

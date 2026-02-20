@@ -70,7 +70,9 @@ struct BenchResults {
     wire_bytes: HashMap<String, usize>,
 }
 
-async fn start_server() -> (
+async fn start_server(
+    miner_hk: &str,
+) -> (
     Arc<LightningServer>,
     tokio::task::JoinHandle<Result<()>>,
     u16,
@@ -80,7 +82,7 @@ async fn start_server() -> (
         ..Default::default()
     };
     let mut server =
-        LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
+        LightningServer::with_config(miner_hk.into(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
     server
         .register_synapse_handler("echo".into(), Arc::new(EchoHandler))
@@ -94,12 +96,17 @@ async fn start_server() -> (
     (server, handle, port)
 }
 
-async fn make_client(port: u16) -> (LightningClient, QuicAxonInfo) {
-    let mut client = LightningClient::new(validator_hotkey());
-    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+async fn make_client(
+    validator_hk: &str,
+    miner_hk: &str,
+    signer: Sr25519Signer,
+    port: u16,
+) -> (LightningClient, QuicAxonInfo) {
+    let mut client = LightningClient::new(validator_hk.into());
+    client.set_signer(Box::new(signer));
     client.create_endpoint().await.unwrap();
     let axon = QuicAxonInfo {
-        hotkey: miner_hotkey(),
+        hotkey: miner_hk.into(),
         ip: "127.0.0.1".into(),
         port,
         protocol: 4,
@@ -142,13 +149,17 @@ const PAYLOAD_SIZES: &[(&str, usize)] = &[
 async fn main() {
     eprintln!("lightning benchmark");
 
+    let miner_hk = miner_hotkey();
+    let validator_hk = validator_hotkey();
+
     eprintln!("  measuring connection setup ({SETUP_ITERATIONS} iterations)...");
     let mut setup_times = Vec::with_capacity(SETUP_ITERATIONS);
     let warmup_data = payload(64);
     for i in 0..SETUP_ITERATIONS {
-        let (server, handle, port) = start_server().await;
+        let (server, handle, port) = start_server(&miner_hk).await;
+        let signer = Sr25519Signer::from_seed(VALIDATOR_SEED);
         let start = Instant::now();
-        let (client, axon) = make_client(port).await;
+        let (client, axon) = make_client(&validator_hk, &miner_hk, signer, port).await;
         let resp = client
             .query_axon(axon, request(warmup_data.clone()))
             .await
@@ -170,8 +181,9 @@ async fn main() {
         p99: percentile(&setup_times, 99.0),
     };
 
-    let (server, handle, port) = start_server().await;
-    let (client, axon) = make_client(port).await;
+    let (server, handle, port) = start_server(&miner_hk).await;
+    let signer = Sr25519Signer::from_seed(VALIDATOR_SEED);
+    let (client, axon) = make_client(&validator_hk, &miner_hk, signer, port).await;
     let client = Arc::new(client);
 
     let mut latency_ms = HashMap::new();
