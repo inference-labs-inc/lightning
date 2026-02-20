@@ -1,6 +1,7 @@
 import sys
 import traceback
-from typing import Callable, Dict, Any, List, Optional, Iterator
+from typing import Callable, Dict, Any, List, Optional, Iterator, TypedDict
+from typing_extensions import NotRequired
 
 from btlightning._native import (
     RustLightning,
@@ -10,6 +11,37 @@ from btlightning._native import (
 )
 
 LIGHTNING_AVAILABLE = True
+
+
+class AxonInfo(TypedDict):
+    hotkey: str
+    ip: str
+    port: int
+    protocol: NotRequired[int]  # IP protocol version (default 4 = IPv4)
+    placeholder1: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
+    placeholder2: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
+
+
+class SynapseRequest(TypedDict):
+    synapse_type: str
+    data: Dict[str, Any]
+
+
+class SynapseResponse(TypedDict):
+    success: bool
+    data: Dict[str, Any]
+    latency_ms: float
+    error: Optional[str]
+
+
+class ClientConnectionStats(TypedDict):
+    total_connections: str
+    active_miners: str
+
+
+class ServerConnectionStats(TypedDict):
+    total_connections: str
+    verified_connections: str
 
 
 class Lightning:
@@ -37,7 +69,7 @@ class Lightning:
     def set_validator_keypair(self, keypair_seed: bytes) -> None:
         return self._rust_client.set_validator_keypair(list(keypair_seed))
 
-    def set_python_signer(self, signer_callback) -> None:
+    def set_python_signer(self, signer_callback: Callable[[bytes], bytes]) -> None:
         return self._rust_client.set_python_signer(signer_callback)
 
     def set_wallet(
@@ -48,26 +80,26 @@ class Lightning:
     ) -> None:
         return self._rust_client.set_wallet(wallet_name, wallet_path, hotkey_name)
 
-    def initialize_connections(self, miners: List[Dict[str, Any]]) -> None:
+    def initialize_connections(self, miners: List[AxonInfo]) -> None:
         return self._rust_client.initialize_connections(miners)
 
     def query_axon(
         self,
-        axon_info: Dict[str, Any],
-        request: Dict[str, Any],
+        axon_info: AxonInfo,
+        request: SynapseRequest,
         timeout_secs: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> SynapseResponse:
         return self._rust_client.query_axon(axon_info, request, timeout_secs=timeout_secs)
 
     def query_axon_stream(
-        self, axon_info: Dict[str, Any], request: Dict[str, Any]
+        self, axon_info: AxonInfo, request: SynapseRequest
     ) -> Iterator[bytes]:
         return self._rust_client.query_axon_stream(axon_info, request)
 
-    def update_miner_registry(self, miners: List[Dict[str, Any]]) -> None:
+    def update_miner_registry(self, miners: List[AxonInfo]) -> None:
         return self._rust_client.update_miner_registry(miners)
 
-    def get_connection_stats(self) -> Dict[str, str]:
+    def get_connection_stats(self) -> ClientConnectionStats:
         return self._rust_client.get_connection_stats()
 
     def close(self) -> None:
@@ -90,6 +122,7 @@ class LightningServer:
         idle_timeout_secs: Optional[int] = None,
         keep_alive_interval_secs: Optional[int] = None,
         nonce_cleanup_interval_secs: Optional[int] = None,
+        max_nonce_entries: Optional[int] = None,
     ):
         self._rust_server = RustLightningServer(
             miner_hotkey,
@@ -99,6 +132,7 @@ class LightningServer:
             idle_timeout_secs=idle_timeout_secs,
             keep_alive_interval_secs=keep_alive_interval_secs,
             nonce_cleanup_interval_secs=nonce_cleanup_interval_secs,
+            max_nonce_entries=max_nonce_entries,
         )
 
     def set_miner_keypair(self, keypair_seed: bytes) -> None:
@@ -128,7 +162,7 @@ class LightningServer:
     def serve_forever(self) -> None:
         return self._rust_server.serve_forever()
 
-    def get_connection_stats(self) -> Dict[str, str]:
+    def get_connection_stats(self) -> ServerConnectionStats:
         return self._rust_server.get_connection_stats()
 
     def cleanup_stale_connections(self, max_idle_seconds: int = 300) -> None:
@@ -145,11 +179,16 @@ class LightningServer:
 
 
 __all__ = [
+    "AxonInfo",
+    "ClientConnectionStats",
     "Lightning",
     "LightningServer",
-    "RustLightning",
-    "RustLightningServer",
+    "LIGHTNING_AVAILABLE",
     "PyStreamingResponse",
     "QuicAxonInfo",
-    "LIGHTNING_AVAILABLE",
+    "RustLightning",
+    "RustLightningServer",
+    "ServerConnectionStats",
+    "SynapseRequest",
+    "SynapseResponse",
 ]

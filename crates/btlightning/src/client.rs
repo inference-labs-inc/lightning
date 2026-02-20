@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 pub struct LightningClientConfig {
     pub connect_timeout: Duration,
@@ -73,7 +73,9 @@ impl StreamingResponse {
                 if end.success {
                     Ok(None)
                 } else {
-                    Err(LightningError::Stream(end.error.unwrap_or_default()))
+                    Err(LightningError::Stream(end.error.unwrap_or_else(|| {
+                        "stream ended with failure status".to_string()
+                    })))
                 }
             }
             Ok((MessageType::SynapseResponse, payload)) => {
@@ -156,6 +158,7 @@ impl LightningClient {
         Ok(())
     }
 
+    #[instrument(skip(self, miners), fields(miner_count = miners.len()))]
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
 
@@ -219,6 +222,7 @@ impl LightningClient {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn create_endpoint(&mut self) -> Result<()> {
         let mut tls_config = RustlsClientConfig::builder()
             .with_safe_defaults()
@@ -250,6 +254,7 @@ impl LightningClient {
         Ok(())
     }
 
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon(
         &self,
         axon_info: QuicAxonInfo,
@@ -273,6 +278,7 @@ impl LightningClient {
         }
     }
 
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port, timeout_ms = timeout.as_millis() as u64))]
     pub async fn query_axon_with_timeout(
         &self,
         axon_info: QuicAxonInfo,
@@ -284,6 +290,7 @@ impl LightningClient {
             .map_err(|_| LightningError::Transport("query timed out".into()))?
     }
 
+    #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon_stream(
         &self,
         axon_info: QuicAxonInfo,
@@ -417,6 +424,7 @@ impl LightningClient {
         }
     }
 
+    #[instrument(skip(self, miners), fields(miner_count = miners.len()))]
     pub async fn update_miner_registry(&self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         let current_miners: HashMap<String, QuicAxonInfo> = miners
             .iter()
@@ -484,6 +492,7 @@ impl LightningClient {
                 .clone();
             let timeout = self.config.connect_timeout;
 
+            let pending_keys: Vec<String> = new_miner_keys.iter().map(|(k, _)| k.clone()).collect();
             let mut set = tokio::task::JoinSet::new();
             for (key, miner) in new_miner_keys {
                 info!("New miner detected, establishing QUIC connection: {}", key);
@@ -525,11 +534,18 @@ impl LightningClient {
                     }
                 }
             }
+
+            for key in &pending_keys {
+                if !state.established_connections.contains_key(key) {
+                    state.active_miners.remove(key);
+                }
+            }
         }
 
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
         let state = self.state.read().await;
 
@@ -552,6 +568,7 @@ impl LightningClient {
         Ok(stats)
     }
 
+    #[instrument(skip(self))]
     pub async fn close_all_connections(&self) -> Result<()> {
         let mut state = self.state.write().await;
 
@@ -598,7 +615,11 @@ async fn connect_and_handshake(
     let nonce = generate_nonce();
     let timestamp = unix_timestamp_secs();
     let message = handshake_request_message(&wallet_hotkey, timestamp, &nonce, &peer_cert_fp_b64);
-    let signature_bytes = signer.sign(message.as_bytes())?;
+    let msg_bytes = message.into_bytes();
+    let signer_clone = signer.clone();
+    let signature_bytes = tokio::task::spawn_blocking(move || signer_clone.sign(&msg_bytes))
+        .await
+        .map_err(|e| LightningError::Signing(format!("signer task failed: {}", e)))??;
 
     let handshake_request = HandshakeRequest {
         validator_hotkey: wallet_hotkey.clone(),
@@ -768,65 +789,9 @@ async fn send_synapse_packet(
                 error: synapse_response.error,
             })
         }
-        MessageType::StreamChunk => {
-            let first_chunk: StreamChunk = rmp_serde::from_slice(&payload).map_err(|e| {
-                LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
-            })?;
-
-            let initial_capacity = (first_chunk.data.len() * 4).min(MAX_RESPONSE_SIZE);
-            let mut all_data = Vec::with_capacity(initial_capacity);
-            all_data.extend_from_slice(&first_chunk.data);
-            loop {
-                let (frame_type, frame_payload) = read_frame(&mut recv).await?;
-                match frame_type {
-                    MessageType::StreamChunk => {
-                        let chunk: StreamChunk =
-                            rmp_serde::from_slice(&frame_payload).map_err(|e| {
-                                LightningError::Serialization(format!(
-                                    "Failed to parse stream chunk: {}",
-                                    e
-                                ))
-                            })?;
-                        if all_data.len() + chunk.data.len() > MAX_RESPONSE_SIZE {
-                            return Err(LightningError::Stream(format!(
-                                "streaming response exceeded {} byte limit",
-                                MAX_RESPONSE_SIZE
-                            )));
-                        }
-                        all_data.extend_from_slice(&chunk.data);
-                    }
-                    MessageType::StreamEnd => {
-                        let end: StreamEnd =
-                            rmp_serde::from_slice(&frame_payload).map_err(|e| {
-                                LightningError::Serialization(format!(
-                                    "Failed to parse stream end: {}",
-                                    e
-                                ))
-                            })?;
-                        if !end.success {
-                            return Err(LightningError::Stream(end.error.unwrap_or_default()));
-                        }
-                        break;
-                    }
-                    other => {
-                        return Err(LightningError::Stream(format!(
-                            "unexpected frame type during streaming collection: {:?}",
-                            other
-                        )));
-                    }
-                }
-            }
-
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let mut data = HashMap::new();
-            data.insert("raw".to_string(), rmpv::Value::Binary(all_data));
-            Ok(QuicResponse {
-                success: true,
-                data,
-                latency_ms,
-                error: None,
-            })
-        }
+        MessageType::StreamChunk => Err(LightningError::Transport(
+            "received StreamChunk on non-streaming query; use query_axon_stream for streaming synapses".to_string(),
+        )),
         other => Err(LightningError::Transport(format!(
             "unexpected response type: {:?}",
             other

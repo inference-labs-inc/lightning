@@ -593,6 +593,36 @@ async fn read_exact_from_recv(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(
     Ok(())
 }
 
+const INCREMENTAL_READ_THRESHOLD: usize = 1_048_576;
+const READ_CHUNK_SIZE: usize = 65_536;
+
+pub fn parse_frame_header(data: &[u8]) -> Result<(MessageType, &[u8])> {
+    if data.len() < FRAME_HEADER_SIZE {
+        return Err(LightningError::Transport(
+            "insufficient data for frame header".to_string(),
+        ));
+    }
+    let msg_type = MessageType::try_from(data[0])?;
+    let payload_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(LightningError::Transport(format!(
+            "frame payload {} bytes exceeds maximum {}",
+            payload_len, MAX_FRAME_PAYLOAD
+        )));
+    }
+    if data.len() < FRAME_HEADER_SIZE + payload_len {
+        return Err(LightningError::Transport(format!(
+            "insufficient data for frame payload: have {}, need {}",
+            data.len() - FRAME_HEADER_SIZE,
+            payload_len
+        )));
+    }
+    Ok((
+        msg_type,
+        &data[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len],
+    ))
+}
+
 pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     read_exact_from_recv(recv, &mut header).await?;
@@ -607,11 +637,37 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
         )));
     }
 
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        read_exact_from_recv(recv, &mut payload).await?;
+    if payload_len == 0 {
+        return Ok((msg_type, Vec::new()));
     }
 
+    // Payloads up to 1MB are allocated in one shot. Larger payloads are read
+    // incrementally in 64KB chunks to bound peak memory when the declared
+    // payload_len has not yet been validated against actual stream data.
+    if payload_len <= INCREMENTAL_READ_THRESHOLD {
+        let mut payload = vec![0u8; payload_len];
+        read_exact_from_recv(recv, &mut payload).await?;
+        return Ok((msg_type, payload));
+    }
+
+    let mut payload = Vec::with_capacity(INCREMENTAL_READ_THRESHOLD);
+    let mut remaining = payload_len;
+    while remaining > 0 {
+        let next_capacity = payload
+            .capacity()
+            .saturating_mul(2)
+            .max(INCREMENTAL_READ_THRESHOLD)
+            .min(payload_len)
+            .min(MAX_FRAME_PAYLOAD);
+        if payload.capacity() < next_capacity {
+            payload.reserve(next_capacity - payload.len());
+        }
+        let chunk_size = remaining.min(READ_CHUNK_SIZE);
+        let start = payload.len();
+        payload.resize(start + chunk_size, 0);
+        read_exact_from_recv(recv, &mut payload[start..]).await?;
+        remaining -= chunk_size;
+    }
     Ok((msg_type, payload))
 }
 
@@ -803,5 +859,126 @@ mod tests {
             msg,
             "handshake_response:5GrwvaEF:5FHneW46:1234567890:abc123:fp_b64"
         );
+    }
+
+    #[test]
+    fn parse_frame_header_valid() {
+        let mut data = vec![0x01];
+        data.extend_from_slice(&5u32.to_be_bytes());
+        data.extend_from_slice(b"hello");
+        let (msg_type, payload) = parse_frame_header(&data).unwrap();
+        assert_eq!(msg_type, MessageType::HandshakeRequest);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn parse_frame_header_insufficient_header() {
+        assert!(parse_frame_header(&[0x01, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_frame_header_insufficient_payload() {
+        let mut data = vec![0x01];
+        data.extend_from_slice(&10u32.to_be_bytes());
+        data.extend_from_slice(b"short");
+        assert!(parse_frame_header(&data).is_err());
+    }
+
+    #[test]
+    fn parse_frame_header_oversized_payload() {
+        let mut data = vec![0x01];
+        data.extend_from_slice(&(MAX_FRAME_PAYLOAD as u32 + 1).to_be_bytes());
+        assert!(parse_frame_header(&data).is_err());
+    }
+
+    #[test]
+    fn parse_frame_header_invalid_message_type() {
+        let mut data = vec![0xFF];
+        data.extend_from_slice(&0u32.to_be_bytes());
+        assert!(parse_frame_header(&data).is_err());
+    }
+
+    use proptest::prelude::*;
+
+    fn arb_rmpv_leaf() -> impl Strategy<Value = rmpv::Value> {
+        prop_oneof![
+            Just(rmpv::Value::Nil),
+            any::<bool>().prop_map(rmpv::Value::Boolean),
+            any::<i64>().prop_map(|v| rmpv::Value::Integer(rmpv::Integer::from(v))),
+            any::<u64>().prop_map(|v| rmpv::Value::Integer(rmpv::Integer::from(v))),
+            any::<f32>().prop_map(rmpv::Value::F32),
+            any::<f64>().prop_map(rmpv::Value::F64),
+            "[a-zA-Z0-9_ ]{0,32}"
+                .prop_map(|s| rmpv::Value::String(rmpv::Utf8String::from(s.as_str()))),
+            proptest::collection::vec(any::<u8>(), 0..64).prop_map(rmpv::Value::Binary),
+        ]
+    }
+
+    fn arb_rmpv_value() -> impl Strategy<Value = rmpv::Value> {
+        arb_rmpv_leaf().prop_recursive(3, 32, 8, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..8).prop_map(rmpv::Value::Array),
+                proptest::collection::vec((inner.clone(), inner), 0..8).prop_map(rmpv::Value::Map),
+            ]
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn msgpack_encode_decode_roundtrip(value in arb_rmpv_value()) {
+            let bytes = rmp_serde::to_vec(&value).unwrap();
+            let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+            prop_assert_eq!(value, decoded);
+        }
+
+        #[test]
+        fn serialize_to_rmpv_map_roundtrip(
+            keys in proptest::collection::vec("[a-z]{1,8}", 1..8),
+            vals in proptest::collection::vec(arb_rmpv_leaf(), 1..8),
+        ) {
+            let mut map = HashMap::new();
+            for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                map.insert(k, v);
+            }
+            let rmpv_map = hashmap_to_rmpv_map(map);
+            let bytes = rmp_serde::to_vec(&rmpv_map).unwrap();
+            let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+            prop_assert_eq!(rmpv_map, decoded);
+        }
+
+        #[test]
+        fn from_typed_roundtrip(
+            name in "[a-zA-Z]{1,16}",
+            count in any::<u32>(),
+            label in "[a-zA-Z0-9 ]{0,32}",
+        ) {
+            #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+            struct TestStruct {
+                name: String,
+                count: u32,
+                label: String,
+            }
+
+            let original = TestStruct {
+                name: name.clone(),
+                count,
+                label: label.clone(),
+            };
+
+            let req = QuicRequest::from_typed("test", &original).unwrap();
+            let resp = QuicResponse {
+                success: true,
+                data: req.data,
+                latency_ms: 0.0,
+                error: None,
+            };
+            let deserialized: TestStruct = resp.deserialize_data().unwrap();
+            prop_assert_eq!(original, deserialized);
+        }
+
+        #[test]
+        fn parse_frame_header_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = parse_frame_header(&data);
+        }
     }
 }

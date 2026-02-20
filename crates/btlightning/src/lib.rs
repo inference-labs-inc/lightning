@@ -15,6 +15,6 @@ pub use server::{
 pub use signing::BtWalletSigner;
 pub use signing::{CallbackSigner, Signer, Sr25519Signer};
 pub use types::{
-    serialize_to_rmpv_map, HandshakeRequest, HandshakeResponse, QuicAxonInfo, QuicRequest,
-    QuicResponse, SynapsePacket, SynapseResponse,
+    parse_frame_header, serialize_to_rmpv_map, HandshakeRequest, HandshakeResponse, MessageType,
+    QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket, SynapseResponse,
 };

@@ -1,6 +1,6 @@
 use btlightning::{LightningError, Result, StreamingSynapseHandler, SynapseHandler};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyInt, PyList};
 use std::collections::HashMap;
 
 pub struct PythonSynapseHandler {
@@ -130,7 +130,10 @@ pub fn msgpack_value_to_py(py: Python, value: &rmpv::Value) -> PyResult<Py<PyAny
             } else if let Some(v) = i.as_u64() {
                 Ok(v.into_pyobject(py)?.into_any().unbind())
             } else {
-                Ok(py.None())
+                Err(pyo3::exceptions::PyOverflowError::new_err(format!(
+                    "msgpack integer {} cannot be represented as i64 or u64",
+                    i
+                )))
             }
         }
         rmpv::Value::F32(f) => Ok(f.into_pyobject(py)?.into_any().unbind()),
@@ -169,6 +172,10 @@ pub fn py_to_msgpack_value(value: &Bound<'_, pyo3::PyAny>) -> PyResult<rmpv::Val
         Ok(rmpv::Value::Integer(rmpv::Integer::from(i)))
     } else if let Ok(u) = value.extract::<u64>() {
         Ok(rmpv::Value::Integer(rmpv::Integer::from(u)))
+    } else if value.downcast::<PyInt>().is_ok() {
+        Err(pyo3::exceptions::PyOverflowError::new_err(
+            "integer too large for msgpack representation (must fit i64 or u64)",
+        ))
     } else if let Ok(f) = value.extract::<f64>() {
         Ok(rmpv::Value::F64(f))
     } else if let Ok(s) = value.extract::<String>() {
