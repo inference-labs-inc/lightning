@@ -70,7 +70,8 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 | Color | System |
 |---|---|
 | ![bittensor](https://img.shields.io/badge/-808080?style=flat-square) | bittensor |
-| ![lightning](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning |
+| ![lightning-py](https://img.shields.io/badge/-FF8C00?style=flat-square) | lightning (Python) |
+| ![lightning](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning (Rust) |
 
 ### Latency p50
 
@@ -82,7 +83,7 @@ config:
     themeVariables:
         xyChart:
             backgroundColor: "#000000"
-            plotColorPalette: "#808080, #FFE000"
+            plotColorPalette: "#808080, #FF8C00, #FFE000"
             titleColor: "#ffffff"
             xAxisLabelColor: "#aaaaaa"
             xAxisTitleColor: "#cccccc"
@@ -97,7 +98,8 @@ xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
     y-axis "log10(us)" 0 --> 5
     bar "bittensor" [4.39, 4.38, 4.39, 4.42, 4.61]
-    bar "lightning" [1.70, 1.70, 2.04, 2.84, 3.87]
+    bar "lightning (Python)" [1.90, 1.90, 2.36, 3.27, 4.31]
+    bar "lightning (Rust)" [1.70, 1.70, 2.04, 2.84, 3.87]
 ```
 
 ### Throughput (req/s)
@@ -110,7 +112,7 @@ config:
     themeVariables:
         xyChart:
             backgroundColor: "#000000"
-            plotColorPalette: "#808080, #FFE000"
+            plotColorPalette: "#FFE000, #FF8C00, #808080"
             titleColor: "#ffffff"
             xAxisLabelColor: "#aaaaaa"
             xAxisTitleColor: "#cccccc"
@@ -124,8 +126,9 @@ config:
 xychart-beta
     x-axis ["256B", "1KB", "10KB", "100KB", "1MB"]
     y-axis "log10(req/s)" 0 --> 5
+    bar "lightning (Rust)" [4.92, 4.84, 4.27, 3.26, 2.26]
+    bar "lightning (Python)" [4.55, 4.42, 3.83, 2.94, 1.94]
     bar "bittensor" [1.61, 1.61, 1.60, 1.57, 1.40]
-    bar "lightning" [4.92, 4.84, 4.27, 3.26, 2.26]
 ```
 
 <details>
