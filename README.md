@@ -23,7 +23,10 @@ Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handle
 | Throughput (1KB) | 61 req/s | 67,210 req/s |
 | Wire size (1KB payload) | 2,052 bytes | 1,052 bytes |
 
-**Legend:** <svg width="12" height="12"><rect width="12" height="12" fill="#808080"/></svg> bittensor &nbsp; <svg width="12" height="12"><rect width="12" height="12" fill="#FFE000"/></svg> lightning
+| Color | System |
+|---|---|
+| ![](https://img.shields.io/badge/-808080?style=flat-square) | bittensor |
+| ![](https://img.shields.io/badge/-FFE000?style=flat-square) | lightning |
 
 ### Latency p50 (ms)
 
