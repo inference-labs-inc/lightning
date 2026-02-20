@@ -335,12 +335,15 @@ async fn server_stop_closes_connections() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    let (client, _axon) = connect_client(port).await;
+    let (client, axon) = connect_client(port).await;
 
     server.stop().await.unwrap();
     let _ = server_handle.await;
 
-    client.close_all_connections().await.unwrap();
+    let result = client.query_axon(axon, build_request("echo")).await;
+    assert!(result.is_err(), "query should fail after server stop");
+
+    let _ = client.close_all_connections().await;
 }
 
 #[tokio::test]
@@ -406,7 +409,8 @@ async fn nonce_accounting_increments() {
     );
 
     client.close_all_connections().await.unwrap();
-    server_handle.abort();
+    let _ = server.stop().await;
+    let _ = server_handle.await;
 }
 
 // --- Sync Handler Dispatch ---
@@ -668,7 +672,16 @@ async fn streaming_client_drops_early() {
     let _ = stream.next_chunk().await;
     drop(stream);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stream2 = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("bigstream"))
+        .await
+        .unwrap();
+    let chunk = stream2.next_chunk().await.unwrap();
+    assert!(
+        chunk.is_some(),
+        "server should remain operational after client drops stream"
+    );
 
     env.shutdown().await;
 }
@@ -726,9 +739,11 @@ async fn query_timeout_triggers() {
     };
 
     let result = client
-        .query_axon_with_timeout(bad_axon, build_request("echo"), Duration::from_millis(100))
+        .query_axon_with_timeout(bad_axon, build_request("echo"), Duration::from_millis(500))
         .await;
     assert!(result.is_err());
+
+    let _ = client.close_all_connections().await;
 }
 
 // --- Typed Handler Roundtrips ---
