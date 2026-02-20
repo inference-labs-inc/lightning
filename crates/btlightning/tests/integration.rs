@@ -1048,6 +1048,8 @@ async fn handshake_rate_limiting_rejects_excess_attempts() {
 #[tokio::test]
 async fn handshake_timeout_rejects_slow_signing() {
     let real_signer = Sr25519Signer::from_seed(MINER_SEED);
+    // std::thread::sleep is intentional: the signer runs via spawn_blocking
+    // on the blocking thread pool, so tokio::time::sleep would not work.
     let slow_signer = CallbackSigner::new(move |msg: &[u8]| {
         let sig = real_signer.sign(msg);
         std::thread::sleep(Duration::from_millis(1100));
@@ -1114,7 +1116,7 @@ async fn validator_without_permit_rejected() {
     let s = server.clone();
     let server_handle = tokio::spawn(async move { s.serve_forever().await });
 
-    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (client, _axon) = connect_client(port).await;
     let stats = client.get_connection_stats().await.unwrap();

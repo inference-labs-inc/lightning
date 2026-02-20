@@ -433,11 +433,11 @@ impl LightningServer {
         *self.cleanup_handle.lock().await = Some(handle);
 
         if self.ctx.config.require_validator_permit && self.ctx.permit_resolver.is_none() {
-            warn!("require_validator_permit is enabled but no ValidatorPermitResolver is configured -- all handshakes will be rejected");
+            error!("require_validator_permit is enabled but no ValidatorPermitResolver is configured -- all handshakes will be rejected");
         }
 
         if !self.ctx.config.require_validator_permit {
-            warn!("Validator permit checking is DISABLED -- any hotkey with a valid signature can connect");
+            info!("Validator permit checking is disabled -- any hotkey with a valid signature can connect");
         }
 
         {
@@ -629,7 +629,7 @@ impl LightningServer {
                 if !Self::check_handshake_rate(&ctx, remote_ip).await {
                     warn!("Handshake rate limit exceeded for {}", remote_ip);
                     let reject = HandshakeResponse {
-                        miner_hotkey: ctx.miner_hotkey,
+                        miner_hotkey: String::new(),
                         timestamp: unix_timestamp_secs(),
                         signature: String::new(),
                         accepted: false,
@@ -652,7 +652,7 @@ impl LightningServer {
                     Err(e) => {
                         warn!("Failed to parse handshake request: {}", e);
                         let err_response = HandshakeResponse {
-                            miner_hotkey: ctx.miner_hotkey,
+                            miner_hotkey: String::new(),
                             timestamp: unix_timestamp_secs(),
                             signature: String::new(),
                             accepted: false,
@@ -1711,9 +1711,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn rate_limiter_allows_within_limit() {
-        let ctx = ServerContext {
+    fn test_server_context(config: LightningServerConfig) -> ServerContext {
+        ServerContext {
             connections: Arc::new(RwLock::new(HashMap::new())),
             addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
             synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
@@ -1726,11 +1725,16 @@ mod tests {
             miner_hotkey: String::new(),
             miner_signer: None,
             cert_fingerprint: Arc::new(RwLock::new(None)),
-            config: LightningServerConfig {
-                max_handshake_attempts_per_minute: 3,
-                ..Default::default()
-            },
-        };
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_allows_within_limit() {
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 3,
+            ..Default::default()
+        });
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
         assert!(LightningServer::check_handshake_rate(&ctx, ip).await);
@@ -1744,24 +1748,10 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_isolates_ips() {
-        let ctx = ServerContext {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
-            synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
-            async_handlers: Arc::new(RwLock::new(HashMap::new())),
-            streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
-            used_nonces: Arc::new(RwLock::new(HashMap::new())),
-            handshake_rate: Arc::new(RwLock::new(HashMap::new())),
-            permit_resolver: None,
-            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
-            miner_hotkey: String::new(),
-            miner_signer: None,
-            cert_fingerprint: Arc::new(RwLock::new(None)),
-            config: LightningServerConfig {
-                max_handshake_attempts_per_minute: 1,
-                ..Default::default()
-            },
-        };
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 1,
+            ..Default::default()
+        });
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
 
@@ -1778,25 +1768,11 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_evicts_oldest_ip_at_cap() {
-        let ctx = ServerContext {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            addr_to_hotkey: Arc::new(RwLock::new(HashMap::new())),
-            synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
-            async_handlers: Arc::new(RwLock::new(HashMap::new())),
-            streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
-            used_nonces: Arc::new(RwLock::new(HashMap::new())),
-            handshake_rate: Arc::new(RwLock::new(HashMap::new())),
-            permit_resolver: None,
-            permitted_validators: Arc::new(RwLock::new(HashSet::new())),
-            miner_hotkey: String::new(),
-            miner_signer: None,
-            cert_fingerprint: Arc::new(RwLock::new(None)),
-            config: LightningServerConfig {
-                max_handshake_attempts_per_minute: 10,
-                max_tracked_rate_ips: 2,
-                ..Default::default()
-            },
-        };
+        let ctx = test_server_context(LightningServerConfig {
+            max_handshake_attempts_per_minute: 10,
+            max_tracked_rate_ips: 2,
+            ..Default::default()
+        });
 
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
