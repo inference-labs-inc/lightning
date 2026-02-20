@@ -6,7 +6,7 @@ description = "QUIC transport layer for Bittensor"
 license = "MIT"
 repository = "https://github.com/inference-labs-inc/lightning"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 
 [lib]
 name = "btlightning"
