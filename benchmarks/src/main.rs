@@ -144,11 +144,17 @@ async fn main() {
 
     eprintln!("  measuring connection setup ({SETUP_ITERATIONS} iterations)...");
     let mut setup_times = Vec::with_capacity(SETUP_ITERATIONS);
+    let warmup_data = payload(64);
     for i in 0..SETUP_ITERATIONS {
         let (server, handle, port) = start_server().await;
         let start = Instant::now();
-        let (client, _axon) = make_client(port).await;
+        let (client, axon) = make_client(port).await;
+        let resp = client
+            .query_axon(axon, request(warmup_data.clone()))
+            .await
+            .unwrap();
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(resp.success);
         setup_times.push(elapsed);
         let _ = client.close_all_connections().await;
         let _ = server.stop().await;

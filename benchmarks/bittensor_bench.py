@@ -47,8 +47,12 @@ def percentile(sorted_vals: list[float], p: float) -> float:
 
 def wire_size(synapse: EchoSynapse) -> int:
     body = json.dumps(synapse.model_dump()).encode()
-    headers_est = len(str(synapse.to_headers()).encode())
-    return len(body) + headers_est
+    headers = synapse.to_headers()
+    header_bytes = sum(
+        len(k.encode()) + len(str(v).encode()) + 4
+        for k, v in headers.items()
+    )
+    return len(body) + header_bytes
 
 
 def start_axon(wallet, port: int) -> Axon:
@@ -112,18 +116,25 @@ async def main():
     throughput_rps = {}
     wire_bytes = {}
 
-    for label, size in PAYLOAD_SIZES:
-        data_str = make_payload(size)
-
-        synapse = EchoSynapse(data=data_str)
-        wire_bytes[label] = wire_size(synapse)
-
-        print(
-            f"  measuring latency {label} ({LATENCY_ITERATIONS} iterations)...",
-            file=sys.stderr,
+    async with Dendrite(wallet=wallet) as dendrite:
+        await dendrite.forward(
+            target,
+            synapse=EchoSynapse(data="warmup"),
+            timeout=30.0,
+            deserialize=False,
         )
-        times = []
-        async with Dendrite(wallet=wallet) as dendrite:
+
+        for label, size in PAYLOAD_SIZES:
+            data_str = make_payload(size)
+
+            synapse = EchoSynapse(data=data_str)
+            wire_bytes[label] = wire_size(synapse)
+
+            print(
+                f"  measuring latency {label} ({LATENCY_ITERATIONS} iterations)...",
+                file=sys.stderr,
+            )
+            times = []
             for _ in range(LATENCY_ITERATIONS):
                 start = time.perf_counter()
                 resp = await dendrite.forward(
@@ -135,29 +146,28 @@ async def main():
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
                 times.append(elapsed_ms)
 
-        times.sort()
-        latency_ms[label] = {
-            "p50": percentile(times, 50.0),
-            "p95": percentile(times, 95.0),
-            "p99": percentile(times, 99.0),
-        }
+            times.sort()
+            latency_ms[label] = {
+                "p50": percentile(times, 50.0),
+                "p95": percentile(times, 95.0),
+                "p99": percentile(times, 99.0),
+            }
 
-        print(
-            f"  measuring throughput {label} ({THROUGHPUT_TOTAL} requests, {CONCURRENCY} concurrent)...",
-            file=sys.stderr,
-        )
-        sem = asyncio.Semaphore(CONCURRENCY)
+            print(
+                f"  measuring throughput {label} ({THROUGHPUT_TOTAL} requests, {CONCURRENCY} concurrent)...",
+                file=sys.stderr,
+            )
+            sem = asyncio.Semaphore(CONCURRENCY)
 
-        async def single_request(d, t, data):
-            async with sem:
-                await d.forward(
-                    t,
-                    synapse=EchoSynapse(data=data),
-                    timeout=30.0,
-                    deserialize=False,
-                )
+            async def single_request(d, t, data):
+                async with sem:
+                    await d.forward(
+                        t,
+                        synapse=EchoSynapse(data=data),
+                        timeout=30.0,
+                        deserialize=False,
+                    )
 
-        async with Dendrite(wallet=wallet) as dendrite:
             start = time.perf_counter()
             tasks = [
                 single_request(dendrite, target, data_str)
@@ -166,7 +176,7 @@ async def main():
             await asyncio.gather(*tasks)
             elapsed = time.perf_counter() - start
 
-        throughput_rps[label] = THROUGHPUT_TOTAL / elapsed
+            throughput_rps[label] = THROUGHPUT_TOTAL / elapsed
 
     axon.stop()
 
