@@ -542,40 +542,44 @@ async fn async_handler_error_propagation() {
 
 #[tokio::test]
 async fn mixed_sync_async_handlers() {
-    let mut server = LightningServer::new(miner_hotkey(), "127.0.0.1".into(), 0).unwrap();
-    server.set_miner_keypair(MINER_SEED);
-    server
-        .register_synapse_handler("sync_echo".to_string(), Arc::new(EchoHandler))
-        .await
-        .unwrap();
-    server
-        .register_async_synapse_handler("async_echo".to_string(), Arc::new(AsyncEchoHandler))
-        .await
-        .unwrap();
-    server.start().await.unwrap();
-    let port = server.local_addr().unwrap().port();
+    let env = setup_with_register(
+        |s| {
+            Box::pin(async {
+                s.register_synapse_handler("sync_echo".to_string(), Arc::new(EchoHandler))
+                    .await?;
+                s.register_async_synapse_handler(
+                    "async_echo".to_string(),
+                    Arc::new(AsyncEchoHandler),
+                )
+                .await?;
+                Ok(())
+            })
+        },
+        None,
+    )
+    .await;
 
-    let server = Arc::new(server);
-    let s = server.clone();
-    let server_handle = tokio::spawn(async move { s.serve_forever().await });
-
-    let (client, axon) = connect_client(port).await;
-
-    let r1 = client
-        .query_axon(axon.clone(), build_request_with_data("sync_echo", "k", "v"))
+    let r1 = env
+        .client
+        .query_axon(
+            env.axon_info.clone(),
+            build_request_with_data("sync_echo", "k", "v"),
+        )
         .await
         .unwrap();
     assert!(r1.success);
 
-    let r2 = client
-        .query_axon(axon, build_request_with_data("async_echo", "k", "v"))
+    let r2 = env
+        .client
+        .query_axon(
+            env.axon_info.clone(),
+            build_request_with_data("async_echo", "k", "v"),
+        )
         .await
         .unwrap();
     assert!(r2.success);
 
-    client.close_all_connections().await.unwrap();
-    let _ = server.stop().await;
-    let _ = server_handle.await;
+    env.shutdown().await;
 }
 
 // --- Streaming Handler Dispatch ---
