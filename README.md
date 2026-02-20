@@ -50,7 +50,7 @@ maturin develop --manifest-path crates/btlightning-py/Cargo.toml
 
 ## Performance
 
-Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handler returns input unchanged. Connection setup includes first request-response round trip. Bittensor payloads are base64-encoded (JSON has no binary type), adding ~33% wire overhead beyond the nominal payload size. Source: [`benchmarks/`](benchmarks/).
+Benchmarked on Apple Silicon (M-series), macOS, loopback networking. Echo handler returns input unchanged. Connection setup includes first request-response round trip. Lightning authenticates once at connection time and amortizes over all subsequent requests; bittensor signs and verifies every request. Bittensor payloads are base64-encoded (JSON has no binary type), adding ~33% wire overhead beyond the nominal payload size. Source: [`benchmarks/`](benchmarks/).
 
 | | bittensor (dendrite/axon) | lightning (Python) | lightning (Rust) |
 |---|---|---|---|
