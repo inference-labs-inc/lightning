@@ -927,6 +927,7 @@ impl LightningServer {
             }
         })
         .await;
+        drop(rx);
 
         let end = if stream_result.is_err() {
             handle.abort();
