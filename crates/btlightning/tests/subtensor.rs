@@ -107,11 +107,9 @@ async fn subtensor_resolver_fetches_permits() {
 async fn subtensor_resolver_integrates_with_server() {
     let resolver = SubtensorPermitResolver::new(TESTNET_ENDPOINT.to_string(), 1);
 
-    let config = LightningServerConfig {
-        require_validator_permit: true,
-        validator_permit_refresh_secs: 3600,
-        ..Default::default()
-    };
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server = LightningServer::with_config(
         "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".into(),
         "127.0.0.1".into(),

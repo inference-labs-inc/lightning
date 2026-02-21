@@ -357,6 +357,7 @@ impl RustLightningServer {
         max_concurrent_bidi_streams=None,
         require_validator_permit=None,
         validator_permit_refresh_secs=None,
+        handler_timeout_secs=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -374,6 +375,7 @@ impl RustLightningServer {
         max_concurrent_bidi_streams: Option<u32>,
         require_validator_permit: Option<bool>,
         validator_permit_refresh_secs: Option<u64>,
+        handler_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -415,6 +417,9 @@ impl RustLightningServer {
         }
         if let Some(v) = validator_permit_refresh_secs {
             config.validator_permit_refresh_secs = v;
+        }
+        if let Some(v) = handler_timeout_secs {
+            config.handler_timeout_secs = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
