@@ -77,8 +77,7 @@ async fn start_server(
     tokio::task::JoinHandle<Result<()>>,
     u16,
 ) {
-    let mut config = LightningServerConfig::default();
-    config.require_validator_permit = false;
+    let config = LightningServerConfig::default();
     let mut server =
         LightningServer::with_config(miner_hk.into(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);

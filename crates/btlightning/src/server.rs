@@ -248,6 +248,12 @@ impl LightningServer {
                 "handler_timeout_secs must be non-zero".to_string(),
             ));
         }
+        if config.handler_timeout_secs > config.idle_timeout_secs {
+            return Err(LightningError::Config(format!(
+                "handler_timeout_secs ({}) must be <= idle_timeout_secs ({})",
+                config.handler_timeout_secs, config.idle_timeout_secs
+            )));
+        }
         Ok(Self {
             host,
             port,
@@ -626,12 +632,15 @@ impl LightningServer {
                     handlers.contains_key(&packet.synapse_type)
                 };
 
-                let handler_timeout =
-                    Duration::from_secs(ctx.config.handler_timeout_secs);
+                let handler_timeout = Duration::from_secs(ctx.config.handler_timeout_secs);
 
                 if is_streaming {
                     Self::handle_streaming_synapse_with_timeout(
-                        send, packet, connection, &ctx, handler_timeout,
+                        send,
+                        packet,
+                        connection,
+                        &ctx,
+                        handler_timeout,
                     )
                     .await;
                 } else {
@@ -643,7 +652,10 @@ impl LightningServer {
                     {
                         Ok(resp) => resp,
                         Err(_) => {
-                            warn!("Handler timed out after {}s", ctx.config.handler_timeout_secs);
+                            warn!(
+                                "Handler timed out after {}s",
+                                ctx.config.handler_timeout_secs
+                            );
                             SynapseResponse {
                                 success: false,
                                 data: HashMap::new(),
@@ -932,10 +944,7 @@ impl LightningServer {
 
         let end = if stream_result.is_err() {
             handle.abort();
-            warn!(
-                "Streaming handler timed out after {}s",
-                timeout.as_secs()
-            );
+            warn!("Streaming handler timed out after {}s", timeout.as_secs());
             StreamEnd {
                 success: false,
                 error: Some("handler timed out".to_string()),
@@ -1915,6 +1924,17 @@ mod tests {
     fn config_rejects_zero_handler_timeout() {
         let config = LightningServerConfig {
             handler_timeout_secs: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_handler_timeout_exceeding_idle() {
+        let config = LightningServerConfig {
+            handler_timeout_secs: 200,
+            idle_timeout_secs: 150,
             ..Default::default()
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);

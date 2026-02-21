@@ -250,6 +250,20 @@ impl StreamingSynapseHandler for ErrorStreamHandler {
     }
 }
 
+struct SlowStreamHandler;
+#[async_trait::async_trait]
+impl StreamingSynapseHandler for SlowStreamHandler {
+    async fn handle(
+        &self,
+        _synapse_type: &str,
+        _data: HashMap<String, rmpv::Value>,
+        _sender: mpsc::Sender<Vec<u8>>,
+    ) -> Result<()> {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(())
+    }
+}
+
 fn build_request(synapse_type: &str) -> QuicRequest {
     QuicRequest {
         synapse_type: synapse_type.to_string(),
@@ -320,8 +334,8 @@ async fn client_with_different_validator_key_connects() {
 
 #[tokio::test]
 async fn max_connections_enforcement() {
-        let mut config = LightningServerConfig::default();
-        config.max_connections = 1;
+    let mut config = LightningServerConfig::default();
+    config.max_connections = 1;
     let env = setup_with_config(config).await;
 
     let third_seed = [3u8; 32];
@@ -768,6 +782,55 @@ async fn query_timeout_triggers() {
     env.shutdown().await;
 }
 
+#[tokio::test]
+async fn server_handler_timeout_returns_error() {
+    let mut config = LightningServerConfig::default();
+    config.handler_timeout_secs = 1;
+    let st = "slow".to_string();
+    let h: Arc<dyn AsyncSynapseHandler> = Arc::new(SlowHandler);
+    let env = setup_with_register(
+        |s| Box::pin(s.register_async_synapse_handler(st, h)),
+        Some(config),
+    )
+    .await;
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("slow"))
+        .await
+        .unwrap();
+    assert!(!resp.success);
+    assert_eq!(resp.error.as_deref(), Some("handler timed out"));
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_streaming_handler_timeout_returns_error() {
+    let mut config = LightningServerConfig::default();
+    config.handler_timeout_secs = 1;
+    let st = "slowstream".to_string();
+    let h: Arc<dyn StreamingSynapseHandler> = Arc::new(SlowStreamHandler);
+    let env = setup_with_register(
+        |s| Box::pin(s.register_streaming_handler(st, h)),
+        Some(config),
+    )
+    .await;
+
+    let mut stream = env
+        .client
+        .query_axon_stream(env.axon_info.clone(), build_request("slowstream"))
+        .await
+        .unwrap();
+    let err = stream.next_chunk().await.unwrap_err();
+    assert!(
+        err.to_string().contains("handler timed out"),
+        "expected timeout error, got: {err}"
+    );
+
+    env.shutdown().await;
+}
+
 // --- Typed Handler Roundtrips ---
 
 #[tokio::test]
@@ -786,8 +849,8 @@ async fn typed_sync_handler_integration() {
         Ok(AddResp { sum: req.a + req.b })
     });
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -832,8 +895,8 @@ async fn typed_async_handler_integration() {
         })
     });
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -865,9 +928,9 @@ async fn typed_async_handler_integration() {
 
 #[tokio::test]
 async fn nonce_cleanup_removes_expired() {
-        let mut config = LightningServerConfig::default();
-        config.max_signature_age_secs = 1;
-        config.nonce_cleanup_interval_secs = 1;
+    let mut config = LightningServerConfig::default();
+    config.max_signature_age_secs = 1;
+    config.nonce_cleanup_interval_secs = 1;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -996,9 +1059,9 @@ async fn streaming_error_does_not_leak_handler_details() {
 
 #[tokio::test]
 async fn handshake_rate_limiting_rejects_excess_attempts() {
-        let mut config = LightningServerConfig::default();
-        config.max_handshake_attempts_per_minute = 2;
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.max_handshake_attempts_per_minute = 2;
+    config.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1056,9 +1119,9 @@ async fn handshake_timeout_rejects_slow_signing() {
         sig
     });
 
-        let mut config = LightningServerConfig::default();
-        config.handshake_timeout_secs = 1;
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.handshake_timeout_secs = 1;
+    config.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_signer(Box::new(slow_signer));
@@ -1114,9 +1177,9 @@ impl ValidatorPermitResolver for FailingPermitResolver {
 
 #[tokio::test]
 async fn validator_without_permit_rejected() {
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 3600;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1154,9 +1217,9 @@ async fn validator_with_permit_accepted() {
     let mut permitted = HashSet::new();
     permitted.insert(validator_hotkey());
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 3600;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1195,8 +1258,8 @@ async fn validator_with_permit_accepted() {
 
 #[tokio::test]
 async fn permit_check_bypassed_when_disabled() {
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = false;
     let env = setup_with_config(config).await;
 
     let stats = env.client.get_connection_stats().await.unwrap();
@@ -1211,8 +1274,8 @@ async fn permit_check_bypassed_when_disabled() {
 
 #[tokio::test]
 async fn no_resolver_configured_rejects_when_required() {
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1238,9 +1301,9 @@ async fn no_resolver_configured_rejects_when_required() {
 
 #[tokio::test]
 async fn resolver_error_preserves_server_availability() {
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 3600;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1277,9 +1340,9 @@ async fn permit_cache_refresh_adds_validator() {
         permitted: permitted.clone(),
     };
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 1;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 1;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1342,9 +1405,9 @@ async fn permit_cache_refresh_removes_validator() {
         permitted: permitted.clone(),
     };
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 1;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 1;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1420,9 +1483,9 @@ async fn large_permit_set_handles_correctly() {
     }
     permitted.insert(validator_hotkey());
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 3600;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1465,9 +1528,9 @@ async fn large_permit_set_handles_correctly() {
 
 #[tokio::test]
 async fn server_processes_queries_during_rate_limiting() {
-        let mut config = LightningServerConfig::default();
-        config.max_handshake_attempts_per_minute = 3;
-        config.require_validator_permit = false;
+    let mut config = LightningServerConfig::default();
+    config.max_handshake_attempts_per_minute = 3;
+    config.require_validator_permit = false;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
@@ -1593,9 +1656,9 @@ async fn permit_rejected_does_not_degrade_permitted_client() {
     let mut permitted = HashSet::new();
     permitted.insert(validator_hotkey());
 
-        let mut config = LightningServerConfig::default();
-        config.require_validator_permit = true;
-        config.validator_permit_refresh_secs = 3600;
+    let mut config = LightningServerConfig::default();
+    config.require_validator_permit = true;
+    config.validator_permit_refresh_secs = 3600;
     let mut server =
         LightningServer::with_config(miner_hotkey(), "127.0.0.1".into(), 0, config).unwrap();
     server.set_miner_keypair(MINER_SEED);
