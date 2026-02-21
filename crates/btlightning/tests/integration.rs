@@ -794,11 +794,14 @@ async fn server_handler_timeout_returns_error() {
     )
     .await;
 
-    let resp = env
-        .client
-        .query_axon(env.axon_info.clone(), build_request("slow"))
-        .await
-        .unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        env.client
+            .query_axon(env.axon_info.clone(), build_request("slow")),
+    )
+    .await
+    .expect("server-side handler timeout did not fire within 5s")
+    .unwrap();
     assert!(!resp.success);
     assert_eq!(resp.error.as_deref(), Some("handler timed out"));
 
@@ -822,7 +825,10 @@ async fn server_streaming_handler_timeout_returns_error() {
         .query_axon_stream(env.axon_info.clone(), build_request("slowstream"))
         .await
         .unwrap();
-    let err = stream.next_chunk().await.unwrap_err();
+    let err = tokio::time::timeout(Duration::from_secs(5), stream.next_chunk())
+        .await
+        .expect("server-side streaming timeout did not fire within 5s")
+        .unwrap_err();
     assert!(
         err.to_string().contains("handler timed out"),
         "expected timeout error, got: {err}"

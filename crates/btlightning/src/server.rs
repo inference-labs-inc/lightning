@@ -248,9 +248,9 @@ impl LightningServer {
                 "handler_timeout_secs must be non-zero".to_string(),
             ));
         }
-        if config.handler_timeout_secs > config.idle_timeout_secs {
+        if config.handler_timeout_secs >= config.idle_timeout_secs {
             return Err(LightningError::Config(format!(
-                "handler_timeout_secs ({}) must be <= idle_timeout_secs ({})",
+                "handler_timeout_secs ({}) must be less than idle_timeout_secs ({})",
                 config.handler_timeout_secs, config.idle_timeout_secs
             )));
         }
@@ -1296,11 +1296,12 @@ impl LightningServer {
                 drop(handlers);
                 let synapse_type = packet.synapse_type;
                 let synapse_type_log = synapse_type.clone();
-                // SynapseHandler::handle runs on Tokio's blocking thread pool so
-                // tokio::time::timeout can preempt via the JoinHandle. Slow or
-                // unbounded implementations will occupy a blocking thread for their
-                // full duration — callers should keep sync handlers fast or use
-                // AsyncSynapseHandler for long-running work.
+                // SynapseHandler::handle runs on Tokio's blocking thread pool.
+                // tokio::time::timeout causes the waiting future to return Elapsed
+                // and drops the JoinHandle, but does NOT cancel or interrupt the
+                // underlying spawn_blocking task — it will run to completion and
+                // occupy a blocking thread for its full duration. Keep sync
+                // handlers fast or use AsyncSynapseHandler for long-running work.
                 match tokio::task::spawn_blocking(move || {
                     handler.handle(&synapse_type, packet.data)
                 })
@@ -1938,6 +1939,14 @@ mod tests {
             ..Default::default()
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+
+        let equal = LightningServerConfig {
+            handler_timeout_secs: 150,
+            idle_timeout_secs: 150,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, equal);
         assert!(result.is_err());
     }
 
