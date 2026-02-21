@@ -58,11 +58,22 @@ struct ClientState {
 
 impl ClientState {
     fn register_miner(&mut self, miner: QuicAxonInfo) {
-        let addr_key = miner.addr_key();
+        let new_addr_key = miner.addr_key();
         let hotkey = miner.hotkey.clone();
+        if let Some(old) = self.active_miners.get(&hotkey) {
+            let old_addr_key = old.addr_key();
+            if old_addr_key != new_addr_key {
+                if let Some(hotkeys) = self.addr_to_hotkeys.get_mut(&old_addr_key) {
+                    hotkeys.remove(&hotkey);
+                    if hotkeys.is_empty() {
+                        self.addr_to_hotkeys.remove(&old_addr_key);
+                    }
+                }
+            }
+        }
         self.active_miners.insert(hotkey.clone(), miner);
         self.addr_to_hotkeys
-            .entry(addr_key)
+            .entry(new_addr_key)
             .or_default()
             .insert(hotkey);
     }
@@ -258,32 +269,38 @@ impl LightningClient {
             ));
         }
 
-        let mut state = self.state.write().await;
-
+        let mut results = Vec::new();
         while let Some(join_result) = set.join_next().await {
             match join_result {
-                Ok((addr_key, conn_result, authenticated)) => match conn_result {
-                    Ok(connection) => {
-                        if authenticated.is_empty() {
-                            warn!(
-                                "No hotkeys authenticated at {}, dropping connection",
-                                addr_key
-                            );
-                            connection.close(0u32.into(), b"no_authenticated_hotkeys");
-                        } else {
-                            for miner in authenticated {
-                                info!("Authenticated miner {} at {}", miner.hotkey, addr_key);
-                                state.register_miner(miner);
-                            }
-                            state.established_connections.insert(addr_key, connection);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to {}: {}", addr_key, e);
-                    }
-                },
+                Ok((addr_key, conn_result, authenticated)) => {
+                    results.push((addr_key, conn_result, authenticated));
+                }
                 Err(e) => {
                     error!("Connection task panicked: {}", e);
+                }
+            }
+        }
+
+        let mut state = self.state.write().await;
+        for (addr_key, conn_result, authenticated) in results {
+            match conn_result {
+                Ok(connection) => {
+                    if authenticated.is_empty() {
+                        warn!(
+                            "No hotkeys authenticated at {}, dropping connection",
+                            addr_key
+                        );
+                        connection.close(0u32.into(), b"no_authenticated_hotkeys");
+                    } else {
+                        for miner in authenticated {
+                            info!("Authenticated miner {} at {}", miner.hotkey, addr_key);
+                            state.register_miner(miner);
+                        }
+                        state.established_connections.insert(addr_key, connection);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect to {}: {}", addr_key, e);
                 }
             }
         }
@@ -560,7 +577,7 @@ impl LightningClient {
                 }
             }
 
-            let active_addrs: Vec<String> =
+            let active_addrs: HashSet<String> =
                 state.active_miners.values().map(|m| m.addr_key()).collect();
             for addr_key in &active_addrs {
                 if state.reconnect_states.remove(addr_key).is_some() {
@@ -680,31 +697,37 @@ impl LightningClient {
                 ));
             }
 
-            let mut state = self.state.write().await;
-
+            let mut results = Vec::new();
             while let Some(join_result) = set.join_next().await {
                 match join_result {
-                    Ok((addr_key, conn_result, authenticated)) => match conn_result {
-                        Ok(connection) => {
-                            if authenticated.is_empty() {
-                                warn!(
-                                    "No hotkeys authenticated at {}, dropping connection",
-                                    addr_key
-                                );
-                                connection.close(0u32.into(), b"no_authenticated_hotkeys");
-                            } else {
-                                for miner in authenticated {
-                                    state.register_miner(miner);
-                                }
-                                state.established_connections.insert(addr_key, connection);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to connect to {}: {}", addr_key, e);
-                        }
-                    },
+                    Ok((addr_key, conn_result, authenticated)) => {
+                        results.push((addr_key, conn_result, authenticated));
+                    }
                     Err(e) => {
                         error!("Connection task panicked: {}", e);
+                    }
+                }
+            }
+
+            let mut state = self.state.write().await;
+            for (addr_key, conn_result, authenticated) in results {
+                match conn_result {
+                    Ok(connection) => {
+                        if authenticated.is_empty() {
+                            warn!(
+                                "No hotkeys authenticated at {}, dropping connection",
+                                addr_key
+                            );
+                            connection.close(0u32.into(), b"no_authenticated_hotkeys");
+                        } else {
+                            for miner in authenticated {
+                                state.register_miner(miner);
+                            }
+                            state.established_connections.insert(addr_key, connection);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to {}: {}", addr_key, e);
                     }
                 }
             }
@@ -1170,7 +1193,7 @@ mod tests {
 // Deliberately disables TLS PKI certificate validation. TLS still provides transport
 // encryption but not identity authentication. Authenticity is instead enforced at the
 // application layer: the handshake exchanges certificate fingerprints and verifies
-// sr25519 signatures over them (see connect_and_handshake / process_handshake).
+// sr25519 signatures over them (see connect_and_authenticate_per_address / authenticate_handshake).
 #[derive(Debug)]
 struct AcceptAnyCertVerifier;
 
