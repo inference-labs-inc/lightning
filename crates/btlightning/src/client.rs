@@ -794,11 +794,8 @@ async fn connect_and_authenticate_per_address(
         }
     };
 
-    let conn = match tokio::time::timeout(
-        timeout,
-        quic_connect(&endpoint, &first.ip, first.port),
-    )
-    .await
+    let conn = match tokio::time::timeout(timeout, quic_connect(&endpoint, &first.ip, first.port))
+        .await
     {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return (addr_key, Err(e), vec![]),
