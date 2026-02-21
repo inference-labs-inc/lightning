@@ -41,12 +41,13 @@ pub struct LightningServerConfig {
     pub require_validator_permit: bool,
     pub validator_permit_refresh_secs: u64,
     pub max_tracked_rate_ips: usize,
+    pub handler_timeout_secs: u64,
 }
 
 impl Default for LightningServerConfig {
     fn default() -> Self {
         Self {
-            max_signature_age_secs: 300,
+            max_signature_age_secs: 60,
             idle_timeout_secs: 150,
             keep_alive_interval_secs: 30,
             nonce_cleanup_interval_secs: 60,
@@ -58,6 +59,7 @@ impl Default for LightningServerConfig {
             require_validator_permit: false,
             validator_permit_refresh_secs: 1800,
             max_tracked_rate_ips: 10_000,
+            handler_timeout_secs: 30,
         }
     }
 }
@@ -238,6 +240,11 @@ impl LightningServer {
         if config.max_tracked_rate_ips == 0 {
             return Err(LightningError::Config(
                 "max_tracked_rate_ips must be non-zero".to_string(),
+            ));
+        }
+        if config.handler_timeout_secs == 0 {
+            return Err(LightningError::Config(
+                "handler_timeout_secs must be non-zero".to_string(),
             ));
         }
         Ok(Self {
@@ -618,11 +625,39 @@ impl LightningServer {
                     handlers.contains_key(&packet.synapse_type)
                 };
 
+                let handler_timeout =
+                    Duration::from_secs(ctx.config.handler_timeout_secs);
+
                 if is_streaming {
-                    Self::handle_streaming_synapse(send, packet, connection, &ctx).await;
+                    match tokio::time::timeout(
+                        handler_timeout,
+                        Self::handle_streaming_synapse(send, packet, connection, &ctx),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => {
+                            warn!("Streaming handler timed out after {}s", ctx.config.handler_timeout_secs);
+                        }
+                    }
                 } else {
-                    let response =
-                        Self::process_synapse_packet(packet, connection.clone(), &ctx).await;
+                    let response = match tokio::time::timeout(
+                        handler_timeout,
+                        Self::process_synapse_packet(packet, connection.clone(), &ctx),
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(_) => {
+                            warn!("Handler timed out after {}s", ctx.config.handler_timeout_secs);
+                            SynapseResponse {
+                                success: false,
+                                data: HashMap::new(),
+                                timestamp: unix_timestamp_secs(),
+                                error: Some("handler timed out".to_string()),
+                            }
+                        }
+                    };
                     match rmp_serde::to_vec(&response) {
                         Ok(bytes) => {
                             let _ = write_frame_and_finish(

@@ -177,6 +177,21 @@ impl LightningClient {
             .clone();
         let timeout = self.config.connect_timeout;
 
+        let miners = if miners.len() > self.config.max_connections {
+            warn!(
+                "Connection limit ({}) exceeded, skipping {} of {} miners",
+                self.config.max_connections,
+                miners.len() - self.config.max_connections,
+                miners.len()
+            );
+            miners
+                .into_iter()
+                .take(self.config.max_connections)
+                .collect::<Vec<_>>()
+        } else {
+            miners
+        };
+
         let mut set = tokio::task::JoinSet::new();
         for miner in miners {
             let ep = endpoint.clone();
