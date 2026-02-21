@@ -629,17 +629,10 @@ impl LightningServer {
                     Duration::from_secs(ctx.config.handler_timeout_secs);
 
                 if is_streaming {
-                    match tokio::time::timeout(
-                        handler_timeout,
-                        Self::handle_streaming_synapse(send, packet, connection, &ctx),
+                    Self::handle_streaming_synapse_with_timeout(
+                        send, packet, connection, &ctx, handler_timeout,
                     )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(_) => {
-                            warn!("Streaming handler timed out after {}s", ctx.config.handler_timeout_secs);
-                        }
-                    }
+                    .await;
                 } else {
                     let response = match tokio::time::timeout(
                         handler_timeout,
@@ -868,11 +861,12 @@ impl LightningServer {
         true
     }
 
-    async fn handle_streaming_synapse(
+    async fn handle_streaming_synapse_with_timeout(
         mut send: SendStream,
         packet: SynapsePacket,
         connection: Arc<quinn::Connection>,
         ctx: &ServerContext,
+        timeout: Duration,
     ) {
         if let Err(err_response) = Self::verify_synapse_auth(&connection, ctx).await {
             let end = StreamEnd {
@@ -913,39 +907,60 @@ impl LightningServer {
         let handle =
             tokio::spawn(async move { handler.handle(&synapse_type, packet.data, tx).await });
 
-        while let Some(chunk_data) = rx.recv().await {
-            let chunk = StreamChunk { data: chunk_data };
-            match rmp_serde::to_vec(&chunk) {
-                Ok(bytes) => {
-                    if let Err(e) = write_frame(&mut send, MessageType::StreamChunk, &bytes).await {
-                        error!("Failed to write stream chunk: {}", e);
-                        break;
+        let stream_result = tokio::time::timeout(timeout, async {
+            while let Some(chunk_data) = rx.recv().await {
+                let chunk = StreamChunk { data: chunk_data };
+                match rmp_serde::to_vec(&chunk) {
+                    Ok(bytes) => {
+                        if let Err(e) =
+                            write_frame(&mut send, MessageType::StreamChunk, &bytes).await
+                        {
+                            error!("Failed to write stream chunk: {}", e);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize stream chunk: {}", e);
+                        return;
                     }
                 }
-                Err(e) => {
-                    error!("Failed to serialize stream chunk: {}", e);
-                    break;
-                }
             }
-        }
+        })
+        .await;
 
-        let end = match handle.await {
-            Ok(Ok(())) => StreamEnd {
-                success: true,
-                error: None,
-            },
-            Ok(Err(e)) => {
-                error!("Streaming handler error: {}", e);
-                StreamEnd {
-                    success: false,
-                    error: Some("stream processing failed".to_string()),
-                }
+        let end = if stream_result.is_err() {
+            handle.abort();
+            warn!(
+                "Streaming handler timed out after {}s",
+                timeout.as_secs()
+            );
+            StreamEnd {
+                success: false,
+                error: Some("handler timed out".to_string()),
             }
-            Err(e) => {
-                error!("Streaming handler panicked: {}", e);
-                StreamEnd {
+        } else {
+            match handle.await {
+                Ok(Ok(())) => StreamEnd {
+                    success: true,
+                    error: None,
+                },
+                Ok(Err(e)) => {
+                    error!("Streaming handler error: {}", e);
+                    StreamEnd {
+                        success: false,
+                        error: Some("stream processing failed".to_string()),
+                    }
+                }
+                Err(e) if e.is_cancelled() => StreamEnd {
                     success: false,
                     error: Some("stream processing failed".to_string()),
+                },
+                Err(e) => {
+                    error!("Streaming handler panicked: {}", e);
+                    StreamEnd {
+                        success: false,
+                        error: Some("stream processing failed".to_string()),
+                    }
                 }
             }
         };
@@ -1265,15 +1280,30 @@ impl LightningServer {
             let handlers = ctx.synapse_handlers.read().await;
             if let Some(handler) = handlers.get(&packet.synapse_type).cloned() {
                 drop(handlers);
-                match handler.handle(&packet.synapse_type, packet.data) {
-                    Ok(response_data) => SynapseResponse {
+                let synapse_type = packet.synapse_type;
+                let synapse_type_log = synapse_type.clone();
+                match tokio::task::spawn_blocking(move || {
+                    handler.handle(&synapse_type, packet.data)
+                })
+                .await
+                {
+                    Ok(Ok(response_data)) => SynapseResponse {
                         success: true,
                         data: response_data,
                         timestamp: unix_timestamp_secs(),
                         error: None,
                     },
+                    Ok(Err(e)) => {
+                        error!("Handler error for {}: {}", synapse_type_log, e);
+                        SynapseResponse {
+                            success: false,
+                            data: HashMap::new(),
+                            timestamp: unix_timestamp_secs(),
+                            error: Some("request processing failed".to_string()),
+                        }
+                    }
                     Err(e) => {
-                        error!("Handler error for {}: {}", packet.synapse_type, e);
+                        error!("Handler task panicked for {}: {}", synapse_type_log, e);
                         SynapseResponse {
                             success: false,
                             data: HashMap::new(),
@@ -1865,6 +1895,16 @@ mod tests {
     fn config_rejects_zero_max_tracked_rate_ips() {
         let config = LightningServerConfig {
             max_tracked_rate_ips: 0,
+            ..Default::default()
+        };
+        let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_handler_timeout() {
+        let config = LightningServerConfig {
+            handler_timeout_secs: 0,
             ..Default::default()
         };
         let result = LightningServer::with_config("test".into(), "0.0.0.0".into(), 8443, config);

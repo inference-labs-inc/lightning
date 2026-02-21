@@ -177,16 +177,24 @@ impl LightningClient {
             .clone();
         let timeout = self.config.connect_timeout;
 
-        let miners = if miners.len() > self.config.max_connections {
+        let remaining_capacity = {
+            let state = self.state.read().await;
+            self.config
+                .max_connections
+                .saturating_sub(state.active_miners.len())
+        };
+
+        let miners = if miners.len() > remaining_capacity {
             warn!(
-                "Connection limit ({}) exceeded, skipping {} of {} miners",
+                "Connection limit ({}) reached with {} active, skipping {} of {} new miners",
                 self.config.max_connections,
-                miners.len() - self.config.max_connections,
+                self.config.max_connections - remaining_capacity,
+                miners.len() - remaining_capacity,
                 miners.len()
             );
             miners
                 .into_iter()
-                .take(self.config.max_connections)
+                .take(remaining_capacity)
                 .collect::<Vec<_>>()
         } else {
             miners
