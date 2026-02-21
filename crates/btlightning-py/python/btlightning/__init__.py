@@ -54,6 +54,7 @@ class Lightning:
         reconnect_initial_backoff_secs: Optional[int] = None,
         reconnect_max_backoff_secs: Optional[int] = None,
         reconnect_max_retries: Optional[int] = None,
+        max_frame_payload_bytes: Optional[int] = None,
     ):
         self._rust_client = RustLightning(
             wallet_hotkey,
@@ -63,6 +64,7 @@ class Lightning:
             reconnect_initial_backoff_secs=reconnect_initial_backoff_secs,
             reconnect_max_backoff_secs=reconnect_max_backoff_secs,
             reconnect_max_retries=reconnect_max_retries,
+            max_frame_payload_bytes=max_frame_payload_bytes,
         )
         self.wallet_hotkey = wallet_hotkey
 
@@ -123,6 +125,7 @@ class LightningServer:
         keep_alive_interval_secs: Optional[int] = None,
         nonce_cleanup_interval_secs: Optional[int] = None,
         max_nonce_entries: Optional[int] = None,
+        max_frame_payload_bytes: Optional[int] = None,
     ):
         self._rust_server = RustLightningServer(
             miner_hotkey,
@@ -133,6 +136,7 @@ class LightningServer:
             keep_alive_interval_secs=keep_alive_interval_secs,
             nonce_cleanup_interval_secs=nonce_cleanup_interval_secs,
             max_nonce_entries=max_nonce_entries,
+            max_frame_payload_bytes=max_frame_payload_bytes,
         )
 
     def set_miner_keypair(self, keypair_seed: bytes) -> None:

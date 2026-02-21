@@ -3,8 +3,7 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
-pub const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicAxonInfo {
@@ -596,7 +595,7 @@ async fn read_exact_from_recv(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(
 const INCREMENTAL_READ_THRESHOLD: usize = 1_048_576;
 const READ_CHUNK_SIZE: usize = 65_536;
 
-pub fn parse_frame_header(data: &[u8]) -> Result<(MessageType, &[u8])> {
+pub fn parse_frame_header(data: &[u8], max_payload: usize) -> Result<(MessageType, &[u8])> {
     if data.len() < FRAME_HEADER_SIZE {
         return Err(LightningError::Transport(
             "insufficient data for frame header".to_string(),
@@ -604,10 +603,10 @@ pub fn parse_frame_header(data: &[u8]) -> Result<(MessageType, &[u8])> {
     }
     let msg_type = MessageType::try_from(data[0])?;
     let payload_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-    if payload_len > MAX_FRAME_PAYLOAD {
+    if payload_len > max_payload {
         return Err(LightningError::Transport(format!(
             "frame payload {} bytes exceeds maximum {}",
-            payload_len, MAX_FRAME_PAYLOAD
+            payload_len, max_payload
         )));
     }
     if data.len() < FRAME_HEADER_SIZE + payload_len {
@@ -623,17 +622,17 @@ pub fn parse_frame_header(data: &[u8]) -> Result<(MessageType, &[u8])> {
     ))
 }
 
-pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)> {
+pub async fn read_frame(recv: &mut RecvStream, max_payload: usize) -> Result<(MessageType, Vec<u8>)> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     read_exact_from_recv(recv, &mut header).await?;
 
     let msg_type = MessageType::try_from(header[0])?;
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
-    if payload_len > MAX_FRAME_PAYLOAD {
+    if payload_len > max_payload {
         return Err(LightningError::Transport(format!(
             "frame payload {} bytes exceeds maximum {}",
-            payload_len, MAX_FRAME_PAYLOAD
+            payload_len, max_payload
         )));
     }
 
@@ -658,7 +657,7 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<(MessageType, Vec<u8>)>
             .saturating_mul(2)
             .max(INCREMENTAL_READ_THRESHOLD)
             .min(payload_len)
-            .min(MAX_FRAME_PAYLOAD);
+            .min(max_payload);
         if payload.capacity() < next_capacity {
             payload.reserve(next_capacity - payload.len());
         }
@@ -865,14 +864,14 @@ mod tests {
         let mut data = vec![0x01];
         data.extend_from_slice(&5u32.to_be_bytes());
         data.extend_from_slice(b"hello");
-        let (msg_type, payload) = parse_frame_header(&data).unwrap();
+        let (msg_type, payload) = parse_frame_header(&data, DEFAULT_MAX_FRAME_PAYLOAD).unwrap();
         assert_eq!(msg_type, MessageType::HandshakeRequest);
         assert_eq!(payload, b"hello");
     }
 
     #[test]
     fn parse_frame_header_insufficient_header() {
-        assert!(parse_frame_header(&[0x01, 0x00]).is_err());
+        assert!(parse_frame_header(&[0x01, 0x00], DEFAULT_MAX_FRAME_PAYLOAD).is_err());
     }
 
     #[test]
@@ -880,21 +879,21 @@ mod tests {
         let mut data = vec![0x01];
         data.extend_from_slice(&10u32.to_be_bytes());
         data.extend_from_slice(b"short");
-        assert!(parse_frame_header(&data).is_err());
+        assert!(parse_frame_header(&data, DEFAULT_MAX_FRAME_PAYLOAD).is_err());
     }
 
     #[test]
     fn parse_frame_header_oversized_payload() {
         let mut data = vec![0x01];
-        data.extend_from_slice(&(MAX_FRAME_PAYLOAD as u32 + 1).to_be_bytes());
-        assert!(parse_frame_header(&data).is_err());
+        data.extend_from_slice(&(DEFAULT_MAX_FRAME_PAYLOAD as u32 + 1).to_be_bytes());
+        assert!(parse_frame_header(&data, DEFAULT_MAX_FRAME_PAYLOAD).is_err());
     }
 
     #[test]
     fn parse_frame_header_invalid_message_type() {
         let mut data = vec![0xFF];
         data.extend_from_slice(&0u32.to_be_bytes());
-        assert!(parse_frame_header(&data).is_err());
+        assert!(parse_frame_header(&data, DEFAULT_MAX_FRAME_PAYLOAD).is_err());
     }
 
     use proptest::prelude::*;
@@ -977,7 +976,7 @@ mod tests {
 
         #[test]
         fn parse_frame_header_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
-            let _ = parse_frame_header(&data);
+            let _ = parse_frame_header(&data, DEFAULT_MAX_FRAME_PAYLOAD);
         }
     }
 }
