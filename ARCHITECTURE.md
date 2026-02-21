@@ -122,11 +122,12 @@ Bittensor miners are identified by sr25519 hotkeys registered on the subtensor c
 
 `LightningClient` maintains a two-layer connection pool that separates identity (hotkey) from transport (ip:port). Multiple metagraph entries (different hotkeys) can register the same ip:port — for example, when multiple miners run on the same machine, or when an adversary claims a legitimate miner's address. Each hotkey is independently authenticated via handshake to prove the server actually controls the claimed identity.
 
-```
+```text
 ClientState
 ├── active_miners:            HashMap<hotkey, QuicAxonInfo>
 ├── established_connections:  HashMap<"ip:port", quinn::Connection>
-└── reconnect_states:         HashMap<"ip:port", ReconnectState>
+├── reconnect_states:         HashMap<"ip:port", ReconnectState>
+└── addr_to_hotkeys:          HashMap<"ip:port", HashSet<hotkey>>
 ```
 
 `active_miners` is keyed by hotkey (the unique on-chain identity), while `established_connections` and `reconnect_states` are keyed by `"ip:port"` (the network address). This means multiple authenticated hotkeys can share a single QUIC connection when they point to the same address.
@@ -141,7 +142,7 @@ Connection liveness is checked lazily on each query via `conn.close_reason().is_
 
 `LightningServer` tracks connections through two synchronized indices:
 
-```
+```text
 ServerContext
 ├── connections:     HashMap<hotkey, ValidatorConnection>
 └── addr_to_hotkey:  HashMap<SocketAddr, hotkey>

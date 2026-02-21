@@ -36,7 +36,11 @@ impl QuicAxonInfo {
     }
 
     pub fn addr_key(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+        if self.ip.contains(':') {
+            format!("[{}]:{}", self.ip, self.port)
+        } else {
+            format!("{}:{}", self.ip, self.port)
+        }
     }
 }
 

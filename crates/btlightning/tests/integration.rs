@@ -1905,11 +1905,13 @@ async fn max_connections_counts_addresses_not_hotkeys() {
         .public()
         .to_ss58check();
 
-    let mut client =
-        LightningClient::with_config(validator_hotkey(), btlightning::LightningClientConfig {
+    let mut client = LightningClient::with_config(
+        validator_hotkey(),
+        btlightning::LightningClientConfig {
             max_connections: 1,
             ..Default::default()
-        });
+        },
+    );
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
 
