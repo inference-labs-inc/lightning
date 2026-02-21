@@ -82,11 +82,8 @@ impl ClientState {
         }
     }
 
-    fn addr_has_other_hotkeys(&self, addr_key: &str, excluding: &str) -> bool {
-        self.addr_to_hotkeys
-            .get(addr_key)
-            .map(|hotkeys| hotkeys.len() > 1 || !hotkeys.contains(excluding))
-            .unwrap_or(false)
+    fn addr_has_hotkeys(&self, addr_key: &str) -> bool {
+        self.addr_to_hotkeys.contains_key(addr_key)
     }
 
     fn hotkeys_at_addr(&self, addr_key: &str) -> Vec<String> {
@@ -478,6 +475,7 @@ impl LightningClient {
                     .as_ref()
                     .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
                     .clone();
+                let mut failed_hotkeys = Vec::new();
                 for hk in &co_located {
                     match authenticate_handshake(&connection, hk, &self.wallet_hotkey, &signer)
                         .await
@@ -493,11 +491,15 @@ impl LightningClient {
                                 "Re-authentication failed for co-located miner {} at {}: {}",
                                 hk, addr_key, e
                             );
+                            failed_hotkeys.push(hk.clone());
                         }
                     }
                 }
 
                 let mut state = self.state.write().await;
+                for hk in &failed_hotkeys {
+                    state.deregister_miner(hk);
+                }
                 state
                     .established_connections
                     .insert(addr_key.to_string(), connection.clone());
@@ -546,7 +548,7 @@ impl LightningClient {
                     if let Some(miner) = state.deregister_miner(&hotkey) {
                         let addr_key = miner.addr_key();
                         info!("Miner {} deregistered from {}", hotkey, addr_key);
-                        if !state.addr_has_other_hotkeys(&addr_key, &hotkey) {
+                        if !state.addr_has_hotkeys(&addr_key) {
                             if let Some(connection) =
                                 state.established_connections.remove(&addr_key)
                             {
@@ -781,9 +783,20 @@ async fn connect_and_authenticate_per_address(
     miners_at_addr: Vec<QuicAxonInfo>,
     timeout: Duration,
 ) -> (String, Result<Connection>, Vec<QuicAxonInfo>) {
+    let first = match miners_at_addr.first() {
+        Some(m) => m,
+        None => {
+            return (
+                addr_key,
+                Err(LightningError::Connection("no miners for address".into())),
+                vec![],
+            );
+        }
+    };
+
     let conn = match tokio::time::timeout(
         timeout,
-        quic_connect(&endpoint, &miners_at_addr[0].ip, miners_at_addr[0].port),
+        quic_connect(&endpoint, &first.ip, first.port),
     )
     .await
     {
