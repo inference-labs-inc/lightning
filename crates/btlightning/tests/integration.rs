@@ -1733,3 +1733,244 @@ async fn permit_rejected_does_not_degrade_permitted_client() {
     let _ = server.stop().await;
     let _ = server_handle.await;
 }
+
+// --- Multi-Hotkey Per Address ---
+
+#[tokio::test]
+async fn multiple_hotkeys_same_address_authenticates_matching_only() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+    let port = env.axon_info.port;
+
+    let fake_hotkey = sr25519::Pair::from_seed(&[99u8; 32])
+        .public()
+        .to_ss58check();
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+    client
+        .initialize_connections(vec![
+            QuicAxonInfo {
+                hotkey: miner_hotkey(),
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+            QuicAxonInfo {
+                hotkey: fake_hotkey,
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "one QUIC connection for the shared address"
+    );
+    assert_eq!(
+        stats.get("active_miners").unwrap(),
+        "1",
+        "only the real miner hotkey should be authenticated"
+    );
+
+    let resp = client
+        .query_axon(env.axon_info.clone(), build_request("echo"))
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn fake_hotkey_only_at_address_no_connection_retained() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+    let port = env.axon_info.port;
+
+    let fake_hotkey = sr25519::Pair::from_seed(&[99u8; 32])
+        .public()
+        .to_ss58check();
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+    client
+        .initialize_connections(vec![QuicAxonInfo {
+            hotkey: fake_hotkey,
+            ip: "127.0.0.1".into(),
+            port,
+            protocol: 4,
+            placeholder1: 0,
+            placeholder2: 0,
+        }])
+        .await
+        .unwrap();
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "connection dropped when no hotkeys authenticate"
+    );
+    assert_eq!(stats.get("active_miners").unwrap(), "0");
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn update_registry_removes_last_hotkey_closes_connection() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+
+    let stats = env.client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    env.client.update_miner_registry(vec![]).await.unwrap();
+
+    let stats = env.client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "0",
+        "connection must be closed when all hotkeys are deregistered"
+    );
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn update_registry_adds_fake_hotkey_at_existing_address() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+    let port = env.axon_info.port;
+
+    let fake_hotkey = sr25519::Pair::from_seed(&[99u8; 32])
+        .public()
+        .to_ss58check();
+
+    env.client
+        .update_miner_registry(vec![
+            env.axon_info.clone(),
+            QuicAxonInfo {
+                hotkey: fake_hotkey.clone(),
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let stats = env.client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "no new connection needed for same address"
+    );
+    assert_eq!(
+        stats.get("active_miners").unwrap(),
+        "1",
+        "fake hotkey should not be registered"
+    );
+
+    let resp = env
+        .client
+        .query_axon(env.axon_info.clone(), build_request("echo"))
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn max_connections_counts_addresses_not_hotkeys() {
+    let env = setup_with_handler("echo", EchoHandler).await;
+    let port = env.axon_info.port;
+
+    let fake1 = sr25519::Pair::from_seed(&[90u8; 32])
+        .public()
+        .to_ss58check();
+    let fake2 = sr25519::Pair::from_seed(&[91u8; 32])
+        .public()
+        .to_ss58check();
+
+    let mut client =
+        LightningClient::with_config(validator_hotkey(), btlightning::LightningClientConfig {
+            max_connections: 1,
+            ..Default::default()
+        });
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    client
+        .initialize_connections(vec![
+            QuicAxonInfo {
+                hotkey: miner_hotkey(),
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+            QuicAxonInfo {
+                hotkey: fake1,
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+            QuicAxonInfo {
+                hotkey: fake2,
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(
+        stats.get("total_connections").unwrap(),
+        "1",
+        "3 hotkeys at one address = 1 connection"
+    );
+    assert_eq!(
+        stats.get("active_miners").unwrap(),
+        "1",
+        "only the real hotkey authenticates"
+    );
+
+    let resp = client
+        .query_axon(
+            QuicAxonInfo {
+                hotkey: miner_hotkey(),
+                ip: "127.0.0.1".into(),
+                port,
+                protocol: 4,
+                placeholder1: 0,
+                placeholder2: 0,
+            },
+            build_request("echo"),
+        )
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}

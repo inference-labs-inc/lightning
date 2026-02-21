@@ -120,20 +120,22 @@ Bittensor miners are identified by sr25519 hotkeys registered on the subtensor c
 
 ### Client Side
 
-`LightningClient` maintains a flat connection pool: one persistent QUIC connection per miner, keyed by `"ip:port"`.
+`LightningClient` maintains a two-layer connection pool that separates identity (hotkey) from transport (ip:port). Multiple metagraph entries (different hotkeys) can register the same ip:port — for example, when multiple miners run on the same machine, or when an adversary claims a legitimate miner's address. Each hotkey is independently authenticated via handshake to prove the server actually controls the claimed identity.
 
 ```
 ClientState
-├── active_miners:            HashMap<"ip:port", QuicAxonInfo>
+├── active_miners:            HashMap<hotkey, QuicAxonInfo>
 ├── established_connections:  HashMap<"ip:port", quinn::Connection>
 └── reconnect_states:         HashMap<"ip:port", ReconnectState>
 ```
 
+`active_miners` is keyed by hotkey (the unique on-chain identity), while `established_connections` and `reconnect_states` are keyed by `"ip:port"` (the network address). This means multiple authenticated hotkeys can share a single QUIC connection when they point to the same address.
+
+During `initialize_connections`, miners are grouped by address. One QUIC connection is established per unique ip:port, then each hotkey at that address is independently authenticated via `authenticate_handshake`. Only hotkeys whose handshake succeeds (server signs with matching keypair) are registered in `active_miners`. If no hotkeys authenticate at an address, the connection is closed.
+
 Connection liveness is checked lazily on each query via `conn.close_reason().is_none()`. Dead connections trigger reconnection with exponential backoff (1s initial, 2x growth, 60s cap, 5 retries max). The backoff state resets on successful reconnect or when `update_miner_registry` includes the miner.
 
-`update_miner_registry` performs full reconciliation: deregisters absent miners (closing their QUIC connections), resets reconnect state for retained miners, and establishes connections to new miners. The `max_connections` cap (default 1024) is enforced here.
-
-A known TOCTOU exists in `try_reconnect`: the backoff check (read lock) and state update (write lock) are separate operations, so two concurrent callers can both pass the gate and both connect. The later write overwrites the earlier's connection entry — wasteful but correct.
+`update_miner_registry` performs full reconciliation: deregisters absent hotkeys, closing the underlying QUIC connection only when no remaining hotkeys reference that address. New hotkeys at already-connected addresses are authenticated on the existing connection without establishing a new one. The `max_connections` cap (default 1024) counts unique QUIC connections, not hotkeys.
 
 ### Server Side
 
