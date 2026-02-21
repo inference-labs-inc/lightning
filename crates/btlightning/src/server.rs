@@ -28,6 +28,7 @@ use tracing::{debug, error, info, instrument, warn};
 const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, Copy, Clone)]
+#[non_exhaustive]
 pub struct LightningServerConfig {
     pub max_signature_age_secs: u64,
     pub idle_timeout_secs: u64,
@@ -47,7 +48,7 @@ pub struct LightningServerConfig {
 impl Default for LightningServerConfig {
     fn default() -> Self {
         Self {
-            max_signature_age_secs: 60,
+            max_signature_age_secs: 300,
             idle_timeout_secs: 150,
             keep_alive_interval_secs: 30,
             nonce_cleanup_interval_secs: 60,
@@ -952,10 +953,13 @@ impl LightningServer {
                         error: Some("stream processing failed".to_string()),
                     }
                 }
-                Err(e) if e.is_cancelled() => StreamEnd {
-                    success: false,
-                    error: Some("stream processing failed".to_string()),
-                },
+                Err(e) if e.is_cancelled() => {
+                    warn!("Streaming handler task cancelled");
+                    StreamEnd {
+                        success: false,
+                        error: Some("stream processing failed".to_string()),
+                    }
+                }
                 Err(e) => {
                     error!("Streaming handler panicked: {}", e);
                     StreamEnd {
@@ -1283,6 +1287,11 @@ impl LightningServer {
                 drop(handlers);
                 let synapse_type = packet.synapse_type;
                 let synapse_type_log = synapse_type.clone();
+                // SynapseHandler::handle runs on Tokio's blocking thread pool so
+                // tokio::time::timeout can preempt via the JoinHandle. Slow or
+                // unbounded implementations will occupy a blocking thread for their
+                // full duration — callers should keep sync handlers fast or use
+                // AsyncSynapseHandler for long-running work.
                 match tokio::task::spawn_blocking(move || {
                     handler.handle(&synapse_type, packet.data)
                 })
