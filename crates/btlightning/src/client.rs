@@ -25,6 +25,7 @@ use crate::metagraph::{Metagraph, MetagraphMonitorConfig};
 #[cfg(feature = "subtensor")]
 use subxt::{OnlineClient, PolkadotConfig};
 
+#[derive(Clone)]
 pub struct LightningClientConfig {
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
@@ -142,10 +143,24 @@ pub struct LightningClient {
 impl LightningClient {
     pub fn new(wallet_hotkey: String) -> Self {
         Self::with_config(wallet_hotkey, LightningClientConfig::default())
+            .expect("default config is always valid")
     }
 
-    pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Self {
-        Self {
+    pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Result<Self> {
+        if config.max_frame_payload_bytes < 1_048_576 {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
+                config.max_frame_payload_bytes
+            )));
+        }
+        if config.max_frame_payload_bytes > u32::MAX as usize {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must not exceed {} (u32::MAX)",
+                config.max_frame_payload_bytes,
+                u32::MAX
+            )));
+        }
+        Ok(Self {
             config,
             wallet_hotkey,
             signer: None,
@@ -159,7 +174,7 @@ impl LightningClient {
                 metagraph_handle: None,
             })),
             endpoint: None,
-        }
+        })
     }
 
     pub fn set_signer(&mut self, signer: Box<dyn Signer>) {
@@ -570,18 +585,11 @@ impl LightningClient {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
         let wallet_hotkey = self.wallet_hotkey.clone();
-        let config = LightningClientConfig {
-            connect_timeout: self.config.connect_timeout,
-            idle_timeout: self.config.idle_timeout,
-            keep_alive_interval: self.config.keep_alive_interval,
-            reconnect_initial_backoff: self.config.reconnect_initial_backoff,
-            reconnect_max_backoff: self.config.reconnect_max_backoff,
-            reconnect_max_retries: self.config.reconnect_max_retries,
-            max_connections: self.config.max_connections,
-            max_frame_payload_bytes: self.config.max_frame_payload_bytes,
-            #[cfg(feature = "subtensor")]
-            metagraph: None,
-        };
+        let mut config = self.config.clone();
+        #[cfg(feature = "subtensor")]
+        {
+            config.metagraph = None;
+        }
         let sync_interval = monitor_config.sync_interval;
 
         let handle = tokio::spawn(async move {

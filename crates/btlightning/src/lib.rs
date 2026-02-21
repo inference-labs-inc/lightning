@@ -22,4 +22,6 @@ pub use types::{
     DEFAULT_MAX_FRAME_PAYLOAD,
 };
 #[cfg(feature = "subtensor")]
-pub use metagraph::{is_valid_ip, Metagraph, MetagraphMonitorConfig, NeuronInfo};
+pub use metagraph::{
+    is_valid_ip, Metagraph, MetagraphMonitorConfig, NeuronInfo, FINNEY_ENDPOINT, TESTNET_ENDPOINT,
+};

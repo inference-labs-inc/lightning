@@ -147,7 +147,8 @@ impl RustLightning {
             config.max_frame_payload_bytes = v;
         }
 
-        let client = btlightning::LightningClient::with_config(wallet_hotkey, config);
+        let client = btlightning::LightningClient::with_config(wallet_hotkey, config)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             client: RwLock::new(client),

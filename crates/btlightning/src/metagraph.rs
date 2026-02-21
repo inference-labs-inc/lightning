@@ -13,6 +13,7 @@ use subxt::{OnlineClient, PolkadotConfig};
 use tracing::{debug, info, warn};
 
 const METAGRAPH_SYNC_CONCURRENCY: usize = 32;
+const QUIC_PROTOCOL: u8 = 4;
 
 pub const FINNEY_ENDPOINT: &str = "wss://entrypoint-finney.opentensor.ai:443";
 pub const TESTNET_ENDPOINT: &str = "wss://test.finney.opentensor.ai:443";
@@ -208,18 +209,31 @@ impl Metagraph {
     ) -> Result<Vec<NeuronInfo>> {
         let netuid = self.netuid;
 
-        let validator_permits =
-            query_vec::<bool>(storage, "ValidatorPermit", netuid)
-                .await
-                .unwrap_or_default();
+        let (validator_permits, active_flags) = tokio::join!(
+            async {
+                query_vec::<bool>(storage, "ValidatorPermit", netuid)
+                    .await
+                    .unwrap_or_default()
+            },
+            async {
+                query_vec::<bool>(storage, "Active", netuid)
+                    .await
+                    .unwrap_or_default()
+            },
+        );
 
         let neurons: Vec<Option<NeuronInfo>> = stream::iter(0..n)
             .map(|uid| {
                 let validator_permits = &validator_permits;
+                let active_flags = &active_flags;
                 async move {
                     match query_neuron_core(storage, netuid, uid).await {
                         Ok(mut neuron) => {
                             neuron.validator_permit = validator_permits
+                                .get(uid as usize)
+                                .copied()
+                                .unwrap_or(false);
+                            neuron.is_active = active_flags
                                 .get(uid as usize)
                                 .copied()
                                 .unwrap_or(false);
@@ -246,7 +260,7 @@ impl Metagraph {
             .filter(|n| !n.validator_permit)
             .filter(|n| !n.axon_ip.is_empty() && n.axon_port > 0)
             .filter(|n| is_valid_ip(&n.axon_ip))
-            .filter(|n| n.axon_protocol > 0)
+            .filter(|n| n.axon_protocol == QUIC_PROTOCOL)
             .map(|n| {
                 QuicAxonInfo::new(
                     n.hotkey.clone(),
@@ -269,6 +283,11 @@ impl Metagraph {
     }
 }
 
+/// Validates that an IPv4 address is publicly routable.
+///
+/// Rejects: private (RFC 1918), loopback, link-local (169.254/16), multicast (224-239/8),
+/// broadcast, and zero-prefix addresses. IPv6 inputs return false — Bittensor axons currently
+/// only advertise IPv4. CGNAT range (100.64/10) is allowed (matches subnet-2 behavior).
 pub fn is_valid_ip(ip_str: &str) -> bool {
     let addr: Ipv4Addr = match ip_str.parse() {
         Ok(a) => a,
@@ -299,6 +318,7 @@ pub fn is_valid_ip(ip_str: &str) -> bool {
     true
 }
 
+#[derive(Clone)]
 pub struct MetagraphMonitorConfig {
     pub netuid: u16,
     pub subtensor_endpoint: String,
