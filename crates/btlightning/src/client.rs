@@ -34,6 +34,8 @@ pub struct LightningClientConfig {
     pub reconnect_max_retries: u32,
     pub max_connections: usize,
     pub max_frame_payload_bytes: usize,
+    #[cfg(feature = "subtensor")]
+    pub metagraph: Option<MetagraphMonitorConfig>,
 }
 
 impl Default for LightningClientConfig {
@@ -47,6 +49,8 @@ impl Default for LightningClientConfig {
             reconnect_max_retries: 5,
             max_connections: 1024,
             max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            #[cfg(feature = "subtensor")]
+            metagraph: None,
         }
     }
 }
@@ -60,6 +64,10 @@ struct ClientState {
     active_miners: HashMap<String, QuicAxonInfo>,
     established_connections: HashMap<String, Connection>,
     reconnect_states: HashMap<String, ReconnectState>,
+    #[cfg(feature = "subtensor")]
+    metagraph_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    #[cfg(feature = "subtensor")]
+    metagraph_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct StreamingResponse {
@@ -129,10 +137,6 @@ pub struct LightningClient {
     signer: Option<Arc<dyn Signer>>,
     state: Arc<RwLock<ClientState>>,
     endpoint: Option<Endpoint>,
-    #[cfg(feature = "subtensor")]
-    metagraph_shutdown: Option<tokio::sync::watch::Sender<bool>>,
-    #[cfg(feature = "subtensor")]
-    metagraph_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LightningClient {
@@ -149,12 +153,12 @@ impl LightningClient {
                 active_miners: HashMap::new(),
                 established_connections: HashMap::new(),
                 reconnect_states: HashMap::new(),
+                #[cfg(feature = "subtensor")]
+                metagraph_shutdown: None,
+                #[cfg(feature = "subtensor")]
+                metagraph_handle: None,
             })),
             endpoint: None,
-            #[cfg(feature = "subtensor")]
-            metagraph_shutdown: None,
-            #[cfg(feature = "subtensor")]
-            metagraph_handle: None,
         }
     }
 
@@ -259,6 +263,11 @@ impl LightningClient {
                     error!("Connection task panicked: {}", e);
                 }
             }
+        }
+
+        #[cfg(feature = "subtensor")]
+        if let Some(metagraph_config) = self.config.metagraph.take() {
+            self.start_metagraph_monitor(metagraph_config).await?;
         }
 
         Ok(())
@@ -520,9 +529,8 @@ impl LightningClient {
     }
 
     #[cfg(feature = "subtensor")]
-    pub async fn start_metagraph_monitor(&mut self, monitor_config: MetagraphMonitorConfig) -> Result<()> {
+    pub async fn start_metagraph_monitor(&self, monitor_config: MetagraphMonitorConfig) -> Result<()> {
         self.stop_metagraph_monitor().await;
-        self.create_endpoint().await?;
 
         let endpoint = self
             .endpoint
@@ -571,6 +579,8 @@ impl LightningClient {
             reconnect_max_retries: self.config.reconnect_max_retries,
             max_connections: self.config.max_connections,
             max_frame_payload_bytes: self.config.max_frame_payload_bytes,
+            #[cfg(feature = "subtensor")]
+            metagraph: None,
         };
         let sync_interval = monitor_config.sync_interval;
 
@@ -616,23 +626,31 @@ impl LightningClient {
             }
         });
 
-        self.metagraph_shutdown = Some(shutdown_tx);
-        self.metagraph_handle = Some(handle);
+        let mut st = self.state.write().await;
+        st.metagraph_shutdown = Some(shutdown_tx);
+        st.metagraph_handle = Some(handle);
         Ok(())
     }
 
     #[cfg(feature = "subtensor")]
-    pub async fn stop_metagraph_monitor(&mut self) {
-        if let Some(tx) = self.metagraph_shutdown.take() {
+    pub async fn stop_metagraph_monitor(&self) {
+        let (shutdown_tx, handle) = {
+            let mut st = self.state.write().await;
+            (st.metagraph_shutdown.take(), st.metagraph_handle.take())
+        };
+        if let Some(tx) = shutdown_tx {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.metagraph_handle.take() {
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
     }
 
     #[instrument(skip(self))]
     pub async fn close_all_connections(&self) -> Result<()> {
+        #[cfg(feature = "subtensor")]
+        self.stop_metagraph_monitor().await;
+
         let mut state = self.state.write().await;
 
         for (_, connection) in state.established_connections.drain() {
