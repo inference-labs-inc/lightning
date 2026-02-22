@@ -35,6 +35,9 @@ pub struct LightningClientConfig {
     pub reconnect_max_retries: u32,
     pub max_connections: usize,
     pub max_frame_payload_bytes: usize,
+    /// Aggregate byte limit for `collect_all()` across all chunks in a streaming response.
+    /// Defaults to `DEFAULT_MAX_FRAME_PAYLOAD` (64 MiB). Increase for multi-chunk streams
+    /// that exceed a single frame. Must be >= `max_frame_payload_bytes`.
     pub max_stream_payload_bytes: usize,
     #[cfg(feature = "subtensor")]
     pub metagraph: Option<MetagraphMonitorConfig>,
@@ -713,6 +716,7 @@ impl LightningClient {
             {
                 warn!("metagraph monitor did not shut down within 5s, aborting");
                 handle.abort();
+                let _ = handle.await;
             }
         }
     }
