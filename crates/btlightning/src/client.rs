@@ -1219,6 +1219,35 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
     }
+
+    #[test]
+    fn with_config_rejects_frame_payload_below_minimum() {
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_frame_payload_bytes = 512;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_rejects_frame_payload_above_u32_max() {
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_frame_payload_bytes = u32::MAX as usize + 1;
+        cfg.max_stream_payload_bytes = u32::MAX as usize + 1;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_rejects_stream_below_frame() {
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_stream_payload_bytes = cfg.max_frame_payload_bytes - 1;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_default_succeeds() {
+        assert!(
+            LightningClient::with_config("hk".into(), LightningClientConfig::default()).is_ok()
+        );
+    }
 }
 
 // Deliberately disables TLS PKI certificate validation. TLS still provides transport

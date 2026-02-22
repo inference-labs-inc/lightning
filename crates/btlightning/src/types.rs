@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const DEFAULT_MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+const _: () = assert!(DEFAULT_MAX_FRAME_PAYLOAD >= 1_048_576);
+const _: () = assert!(DEFAULT_MAX_FRAME_PAYLOAD <= u32::MAX as usize);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicAxonInfo {
