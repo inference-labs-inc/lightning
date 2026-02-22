@@ -588,10 +588,12 @@ impl LightningClient {
         let mut config = self.config.clone();
         config.metagraph = None;
         let sync_interval = monitor_config.sync_interval;
+        let subtensor_url = monitor_config.subtensor_endpoint.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(sync_interval);
             interval.tick().await;
+            let mut subtensor = subtensor;
 
             loop {
                 tokio::select! {
@@ -625,7 +627,16 @@ impl LightningClient {
                         }
                     }
                     Err(e) => {
-                        error!("metagraph sync failed: {}", e);
+                        error!("metagraph sync failed, reconnecting to subtensor: {}", e);
+                        match OnlineClient::<PolkadotConfig>::from_url(&subtensor_url).await {
+                            Ok(new_client) => {
+                                subtensor = new_client;
+                                info!("subtensor client reconnected");
+                            }
+                            Err(e) => {
+                                error!("subtensor reconnection failed: {}", e);
+                            }
+                        }
                     }
                 }
             }

@@ -15,6 +15,20 @@ use tracing::{debug, info, warn};
 const METAGRAPH_SYNC_CONCURRENCY: usize = 32;
 const QUIC_PROTOCOL: u8 = 4;
 
+fn format_ipv4(ip_raw: u128, ip_type: u8) -> String {
+    if ip_type != 4 {
+        return String::new();
+    }
+    let v = ip_raw as u32;
+    format!(
+        "{}.{}.{}.{}",
+        (v >> 24) & 0xFF,
+        (v >> 16) & 0xFF,
+        (v >> 8) & 0xFF,
+        v & 0xFF,
+    )
+}
+
 pub const FINNEY_ENDPOINT: &str = "wss://entrypoint-finney.opentensor.ai:443";
 pub const TESTNET_ENDPOINT: &str = "wss://test.finney.opentensor.ai:443";
 
@@ -171,18 +185,7 @@ impl Metagraph {
                     sp_core::crypto::AccountId32::new(raw.hotkey).to_ss58check();
                 let total_stake: u64 = raw.stake.iter().map(|(_, s)| s.0).sum();
 
-                let ip_raw = raw.axon_info.ip as u32;
-                let axon_ip = if raw.axon_info.ip_type == 4 {
-                    format!(
-                        "{}.{}.{}.{}",
-                        (ip_raw >> 24) & 0xFF,
-                        (ip_raw >> 16) & 0xFF,
-                        (ip_raw >> 8) & 0xFF,
-                        ip_raw & 0xFF,
-                    )
-                } else {
-                    String::new()
-                };
+                let axon_ip = format_ipv4(raw.axon_info.ip, raw.axon_info.ip_type);
 
                 NeuronInfo {
                     uid: raw.uid.0,
@@ -255,6 +258,7 @@ impl Metagraph {
     pub fn quic_miners(&self) -> Vec<QuicAxonInfo> {
         self.neurons
             .iter()
+            .filter(|n| n.is_active)
             .filter(|n| !n.validator_permit)
             .filter(|n| !n.axon_ip.is_empty() && n.axon_port > 0)
             .filter(|n| is_valid_ip(&n.axon_ip))
@@ -509,24 +513,14 @@ async fn query_axon(
                 .at("ip_type")
                 .and_then(|v| v.as_u128())
                 .unwrap_or(0) as u8;
-            let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0) as u32;
+            let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0);
             let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
             let protocol = v
                 .at("protocol")
                 .and_then(|v| v.as_u128())
                 .unwrap_or(0) as u8;
 
-            let ip = if ip_type == 4 {
-                format!(
-                    "{}.{}.{}.{}",
-                    (ip_raw >> 24) & 0xFF,
-                    (ip_raw >> 16) & 0xFF,
-                    (ip_raw >> 8) & 0xFF,
-                    ip_raw & 0xFF,
-                )
-            } else {
-                String::new()
-            };
+            let ip = format_ipv4(ip_raw, ip_type);
 
             Ok((ip, port, protocol))
         }
@@ -664,5 +658,27 @@ mod tests {
         assert_eq!(miners[0].hotkey, "miner_quic");
         assert_eq!(miners[0].ip, "5.6.7.8");
         assert_eq!(miners[0].port, 8080);
+    }
+
+    #[test]
+    fn quic_miners_excludes_inactive() {
+        let metagraph = Metagraph {
+            netuid: 1,
+            n: 1,
+            block: 100,
+            hotkey_to_uid: HashMap::new(),
+            neurons: vec![NeuronInfo {
+                uid: 0,
+                hotkey: "inactive_miner".into(),
+                stake: 0,
+                is_active: false,
+                axon_ip: "5.6.7.8".into(),
+                axon_port: 8080,
+                axon_protocol: 4,
+                validator_permit: false,
+            }],
+        };
+
+        assert!(metagraph.quic_miners().is_empty());
     }
 }
