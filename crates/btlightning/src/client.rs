@@ -233,11 +233,10 @@ impl LightningClient {
             addr_groups.entry(miner.addr_key()).or_default().push(miner);
         }
 
-        let remaining_capacity = {
+        let (active_count, remaining_capacity) = {
             let state = self.state.read().await;
-            self.config
-                .max_connections
-                .saturating_sub(state.established_connections.len())
+            let active = state.established_connections.len();
+            (active, self.config.max_connections.saturating_sub(active))
         };
 
         let addr_groups: Vec<(String, Vec<QuicAxonInfo>)> =
@@ -245,7 +244,7 @@ impl LightningClient {
                 warn!(
                     "Connection limit ({}) reached with {} active, skipping {} of {} new addresses",
                     self.config.max_connections,
-                    self.config.max_connections - remaining_capacity,
+                    active_count,
                     addr_groups.len() - remaining_capacity,
                     addr_groups.len()
                 );
@@ -593,7 +592,6 @@ impl LightningClient {
                 }
             }
 
-            let mut addr_changed: Vec<QuicAxonInfo> = Vec::new();
             for new_miner in new_by_hotkey.values() {
                 if let Some(old_miner) = state.active_miners.get(&new_miner.hotkey) {
                     let old_addr = old_miner.addr_key();
@@ -610,7 +608,6 @@ impl LightningClient {
                             }
                             state.reconnect_states.remove(&old_addr);
                         }
-                        addr_changed.push(new_miner.clone());
                     }
                 }
             }
@@ -632,14 +629,13 @@ impl LightningClient {
                 }
             }
 
-            let remaining_capacity = self
-                .config
-                .max_connections
-                .saturating_sub(state.established_connections.len());
+            let active_count = state.established_connections.len();
+            let remaining_capacity = self.config.max_connections.saturating_sub(active_count);
             if need_connect.len() > remaining_capacity {
                 warn!(
-                    "Connection limit ({}) reached, skipping {} of {} new addresses",
+                    "Connection limit ({}) reached with {} active, skipping {} of {} new addresses",
                     self.config.max_connections,
+                    active_count,
                     need_connect.len() - remaining_capacity,
                     need_connect.len()
                 );
