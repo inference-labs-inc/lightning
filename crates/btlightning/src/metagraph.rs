@@ -285,36 +285,53 @@ impl Metagraph {
     }
 }
 
-/// Validates that an IPv4 address is publicly routable.
+/// Validates that an IP address string is globally routable IPv4.
 ///
-/// Rejects: private (RFC 1918), loopback, link-local (169.254/16), multicast (224-239/8),
-/// broadcast, and zero-prefix addresses. IPv6 inputs return false — Bittensor axons currently
-/// only advertise IPv4. CGNAT range (100.64/10) is allowed (matches subnet-2 behavior).
+/// Rejects: private (RFC 1918), loopback, link-local, multicast, broadcast, unspecified,
+/// CGNAT (100.64/10), documentation (TEST-NET-1/2/3), benchmarking (198.18/15), IETF
+/// protocol assignments (192.0.0/24), 6to4 relay (192.88.99/24), and reserved/Class E
+/// (240/4). IPv6 and unparseable inputs return false — Bittensor axons currently only
+/// advertise IPv4.
 pub fn is_valid_ip(ip_str: &str) -> bool {
     let addr: Ipv4Addr = match ip_str.parse() {
         Ok(a) => a,
         Err(_) => return false,
     };
-    let octets = addr.octets();
-    if octets[0] == 0 || octets[0] == 127 {
+    if addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_multicast()
+        || addr.is_broadcast()
+        || addr.is_unspecified()
+    {
         return false;
     }
-    if octets[0] == 10 {
+    let o = addr.octets();
+    if o[0] == 0 {
         return false;
     }
-    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+    if o[0] == 100 && (o[1] & 0xC0) == 64 {
         return false;
     }
-    if octets[0] == 192 && octets[1] == 168 {
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
         return false;
     }
-    if octets[0] == 169 && octets[1] == 254 {
+    if o[0] == 192 && o[1] == 0 && o[2] == 2 {
         return false;
     }
-    if addr == Ipv4Addr::BROADCAST {
+    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
         return false;
     }
-    if (224..=239).contains(&octets[0]) {
+    if o[0] == 198 && (o[1] & 0xFE) == 18 {
+        return false;
+    }
+    if o[0] == 198 && o[1] == 51 && o[2] == 100 {
+        return false;
+    }
+    if o[0] == 203 && o[1] == 0 && o[2] == 113 {
+        return false;
+    }
+    if o[0] >= 240 {
         return false;
     }
     true
@@ -536,8 +553,26 @@ mod tests {
     fn valid_public_ips() {
         assert!(is_valid_ip("1.2.3.4"));
         assert!(is_valid_ip("8.8.8.8"));
-        assert!(is_valid_ip("203.0.113.1"));
-        assert!(is_valid_ip("100.64.0.1"));
+        assert!(is_valid_ip("45.33.32.156"));
+    }
+
+    #[test]
+    fn rejects_cgnat() {
+        assert!(!is_valid_ip("100.64.0.1"));
+        assert!(!is_valid_ip("100.127.255.254"));
+    }
+
+    #[test]
+    fn rejects_documentation_ranges() {
+        assert!(!is_valid_ip("192.0.2.1"));
+        assert!(!is_valid_ip("198.51.100.1"));
+        assert!(!is_valid_ip("203.0.113.1"));
+    }
+
+    #[test]
+    fn rejects_reserved_class_e() {
+        assert!(!is_valid_ip("240.0.0.1"));
+        assert!(!is_valid_ip("254.255.255.255"));
     }
 
     #[test]

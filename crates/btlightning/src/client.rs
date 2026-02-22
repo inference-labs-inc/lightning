@@ -281,7 +281,7 @@ impl LightningClient {
         }
 
         #[cfg(feature = "subtensor")]
-        if let Some(metagraph_config) = self.config.metagraph.take() {
+        if let Some(metagraph_config) = self.config.metagraph.clone() {
             self.start_metagraph_monitor(metagraph_config).await?;
         }
 
