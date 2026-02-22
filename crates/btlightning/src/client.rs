@@ -615,12 +615,11 @@ impl LightningClient {
                 }
             }
 
-            let mut new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
+            let new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
                 .values()
                 .filter(|m| !state.active_miners.contains_key(&m.hotkey))
                 .cloned()
                 .collect();
-            new_hotkeys.extend(addr_changed);
 
             let mut need_auth = Vec::new();
             let mut need_connect: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
