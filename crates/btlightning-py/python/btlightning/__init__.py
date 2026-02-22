@@ -55,6 +55,7 @@ class Lightning:
         reconnect_max_backoff_secs: Optional[int] = None,
         reconnect_max_retries: Optional[int] = None,
         max_frame_payload_bytes: Optional[int] = None,
+        max_stream_payload_bytes: Optional[int] = None,
     ):
         self._rust_client = RustLightning(
             wallet_hotkey,
@@ -65,6 +66,7 @@ class Lightning:
             reconnect_max_backoff_secs=reconnect_max_backoff_secs,
             reconnect_max_retries=reconnect_max_retries,
             max_frame_payload_bytes=max_frame_payload_bytes,
+            max_stream_payload_bytes=max_stream_payload_bytes,
         )
         self.wallet_hotkey = wallet_hotkey
 

@@ -101,6 +101,7 @@ impl RustLightning {
         reconnect_max_retries=None,
         max_connections=None,
         max_frame_payload_bytes=None,
+        max_stream_payload_bytes=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -113,6 +114,7 @@ impl RustLightning {
         reconnect_max_retries: Option<u32>,
         max_connections: Option<usize>,
         max_frame_payload_bytes: Option<usize>,
+        max_stream_payload_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -145,6 +147,9 @@ impl RustLightning {
         }
         if let Some(v) = max_frame_payload_bytes {
             config.max_frame_payload_bytes = v;
+        }
+        if let Some(v) = max_stream_payload_bytes {
+            config.max_stream_payload_bytes = v;
         }
 
         let client = btlightning::LightningClient::with_config(wallet_hotkey, config)

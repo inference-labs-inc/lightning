@@ -35,6 +35,7 @@ pub struct LightningClientConfig {
     pub reconnect_max_retries: u32,
     pub max_connections: usize,
     pub max_frame_payload_bytes: usize,
+    pub max_stream_payload_bytes: usize,
     #[cfg(feature = "subtensor")]
     pub metagraph: Option<MetagraphMonitorConfig>,
 }
@@ -50,6 +51,7 @@ impl Default for LightningClientConfig {
             reconnect_max_retries: 5,
             max_connections: 1024,
             max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            max_stream_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
             #[cfg(feature = "subtensor")]
             metagraph: None,
         }
@@ -74,6 +76,7 @@ struct ClientState {
 pub struct StreamingResponse {
     recv: quinn::RecvStream,
     max_payload: usize,
+    max_stream_payload: usize,
 }
 
 impl StreamingResponse {
@@ -120,10 +123,10 @@ impl StreamingResponse {
         let mut total_size: usize = 0;
         while let Some(chunk) = self.next_chunk().await? {
             total_size += chunk.len();
-            if total_size > self.max_payload {
+            if total_size > self.max_stream_payload {
                 return Err(LightningError::Stream(format!(
-                    "streaming response exceeded {} byte limit",
-                    self.max_payload
+                    "streaming response exceeded {} byte aggregate limit",
+                    self.max_stream_payload
                 )));
             }
             chunks.push(chunk);
@@ -375,9 +378,10 @@ impl LightningClient {
         };
 
         let max_fp = self.config.max_frame_payload_bytes;
+        let max_sp = self.config.max_stream_payload_bytes;
         match connection {
             Some(conn) if conn.close_reason().is_none() => {
-                open_streaming_synapse(&conn, request, max_fp).await
+                open_streaming_synapse(&conn, request, max_fp, max_sp).await
             }
             _ => {
                 self.try_reconnect_and_stream(&miner_key, &axon_info, request)
@@ -403,7 +407,7 @@ impl LightningClient {
         request: QuicRequest,
     ) -> Result<StreamingResponse> {
         let connection = self.try_reconnect(miner_key, axon_info).await?;
-        open_streaming_synapse(&connection, request, self.config.max_frame_payload_bytes).await
+        open_streaming_synapse(&connection, request, self.config.max_frame_payload_bytes, self.config.max_stream_payload_bytes).await
     }
 
     // Intentional TOCTOU: read-lock reconnect_states for backoff check, drop before
@@ -558,12 +562,19 @@ impl LightningClient {
             .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
             .clone();
 
-        let subtensor = OnlineClient::<PolkadotConfig>::from_url(&monitor_config.subtensor_endpoint)
-            .await
-            .map_err(|e| LightningError::Handler(format!("connecting to subtensor: {}", e)))?;
+        let subtensor = tokio::time::timeout(
+            Duration::from_secs(30),
+            OnlineClient::<PolkadotConfig>::from_url(&monitor_config.subtensor_endpoint),
+        )
+        .await
+        .map_err(|_| LightningError::Handler("subtensor connection timed out after 30s".into()))?
+        .map_err(|e| LightningError::Handler(format!("connecting to subtensor: {}", e)))?;
 
         let mut metagraph = Metagraph::new(monitor_config.netuid);
-        metagraph.sync(&subtensor).await?;
+        tokio::time::timeout(Duration::from_secs(60), metagraph.sync(&subtensor))
+            .await
+            .map_err(|_| LightningError::Handler("initial metagraph sync timed out after 60s".into()))?
+            ?;
 
         let miners = metagraph.quic_miners();
         info!(
@@ -585,13 +596,13 @@ impl LightningClient {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
         let wallet_hotkey = self.wallet_hotkey.clone();
-        let mut config = self.config.clone();
-        config.metagraph = None;
+        let config = self.config.clone();
         let sync_interval = monitor_config.sync_interval;
         let subtensor_url = monitor_config.subtensor_endpoint.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(sync_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             let mut subtensor = subtensor;
 
@@ -1026,6 +1037,7 @@ async fn open_streaming_synapse(
     connection: &Connection,
     request: QuicRequest,
     max_frame_payload: usize,
+    max_stream_payload: usize,
 ) -> Result<StreamingResponse> {
     let (mut send, recv) = connection
         .open_bi()
@@ -1034,7 +1046,7 @@ async fn open_streaming_synapse(
 
     send_synapse_frame(&mut send, request).await?;
 
-    Ok(StreamingResponse { recv, max_payload: max_frame_payload })
+    Ok(StreamingResponse { recv, max_payload: max_frame_payload, max_stream_payload })
 }
 
 fn generate_nonce() -> String {
