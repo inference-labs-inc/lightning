@@ -100,6 +100,8 @@ impl RustLightning {
         reconnect_max_backoff_secs=None,
         reconnect_max_retries=None,
         max_connections=None,
+        max_frame_payload_bytes=None,
+        max_stream_payload_bytes=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -111,6 +113,8 @@ impl RustLightning {
         reconnect_max_backoff_secs: Option<u64>,
         reconnect_max_retries: Option<u32>,
         max_connections: Option<usize>,
+        max_frame_payload_bytes: Option<usize>,
+        max_stream_payload_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -141,8 +145,15 @@ impl RustLightning {
         if let Some(v) = max_connections {
             config.max_connections = v;
         }
+        if let Some(v) = max_frame_payload_bytes {
+            config.max_frame_payload_bytes = v;
+        }
+        if let Some(v) = max_stream_payload_bytes {
+            config.max_stream_payload_bytes = v;
+        }
 
-        let client = btlightning::LightningClient::with_config(wallet_hotkey, config);
+        let client = btlightning::LightningClient::with_config(wallet_hotkey, config)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             client: RwLock::new(client),
@@ -358,6 +369,7 @@ impl RustLightningServer {
         require_validator_permit=None,
         validator_permit_refresh_secs=None,
         handler_timeout_secs=None,
+        max_frame_payload_bytes=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -376,6 +388,7 @@ impl RustLightningServer {
         require_validator_permit: Option<bool>,
         validator_permit_refresh_secs: Option<u64>,
         handler_timeout_secs: Option<u64>,
+        max_frame_payload_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -420,6 +433,9 @@ impl RustLightningServer {
         }
         if let Some(v) = handler_timeout_secs {
             config.handler_timeout_secs = v;
+        }
+        if let Some(v) = max_frame_payload_bytes {
+            config.max_frame_payload_bytes = v;
         }
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
