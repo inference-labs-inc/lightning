@@ -463,7 +463,7 @@ impl LightningClient {
                 endpoint,
                 axon_info.clone(),
                 self.wallet_hotkey.clone(),
-                signer,
+                signer.clone(),
             ),
         )
         .await;
@@ -486,12 +486,6 @@ impl LightningClient {
                         .filter(|hk| *hk != axon_info.hotkey)
                         .collect()
                 };
-
-                let signer = self
-                    .signer
-                    .as_ref()
-                    .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
-                    .clone();
                 let mut failed_hotkeys = Vec::new();
                 for hk in &co_located {
                     match authenticate_handshake(&connection, hk, &self.wallet_hotkey, &signer)
@@ -781,18 +775,17 @@ fn get_peer_cert_fingerprint(connection: &Connection) -> Option<[u8; 32]> {
     Some(blake2_256(first.as_ref()))
 }
 
-async fn quic_connect(endpoint: &Endpoint, ip: &str, port: u16) -> Result<Connection> {
-    let addr_str = if ip.contains(':') {
-        format!("[{}]:{}", ip, port)
-    } else {
-        format!("{}:{}", ip, port)
-    };
-    let addr: SocketAddr = addr_str
+async fn quic_connect(
+    endpoint: &Endpoint,
+    addr_key: &str,
+    server_name: &str,
+) -> Result<Connection> {
+    let addr: SocketAddr = addr_key
         .parse()
         .map_err(|e| LightningError::Connection(format!("Invalid address: {}", e)))?;
 
     endpoint
-        .connect(addr, ip)
+        .connect(addr, server_name)
         .map_err(|e| LightningError::Connection(format!("Connection failed: {}", e)))?
         .await
         .map_err(|e| LightningError::Connection(format!("Connection handshake failed: {}", e)))
@@ -817,7 +810,7 @@ async fn connect_and_authenticate_per_address(
         }
     };
 
-    let conn = match tokio::time::timeout(timeout, quic_connect(&endpoint, &first.ip, first.port))
+    let conn = match tokio::time::timeout(timeout, quic_connect(&endpoint, &addr_key, &first.ip))
         .await
     {
         Ok(Ok(c)) => c,
@@ -905,7 +898,7 @@ async fn connect_and_handshake(
     wallet_hotkey: String,
     signer: Arc<dyn Signer>,
 ) -> Result<Connection> {
-    let connection = quic_connect(&endpoint, &miner.ip, miner.port).await?;
+    let connection = quic_connect(&endpoint, &miner.addr_key(), &miner.ip).await?;
     authenticate_handshake(&connection, &miner.hotkey, &wallet_hotkey, &signer).await?;
     Ok(connection)
 }
