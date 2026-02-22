@@ -586,10 +586,7 @@ impl LightningClient {
         let state = self.state.clone();
         let wallet_hotkey = self.wallet_hotkey.clone();
         let mut config = self.config.clone();
-        #[cfg(feature = "subtensor")]
-        {
-            config.metagraph = None;
-        }
+        config.metagraph = None;
         let sync_interval = monitor_config.sync_interval;
 
         let handle = tokio::spawn(async move {
@@ -649,8 +646,11 @@ impl LightningClient {
         if let Some(tx) = shutdown_tx {
             let _ = tx.send(true);
         }
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        if let Some(mut handle) = handle {
+            if tokio::time::timeout(Duration::from_secs(5), &mut handle).await.is_err() {
+                warn!("metagraph monitor did not shut down within 5s, aborting");
+                handle.abort();
+            }
         }
     }
 
@@ -760,21 +760,25 @@ async fn update_miner_registry_inner(
             });
         }
 
-        let mut st = state.write().await;
-
+        let mut results = Vec::new();
         while let Some(join_result) = set.join_next().await {
             match join_result {
-                Ok((key, result)) => match result {
-                    Ok(connection) => {
-                        st.established_connections.insert(key, connection);
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to new miner {}: {}", key, e);
-                        st.active_miners.remove(&key);
-                    }
-                },
+                Ok(result) => results.push(result),
                 Err(e) => {
                     error!("Connection task panicked: {}", e);
+                }
+            }
+        }
+
+        let mut st = state.write().await;
+        for (key, result) in results {
+            match result {
+                Ok(connection) => {
+                    st.established_connections.insert(key, connection);
+                }
+                Err(e) => {
+                    error!("Failed to connect to new miner {}: {}", key, e);
+                    st.active_miners.remove(&key);
                 }
             }
         }

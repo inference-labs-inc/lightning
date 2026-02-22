@@ -99,12 +99,11 @@ impl Metagraph {
             .await
             .map_err(|e| LightningError::Handler(format!("fetching latest block: {}", e)))?;
         self.block = block_ref.number() as u64;
+        let block_hash = block_ref.hash();
 
         let storage = client
             .storage()
-            .at_latest()
-            .await
-            .map_err(|e| LightningError::Handler(format!("fetching storage: {}", e)))?;
+            .at(block_hash);
 
         let n = query_subnet_n(&storage, self.netuid).await?;
         self.n = n;
@@ -116,7 +115,7 @@ impl Metagraph {
             "syncing metagraph"
         );
 
-        let neurons = match self.sync_via_runtime_api(client).await {
+        let neurons = match self.sync_via_runtime_api(client, block_hash).await {
             Ok(neurons) => {
                 info!(
                     netuid = self.netuid,
@@ -153,13 +152,12 @@ impl Metagraph {
     async fn sync_via_runtime_api(
         &self,
         client: &OnlineClient<PolkadotConfig>,
+        block_hash: <PolkadotConfig as subxt::Config>::Hash,
     ) -> Result<Vec<NeuronInfo>> {
         let params = Encode::encode(&self.netuid);
         let items: Vec<NeuronInfoLiteRaw> = client
             .runtime_api()
-            .at_latest()
-            .await
-            .map_err(|e| LightningError::Handler(e.to_string()))?
+            .at(block_hash)
             .call_raw("NeuronInfoRuntimeApi_get_neurons_lite", Some(&params))
             .await
             .map_err(|e| {
@@ -507,6 +505,10 @@ async fn query_axon(
             let v = val
                 .to_value()
                 .map_err(|e| LightningError::Handler(e.to_string()))?;
+            let ip_type = v
+                .at("ip_type")
+                .and_then(|v| v.as_u128())
+                .unwrap_or(0) as u8;
             let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0) as u32;
             let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
             let protocol = v
@@ -514,13 +516,17 @@ async fn query_axon(
                 .and_then(|v| v.as_u128())
                 .unwrap_or(0) as u8;
 
-            let ip = format!(
-                "{}.{}.{}.{}",
-                (ip_raw >> 24) & 0xFF,
-                (ip_raw >> 16) & 0xFF,
-                (ip_raw >> 8) & 0xFF,
-                ip_raw & 0xFF,
-            );
+            let ip = if ip_type == 4 {
+                format!(
+                    "{}.{}.{}.{}",
+                    (ip_raw >> 24) & 0xFF,
+                    (ip_raw >> 16) & 0xFF,
+                    (ip_raw >> 8) & 0xFF,
+                    ip_raw & 0xFF,
+                )
+            } else {
+                String::new()
+            };
 
             Ok((ip, port, protocol))
         }
