@@ -115,9 +115,7 @@ impl Metagraph {
         self.block = block_ref.number() as u64;
         let block_hash = block_ref.hash();
 
-        let storage = client
-            .storage()
-            .at(block_hash);
+        let storage = client.storage().at(block_hash);
 
         let n = query_subnet_n(&storage, self.netuid).await?;
         self.n = n;
@@ -150,8 +148,7 @@ impl Metagraph {
 
         self.hotkey_to_uid.clear();
         for neuron in &neurons {
-            self.hotkey_to_uid
-                .insert(neuron.hotkey.clone(), neuron.uid);
+            self.hotkey_to_uid.insert(neuron.hotkey.clone(), neuron.uid);
         }
 
         self.neurons = neurons;
@@ -174,15 +171,12 @@ impl Metagraph {
             .at(block_hash)
             .call_raw("NeuronInfoRuntimeApi_get_neurons_lite", Some(&params))
             .await
-            .map_err(|e| {
-                LightningError::Handler(format!("calling get_neurons_lite: {}", e))
-            })?;
+            .map_err(|e| LightningError::Handler(format!("calling get_neurons_lite: {}", e)))?;
 
         let neurons: Vec<NeuronInfo> = items
             .into_iter()
             .map(|raw| {
-                let hotkey =
-                    sp_core::crypto::AccountId32::new(raw.hotkey).to_ss58check();
+                let hotkey = sp_core::crypto::AccountId32::new(raw.hotkey).to_ss58check();
                 let total_stake: u64 = raw.stake.iter().map(|(_, s)| s.0).sum();
 
                 let axon_ip = format_ipv4(raw.axon_info.ip, raw.axon_info.ip_type);
@@ -234,10 +228,8 @@ impl Metagraph {
                                 .get(uid as usize)
                                 .copied()
                                 .unwrap_or(false);
-                            neuron.is_active = active_flags
-                                .get(uid as usize)
-                                .copied()
-                                .unwrap_or(false);
+                            neuron.is_active =
+                                active_flags.get(uid as usize).copied().unwrap_or(false);
                             debug!(uid = uid, hotkey = %neuron.hotkey, "synced neuron");
                             Some(neuron)
                         }
@@ -391,9 +383,8 @@ async fn query_subnet_n(
                 .to_value()
                 .map_err(|e| LightningError::Handler(e.to_string()))?
                 .as_u128()
-                .ok_or_else(|| {
-                    LightningError::Handler("SubnetworkN not u128".to_string())
-                })? as u16;
+                .ok_or_else(|| LightningError::Handler("SubnetworkN not u128".to_string()))?
+                as u16;
             Ok(n)
         }
         None => Ok(0),
@@ -510,10 +501,7 @@ async fn query_axon(
     let query = subxt::dynamic::storage(
         "SubtensorModule",
         "Axons",
-        vec![
-            Value::from(netuid as u64),
-            Value::from_bytes(hotkey_bytes),
-        ],
+        vec![Value::from(netuid as u64), Value::from_bytes(hotkey_bytes)],
     );
 
     let result = storage
@@ -526,16 +514,10 @@ async fn query_axon(
             let v = val
                 .to_value()
                 .map_err(|e| LightningError::Handler(e.to_string()))?;
-            let ip_type = v
-                .at("ip_type")
-                .and_then(|v| v.as_u128())
-                .unwrap_or(0) as u8;
+            let ip_type = v.at("ip_type").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
             let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0);
             let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
-            let protocol = v
-                .at("protocol")
-                .and_then(|v| v.as_u128())
-                .unwrap_or(0) as u8;
+            let protocol = v.at("protocol").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
 
             let ip = format_ipv4(ip_raw, ip_type);
 

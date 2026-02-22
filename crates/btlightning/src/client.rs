@@ -163,6 +163,12 @@ impl LightningClient {
                 u32::MAX
             )));
         }
+        if config.max_stream_payload_bytes < config.max_frame_payload_bytes {
+            return Err(LightningError::Config(format!(
+                "max_stream_payload_bytes ({}) must be >= max_frame_payload_bytes ({})",
+                config.max_stream_payload_bytes, config.max_frame_payload_bytes
+            )));
+        }
         Ok(Self {
             config,
             wallet_hotkey,
@@ -246,9 +252,11 @@ impl LightningClient {
             let s = signer.clone();
             set.spawn(async move {
                 let miner_key = format!("{}:{}", miner.ip, miner.port);
-                let result =
-                    tokio::time::timeout(timeout, connect_and_handshake(ep, miner.clone(), wh, s, max_fp))
-                        .await;
+                let result = tokio::time::timeout(
+                    timeout,
+                    connect_and_handshake(ep, miner.clone(), wh, s, max_fp),
+                )
+                .await;
                 let result = match result {
                     Ok(r) => r,
                     Err(_) => Err(LightningError::Connection(format!(
@@ -407,7 +415,13 @@ impl LightningClient {
         request: QuicRequest,
     ) -> Result<StreamingResponse> {
         let connection = self.try_reconnect(miner_key, axon_info).await?;
-        open_streaming_synapse(&connection, request, self.config.max_frame_payload_bytes, self.config.max_stream_payload_bytes).await
+        open_streaming_synapse(
+            &connection,
+            request,
+            self.config.max_frame_payload_bytes,
+            self.config.max_stream_payload_bytes,
+        )
+        .await
     }
 
     // Intentional TOCTOU: read-lock reconnect_states for backoff check, drop before
@@ -548,7 +562,10 @@ impl LightningClient {
     }
 
     #[cfg(feature = "subtensor")]
-    pub async fn start_metagraph_monitor(&self, monitor_config: MetagraphMonitorConfig) -> Result<()> {
+    pub async fn start_metagraph_monitor(
+        &self,
+        monitor_config: MetagraphMonitorConfig,
+    ) -> Result<()> {
         self.stop_metagraph_monitor().await;
 
         let endpoint = self
@@ -573,8 +590,9 @@ impl LightningClient {
         let mut metagraph = Metagraph::new(monitor_config.netuid);
         tokio::time::timeout(Duration::from_secs(60), metagraph.sync(&subtensor))
             .await
-            .map_err(|_| LightningError::Handler("initial metagraph sync timed out after 60s".into()))?
-            ?;
+            .map_err(|_| {
+                LightningError::Handler("initial metagraph sync timed out after 60s".into())
+            })??;
 
         let miners = metagraph.quic_miners();
         info!(
@@ -615,8 +633,11 @@ impl LightningClient {
                     }
                 }
 
-                match metagraph.sync(&subtensor).await {
-                    Ok(()) => {
+                let sync_result =
+                    tokio::time::timeout(Duration::from_secs(60), metagraph.sync(&subtensor)).await;
+
+                let needs_reconnect = match sync_result {
+                    Ok(Ok(())) => {
                         let miners = metagraph.quic_miners();
                         info!(
                             netuid = metagraph.netuid,
@@ -636,17 +657,34 @@ impl LightningClient {
                         {
                             error!("registry update after metagraph sync failed: {}", e);
                         }
+                        false
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!("metagraph sync failed, reconnecting to subtensor: {}", e);
-                        match OnlineClient::<PolkadotConfig>::from_url(&subtensor_url).await {
-                            Ok(new_client) => {
-                                subtensor = new_client;
-                                info!("subtensor client reconnected");
-                            }
-                            Err(e) => {
-                                error!("subtensor reconnection failed: {}", e);
-                            }
+                        true
+                    }
+                    Err(_) => {
+                        error!("metagraph sync timed out after 60s, reconnecting to subtensor");
+                        true
+                    }
+                };
+
+                if needs_reconnect {
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        OnlineClient::<PolkadotConfig>::from_url(&subtensor_url),
+                    )
+                    .await
+                    {
+                        Ok(Ok(new_client)) => {
+                            subtensor = new_client;
+                            info!("subtensor client reconnected");
+                        }
+                        Ok(Err(e)) => {
+                            error!("subtensor reconnection failed: {}", e);
+                        }
+                        Err(_) => {
+                            error!("subtensor reconnection timed out after 30s");
                         }
                     }
                 }
@@ -669,7 +707,10 @@ impl LightningClient {
             let _ = tx.send(true);
         }
         if let Some(mut handle) = handle {
-            if tokio::time::timeout(Duration::from_secs(5), &mut handle).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+            {
                 warn!("metagraph monitor did not shut down within 5s, aborting");
                 handle.abort();
             }
@@ -1046,7 +1087,11 @@ async fn open_streaming_synapse(
 
     send_synapse_frame(&mut send, request).await?;
 
-    Ok(StreamingResponse { recv, max_payload: max_frame_payload, max_stream_payload })
+    Ok(StreamingResponse {
+        recv,
+        max_payload: max_frame_payload,
+        max_stream_payload,
+    })
 }
 
 fn generate_nonce() -> String {

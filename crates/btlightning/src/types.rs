@@ -622,7 +622,10 @@ pub fn parse_frame_header(data: &[u8], max_payload: usize) -> Result<(MessageTyp
     ))
 }
 
-pub async fn read_frame(recv: &mut RecvStream, max_payload: usize) -> Result<(MessageType, Vec<u8>)> {
+pub async fn read_frame(
+    recv: &mut RecvStream,
+    max_payload: usize,
+) -> Result<(MessageType, Vec<u8>)> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     read_exact_from_recv(recv, &mut header).await?;
 

@@ -9,6 +9,10 @@ pub mod util;
 
 pub use client::{LightningClient, LightningClientConfig, StreamingResponse};
 pub use error::{LightningError, Result};
+#[cfg(feature = "subtensor")]
+pub use metagraph::{
+    is_valid_ip, Metagraph, MetagraphMonitorConfig, NeuronInfo, FINNEY_ENDPOINT, TESTNET_ENDPOINT,
+};
 pub use server::{
     typed_async_handler, typed_handler, AsyncSynapseHandler, LightningServer,
     LightningServerConfig, StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
@@ -20,8 +24,4 @@ pub use types::{
     parse_frame_header, serialize_to_rmpv_map, HandshakeRequest, HandshakeResponse, MessageType,
     QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket, SynapseResponse,
     DEFAULT_MAX_FRAME_PAYLOAD,
-};
-#[cfg(feature = "subtensor")]
-pub use metagraph::{
-    is_valid_ip, Metagraph, MetagraphMonitorConfig, NeuronInfo, FINNEY_ENDPOINT, TESTNET_ENDPOINT,
 };
