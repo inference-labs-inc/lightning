@@ -488,19 +488,29 @@ impl LightningClient {
                 };
                 let mut failed_hotkeys = Vec::new();
                 for hk in &co_located {
-                    match authenticate_handshake(&connection, hk, &self.wallet_hotkey, &signer)
-                        .await
+                    match tokio::time::timeout(
+                        self.config.connect_timeout,
+                        authenticate_handshake(&connection, hk, &self.wallet_hotkey, &signer),
+                    )
+                    .await
                     {
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             info!(
                                 "Re-authenticated co-located miner {} on reconnected {}",
                                 hk, addr_key
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(
                                 "Re-authentication failed for co-located miner {} at {}: {}",
                                 hk, addr_key, e
+                            );
+                            failed_hotkeys.push(hk.clone());
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Re-authentication timed out for co-located miner {} at {}",
+                                hk, addr_key
                             );
                             failed_hotkeys.push(hk.clone());
                         }
@@ -511,6 +521,7 @@ impl LightningClient {
                 for hk in &failed_hotkeys {
                     state.deregister_miner(hk);
                 }
+                state.register_miner(axon_info.clone());
                 state
                     .established_connections
                     .insert(addr_key.to_string(), connection.clone());
@@ -582,11 +593,34 @@ impl LightningClient {
                 }
             }
 
-            let new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
+            let mut addr_changed: Vec<QuicAxonInfo> = Vec::new();
+            for new_miner in new_by_hotkey.values() {
+                if let Some(old_miner) = state.active_miners.get(&new_miner.hotkey) {
+                    let old_addr = old_miner.addr_key();
+                    let new_addr = new_miner.addr_key();
+                    if old_addr != new_addr {
+                        info!(
+                            "Miner {} changed address from {} to {}",
+                            new_miner.hotkey, old_addr, new_addr
+                        );
+                        state.deregister_miner(&new_miner.hotkey);
+                        if !state.addr_has_hotkeys(&old_addr) {
+                            if let Some(conn) = state.established_connections.remove(&old_addr) {
+                                conn.close(0u32.into(), b"miner_addr_changed");
+                            }
+                            state.reconnect_states.remove(&old_addr);
+                        }
+                        addr_changed.push(new_miner.clone());
+                    }
+                }
+            }
+
+            let mut new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
                 .values()
                 .filter(|m| !state.active_miners.contains_key(&m.hotkey))
                 .cloned()
                 .collect();
+            new_hotkeys.extend(addr_changed);
 
             let mut need_auth = Vec::new();
             let mut need_connect: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
@@ -648,18 +682,29 @@ impl LightningClient {
             let mut authenticated = Vec::new();
             for (miner, conn) in &miners_with_conns {
                 let addr_key = miner.addr_key();
-                match authenticate_handshake(conn, &miner.hotkey, &wallet_hotkey, &signer).await {
-                    Ok(()) => {
+                match tokio::time::timeout(
+                    timeout,
+                    authenticate_handshake(conn, &miner.hotkey, &wallet_hotkey, &signer),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
                         info!(
                             "Authenticated new miner {} on existing connection to {}",
                             miner.hotkey, addr_key
                         );
                         authenticated.push(miner.clone());
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(
                             "Handshake failed for new hotkey {} at {}: {}",
                             miner.hotkey, addr_key, e
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Handshake timed out for new hotkey {} at {}",
+                            miner.hotkey, addr_key
                         );
                     }
                 }
@@ -823,12 +868,23 @@ async fn connect_and_authenticate_per_address(
 
     let mut authenticated = Vec::new();
     for miner in &miners_at_addr {
-        match authenticate_handshake(&conn, &miner.hotkey, &wallet_hotkey, &signer).await {
-            Ok(()) => authenticated.push(miner.clone()),
-            Err(e) => {
+        match tokio::time::timeout(
+            timeout,
+            authenticate_handshake(&conn, &miner.hotkey, &wallet_hotkey, &signer),
+        )
+        .await
+        {
+            Ok(Ok(())) => authenticated.push(miner.clone()),
+            Ok(Err(e)) => {
                 warn!(
                     "Handshake failed for hotkey {} at {}: {}",
                     miner.hotkey, addr_key, e
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Handshake timed out for hotkey {} at {}",
+                    miner.hotkey, addr_key
                 );
             }
         }
