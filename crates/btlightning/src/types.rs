@@ -34,6 +34,14 @@ impl QuicAxonInfo {
             placeholder2,
         }
     }
+
+    pub fn addr_key(&self) -> String {
+        if self.ip.contains(':') {
+            format!("[{}]:{}", self.ip, self.port)
+        } else {
+            format!("{}:{}", self.ip, self.port)
+        }
+    }
 }
 
 pub(crate) fn hashmap_to_rmpv_map(data: HashMap<String, rmpv::Value>) -> rmpv::Value {
