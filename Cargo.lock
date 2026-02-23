@@ -1473,6 +1473,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bittensor_wallet",
+ "futures-util",
+ "parity-scale-codec",
  "proptest",
  "quinn",
  "rand 0.8.5",

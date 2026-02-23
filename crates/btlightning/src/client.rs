@@ -3,7 +3,7 @@ use crate::signing::Signer;
 use crate::types::{
     handshake_request_message, handshake_response_message, read_frame, write_frame_and_finish,
     HandshakeRequest, HandshakeResponse, MessageType, QuicAxonInfo, QuicRequest, QuicResponse,
-    StreamChunk, StreamEnd, SynapsePacket, SynapseResponse, MAX_RESPONSE_SIZE,
+    StreamChunk, StreamEnd, SynapsePacket, SynapseResponse, DEFAULT_MAX_FRAME_PAYLOAD,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -20,6 +20,12 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{error, info, instrument, warn};
 
+#[cfg(feature = "subtensor")]
+use crate::metagraph::{Metagraph, MetagraphMonitorConfig};
+#[cfg(feature = "subtensor")]
+use subxt::{OnlineClient, PolkadotConfig};
+
+#[derive(Clone)]
 pub struct LightningClientConfig {
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
@@ -28,6 +34,13 @@ pub struct LightningClientConfig {
     pub reconnect_max_backoff: Duration,
     pub reconnect_max_retries: u32,
     pub max_connections: usize,
+    pub max_frame_payload_bytes: usize,
+    /// Aggregate byte limit for `collect_all()` across all chunks in a streaming response.
+    /// Defaults to `DEFAULT_MAX_FRAME_PAYLOAD` (64 MiB). Increase for multi-chunk streams
+    /// that exceed a single frame. Must be >= `max_frame_payload_bytes`.
+    pub max_stream_payload_bytes: usize,
+    #[cfg(feature = "subtensor")]
+    pub metagraph: Option<MetagraphMonitorConfig>,
 }
 
 impl Default for LightningClientConfig {
@@ -40,6 +53,10 @@ impl Default for LightningClientConfig {
             reconnect_max_backoff: Duration::from_secs(60),
             reconnect_max_retries: 5,
             max_connections: 1024,
+            max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            max_stream_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            #[cfg(feature = "subtensor")]
+            metagraph: None,
         }
     }
 }
@@ -54,6 +71,10 @@ struct ClientState {
     established_connections: HashMap<String, Connection>,
     reconnect_states: HashMap<String, ReconnectState>,
     addr_to_hotkeys: HashMap<String, HashSet<String>>,
+    #[cfg(feature = "subtensor")]
+    metagraph_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    #[cfg(feature = "subtensor")]
+    metagraph_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ClientState {
@@ -107,11 +128,13 @@ impl ClientState {
 
 pub struct StreamingResponse {
     recv: quinn::RecvStream,
+    max_payload: usize,
+    max_stream_payload: usize,
 }
 
 impl StreamingResponse {
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        match read_frame(&mut self.recv).await {
+        match read_frame(&mut self.recv, self.max_payload).await {
             Ok((MessageType::StreamChunk, payload)) => {
                 let chunk: StreamChunk = rmp_serde::from_slice(&payload).map_err(|e| {
                     LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
@@ -153,10 +176,10 @@ impl StreamingResponse {
         let mut total_size: usize = 0;
         while let Some(chunk) = self.next_chunk().await? {
             total_size += chunk.len();
-            if total_size > MAX_RESPONSE_SIZE {
+            if total_size > self.max_stream_payload {
                 return Err(LightningError::Stream(format!(
-                    "streaming response exceeded {} byte limit",
-                    MAX_RESPONSE_SIZE
+                    "streaming response exceeded {} byte aggregate limit",
+                    self.max_stream_payload
                 )));
             }
             chunks.push(chunk);
@@ -176,10 +199,30 @@ pub struct LightningClient {
 impl LightningClient {
     pub fn new(wallet_hotkey: String) -> Self {
         Self::with_config(wallet_hotkey, LightningClientConfig::default())
+            .expect("default config is always valid")
     }
 
-    pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Self {
-        Self {
+    pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Result<Self> {
+        if config.max_frame_payload_bytes < 1_048_576 {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
+                config.max_frame_payload_bytes
+            )));
+        }
+        if config.max_frame_payload_bytes > u32::MAX as usize {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must not exceed {} (u32::MAX)",
+                config.max_frame_payload_bytes,
+                u32::MAX
+            )));
+        }
+        if config.max_stream_payload_bytes < config.max_frame_payload_bytes {
+            return Err(LightningError::Config(format!(
+                "max_stream_payload_bytes ({}) must be >= max_frame_payload_bytes ({})",
+                config.max_stream_payload_bytes, config.max_frame_payload_bytes
+            )));
+        }
+        Ok(Self {
             config,
             wallet_hotkey,
             signer: None,
@@ -188,9 +231,13 @@ impl LightningClient {
                 established_connections: HashMap::new(),
                 reconnect_states: HashMap::new(),
                 addr_to_hotkeys: HashMap::new(),
+                #[cfg(feature = "subtensor")]
+                metagraph_shutdown: None,
+                #[cfg(feature = "subtensor")]
+                metagraph_handle: None,
             })),
             endpoint: None,
-        }
+        })
     }
 
     pub fn set_signer(&mut self, signer: Box<dyn Signer>) {
@@ -253,6 +300,7 @@ impl LightningClient {
                 addr_groups.into_iter().collect()
             };
 
+        let max_fp = self.config.max_frame_payload_bytes;
         let mut set = tokio::task::JoinSet::new();
         for (addr_key, miners_at_addr) in addr_groups {
             let ep = endpoint.clone();
@@ -265,6 +313,7 @@ impl LightningClient {
                 addr_key,
                 miners_at_addr,
                 timeout,
+                max_fp,
             ));
         }
 
@@ -302,6 +351,11 @@ impl LightningClient {
                     error!("Failed to connect to {}: {}", addr_key, e);
                 }
             }
+        }
+
+        #[cfg(feature = "subtensor")]
+        if let Some(metagraph_config) = self.config.metagraph.clone() {
+            self.start_metagraph_monitor(metagraph_config).await?;
         }
 
         Ok(())
@@ -356,9 +410,10 @@ impl LightningClient {
             state.established_connections.get(&addr_key).cloned()
         };
 
+        let max_fp = self.config.max_frame_payload_bytes;
         match connection {
             Some(conn) if conn.close_reason().is_none() => {
-                send_synapse_packet(&conn, request).await
+                send_synapse_packet(&conn, request, max_fp).await
             }
             _ => {
                 self.try_reconnect_and_query(&addr_key, &axon_info, request)
@@ -392,9 +447,11 @@ impl LightningClient {
             state.established_connections.get(&addr_key).cloned()
         };
 
+        let max_fp = self.config.max_frame_payload_bytes;
+        let max_sp = self.config.max_stream_payload_bytes;
         match connection {
             Some(conn) if conn.close_reason().is_none() => {
-                open_streaming_synapse(&conn, request).await
+                open_streaming_synapse(&conn, request, max_fp, max_sp).await
             }
             _ => {
                 self.try_reconnect_and_stream(&addr_key, &axon_info, request)
@@ -410,7 +467,7 @@ impl LightningClient {
         request: QuicRequest,
     ) -> Result<QuicResponse> {
         let connection = self.try_reconnect(addr_key, axon_info).await?;
-        send_synapse_packet(&connection, request).await
+        send_synapse_packet(&connection, request, self.config.max_frame_payload_bytes).await
     }
 
     async fn try_reconnect_and_stream(
@@ -420,7 +477,13 @@ impl LightningClient {
         request: QuicRequest,
     ) -> Result<StreamingResponse> {
         let connection = self.try_reconnect(addr_key, axon_info).await?;
-        open_streaming_synapse(&connection, request).await
+        open_streaming_synapse(
+            &connection,
+            request,
+            self.config.max_frame_payload_bytes,
+            self.config.max_stream_payload_bytes,
+        )
+        .await
     }
 
     async fn try_reconnect(&self, addr_key: &str, axon_info: &QuicAxonInfo) -> Result<Connection> {
@@ -463,6 +526,7 @@ impl LightningClient {
                 axon_info.clone(),
                 self.wallet_hotkey.clone(),
                 signer.clone(),
+                self.config.max_frame_payload_bytes,
             ),
         )
         .await;
@@ -489,7 +553,13 @@ impl LightningClient {
                 for hk in &co_located {
                     match tokio::time::timeout(
                         self.config.connect_timeout,
-                        authenticate_handshake(&connection, hk, &self.wallet_hotkey, &signer),
+                        authenticate_handshake(
+                            &connection,
+                            hk,
+                            &self.wallet_hotkey,
+                            &signer,
+                            self.config.max_frame_payload_bytes,
+                        ),
                     )
                     .await
                     {
@@ -553,221 +623,25 @@ impl LightningClient {
 
     #[instrument(skip(self, miners), fields(miner_count = miners.len()))]
     pub async fn update_miner_registry(&self, miners: Vec<QuicAxonInfo>) -> Result<()> {
-        let new_by_hotkey: HashMap<String, QuicAxonInfo> = miners
-            .iter()
-            .map(|m| (m.hotkey.clone(), m.clone()))
-            .collect();
-
-        let new_hotkeys_needing_auth: Vec<QuicAxonInfo>;
-        let new_addrs_needing_connect: HashMap<String, Vec<QuicAxonInfo>>;
-        {
-            let mut state = self.state.write().await;
-
-            let active_hotkeys: Vec<String> = state.active_miners.keys().cloned().collect();
-            for hotkey in active_hotkeys {
-                if !new_by_hotkey.contains_key(&hotkey) {
-                    if let Some(miner) = state.deregister_miner(&hotkey) {
-                        let addr_key = miner.addr_key();
-                        info!("Miner {} deregistered from {}", hotkey, addr_key);
-                        if !state.addr_has_hotkeys(&addr_key) {
-                            if let Some(connection) =
-                                state.established_connections.remove(&addr_key)
-                            {
-                                connection.close(0u32.into(), b"miner_deregistered");
-                            }
-                            state.reconnect_states.remove(&addr_key);
-                        }
-                    }
-                }
-            }
-
-            let active_addrs: HashSet<String> =
-                state.active_miners.values().map(|m| m.addr_key()).collect();
-            for addr_key in &active_addrs {
-                if state.reconnect_states.remove(addr_key).is_some() {
-                    info!(
-                        "Registry refresh reset reconnection backoff for {}",
-                        addr_key
-                    );
-                }
-            }
-
-            for new_miner in new_by_hotkey.values() {
-                if let Some(old_miner) = state.active_miners.get(&new_miner.hotkey) {
-                    let old_addr = old_miner.addr_key();
-                    let new_addr = new_miner.addr_key();
-                    if old_addr != new_addr {
-                        info!(
-                            "Miner {} changed address from {} to {}",
-                            new_miner.hotkey, old_addr, new_addr
-                        );
-                        state.deregister_miner(&new_miner.hotkey);
-                        if !state.addr_has_hotkeys(&old_addr) {
-                            if let Some(conn) = state.established_connections.remove(&old_addr) {
-                                conn.close(0u32.into(), b"miner_addr_changed");
-                            }
-                            state.reconnect_states.remove(&old_addr);
-                        }
-                    }
-                }
-            }
-
-            let new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
-                .values()
-                .filter(|m| !state.active_miners.contains_key(&m.hotkey))
-                .cloned()
-                .collect();
-
-            let mut need_auth = Vec::new();
-            let mut need_connect: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
-            for miner in new_hotkeys {
-                let addr_key = miner.addr_key();
-                if state.established_connections.contains_key(&addr_key) {
-                    need_auth.push(miner);
-                } else {
-                    need_connect.entry(addr_key).or_default().push(miner);
-                }
-            }
-
-            let active_count = state.established_connections.len();
-            let remaining_capacity = self.config.max_connections.saturating_sub(active_count);
-            if need_connect.len() > remaining_capacity {
-                warn!(
-                    "Connection limit ({}) reached with {} active, skipping {} of {} new addresses",
-                    self.config.max_connections,
-                    active_count,
-                    need_connect.len() - remaining_capacity,
-                    need_connect.len()
-                );
-            }
-
-            new_hotkeys_needing_auth = need_auth;
-            new_addrs_needing_connect = need_connect.into_iter().take(remaining_capacity).collect();
-        }
-
         let endpoint = self
             .endpoint
             .as_ref()
             .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?
             .clone();
-        let wallet_hotkey = self.wallet_hotkey.clone();
         let signer = self
             .signer
             .as_ref()
             .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
             .clone();
-        let timeout = self.config.connect_timeout;
-
-        if !new_hotkeys_needing_auth.is_empty() {
-            let miners_with_conns: Vec<(QuicAxonInfo, Connection)> = {
-                let state = self.state.read().await;
-                new_hotkeys_needing_auth
-                    .into_iter()
-                    .filter_map(|miner| {
-                        let addr_key = miner.addr_key();
-                        state
-                            .established_connections
-                            .get(&addr_key)
-                            .cloned()
-                            .map(|conn| (miner, conn))
-                    })
-                    .collect()
-            };
-
-            let mut authenticated = Vec::new();
-            for (miner, conn) in &miners_with_conns {
-                let addr_key = miner.addr_key();
-                match tokio::time::timeout(
-                    timeout,
-                    authenticate_handshake(conn, &miner.hotkey, &wallet_hotkey, &signer),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        info!(
-                            "Authenticated new miner {} on existing connection to {}",
-                            miner.hotkey, addr_key
-                        );
-                        authenticated.push(miner.clone());
-                    }
-                    Ok(Err(e)) => {
-                        warn!(
-                            "Handshake failed for new hotkey {} at {}: {}",
-                            miner.hotkey, addr_key, e
-                        );
-                    }
-                    Err(_) => {
-                        warn!(
-                            "Handshake timed out for new hotkey {} at {}",
-                            miner.hotkey, addr_key
-                        );
-                    }
-                }
-            }
-
-            let mut state = self.state.write().await;
-            for miner in authenticated {
-                state.register_miner(miner);
-            }
-        }
-
-        if !new_addrs_needing_connect.is_empty() {
-            let mut set = tokio::task::JoinSet::new();
-            for (addr_key, miners_at_addr) in new_addrs_needing_connect {
-                info!(
-                    "New address detected, establishing QUIC connection: {}",
-                    addr_key
-                );
-                let ep = endpoint.clone();
-                let wh = wallet_hotkey.clone();
-                let s = signer.clone();
-                set.spawn(connect_and_authenticate_per_address(
-                    ep,
-                    wh,
-                    s,
-                    addr_key,
-                    miners_at_addr,
-                    timeout,
-                ));
-            }
-
-            let mut results = Vec::new();
-            while let Some(join_result) = set.join_next().await {
-                match join_result {
-                    Ok((addr_key, conn_result, authenticated)) => {
-                        results.push((addr_key, conn_result, authenticated));
-                    }
-                    Err(e) => {
-                        error!("Connection task panicked: {}", e);
-                    }
-                }
-            }
-
-            let mut state = self.state.write().await;
-            for (addr_key, conn_result, authenticated) in results {
-                match conn_result {
-                    Ok(connection) => {
-                        if authenticated.is_empty() {
-                            warn!(
-                                "No hotkeys authenticated at {}, dropping connection",
-                                addr_key
-                            );
-                            connection.close(0u32.into(), b"no_authenticated_hotkeys");
-                        } else {
-                            for miner in authenticated {
-                                state.register_miner(miner);
-                            }
-                            state.established_connections.insert(addr_key, connection);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to {}: {}", addr_key, e);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        update_miner_registry_inner(
+            &self.state,
+            &endpoint,
+            &self.wallet_hotkey,
+            &signer,
+            &self.config,
+            miners,
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -791,8 +665,168 @@ impl LightningClient {
         Ok(stats)
     }
 
+    #[cfg(feature = "subtensor")]
+    pub async fn start_metagraph_monitor(
+        &self,
+        monitor_config: MetagraphMonitorConfig,
+    ) -> Result<()> {
+        self.stop_metagraph_monitor().await;
+
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| LightningError::Connection("QUIC endpoint not initialized".into()))?
+            .clone();
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| LightningError::Signing("No signer configured".into()))?
+            .clone();
+
+        let subtensor = tokio::time::timeout(
+            Duration::from_secs(30),
+            OnlineClient::<PolkadotConfig>::from_url(&monitor_config.subtensor_endpoint),
+        )
+        .await
+        .map_err(|_| LightningError::Handler("subtensor connection timed out after 30s".into()))?
+        .map_err(|e| LightningError::Handler(format!("connecting to subtensor: {}", e)))?;
+
+        let mut metagraph = Metagraph::new(monitor_config.netuid);
+        tokio::time::timeout(Duration::from_secs(60), metagraph.sync(&subtensor))
+            .await
+            .map_err(|_| {
+                LightningError::Handler("initial metagraph sync timed out after 60s".into())
+            })??;
+
+        let miners = metagraph.quic_miners();
+        info!(
+            netuid = monitor_config.netuid,
+            miners = miners.len(),
+            "initial metagraph sync complete"
+        );
+
+        update_miner_registry_inner(
+            &self.state,
+            &endpoint,
+            &self.wallet_hotkey,
+            &signer,
+            &self.config,
+            miners,
+        )
+        .await?;
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = self.state.clone();
+        let wallet_hotkey = self.wallet_hotkey.clone();
+        let config = self.config.clone();
+        let sync_interval = monitor_config.sync_interval;
+        let subtensor_url = monitor_config.subtensor_endpoint.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(sync_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            let mut subtensor = subtensor;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown_rx.changed() => {
+                        info!("metagraph monitor shutting down");
+                        return;
+                    }
+                }
+
+                let sync_result =
+                    tokio::time::timeout(Duration::from_secs(60), metagraph.sync(&subtensor)).await;
+
+                let needs_reconnect = match sync_result {
+                    Ok(Ok(())) => {
+                        let miners = metagraph.quic_miners();
+                        info!(
+                            netuid = metagraph.netuid,
+                            miners = miners.len(),
+                            block = metagraph.block,
+                            "metagraph resync complete"
+                        );
+                        if let Err(e) = update_miner_registry_inner(
+                            &state,
+                            &endpoint,
+                            &wallet_hotkey,
+                            &signer,
+                            &config,
+                            miners,
+                        )
+                        .await
+                        {
+                            error!("registry update after metagraph sync failed: {}", e);
+                        }
+                        false
+                    }
+                    Ok(Err(e)) => {
+                        error!("metagraph sync failed, reconnecting to subtensor: {}", e);
+                        true
+                    }
+                    Err(_) => {
+                        error!("metagraph sync timed out after 60s, reconnecting to subtensor");
+                        true
+                    }
+                };
+
+                if needs_reconnect {
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        OnlineClient::<PolkadotConfig>::from_url(&subtensor_url),
+                    )
+                    .await
+                    {
+                        Ok(Ok(new_client)) => {
+                            subtensor = new_client;
+                            info!("subtensor client reconnected");
+                        }
+                        Ok(Err(e)) => {
+                            error!("subtensor reconnection failed: {}", e);
+                        }
+                        Err(_) => {
+                            error!("subtensor reconnection timed out after 30s");
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut st = self.state.write().await;
+        st.metagraph_shutdown = Some(shutdown_tx);
+        st.metagraph_handle = Some(handle);
+        Ok(())
+    }
+
+    #[cfg(feature = "subtensor")]
+    pub async fn stop_metagraph_monitor(&self) {
+        let (shutdown_tx, handle) = {
+            let mut st = self.state.write().await;
+            (st.metagraph_shutdown.take(), st.metagraph_handle.take())
+        };
+        if let Some(tx) = shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(mut handle) = handle {
+            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+            {
+                warn!("metagraph monitor did not shut down within 5s, aborting");
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+
     #[instrument(skip(self))]
     pub async fn close_all_connections(&self) -> Result<()> {
+        #[cfg(feature = "subtensor")]
+        self.stop_metagraph_monitor().await;
+
         let mut state = self.state.write().await;
 
         for (_, connection) in state.established_connections.drain() {
@@ -806,6 +840,219 @@ impl LightningClient {
         info!("All Lightning QUIC connections closed");
         Ok(())
     }
+}
+
+async fn update_miner_registry_inner(
+    state: &Arc<RwLock<ClientState>>,
+    endpoint: &Endpoint,
+    wallet_hotkey: &str,
+    signer: &Arc<dyn Signer>,
+    config: &LightningClientConfig,
+    miners: Vec<QuicAxonInfo>,
+) -> Result<()> {
+    let new_by_hotkey: HashMap<String, QuicAxonInfo> = miners
+        .iter()
+        .map(|m| (m.hotkey.clone(), m.clone()))
+        .collect();
+
+    let new_hotkeys_needing_auth: Vec<QuicAxonInfo>;
+    let new_addrs_needing_connect: HashMap<String, Vec<QuicAxonInfo>>;
+    {
+        let mut st = state.write().await;
+
+        let active_hotkeys: Vec<String> = st.active_miners.keys().cloned().collect();
+        for hotkey in active_hotkeys {
+            if !new_by_hotkey.contains_key(&hotkey) {
+                if let Some(miner) = st.deregister_miner(&hotkey) {
+                    let addr_key = miner.addr_key();
+                    info!("Miner {} deregistered from {}", hotkey, addr_key);
+                    if !st.addr_has_hotkeys(&addr_key) {
+                        if let Some(connection) = st.established_connections.remove(&addr_key) {
+                            connection.close(0u32.into(), b"miner_deregistered");
+                        }
+                        st.reconnect_states.remove(&addr_key);
+                    }
+                }
+            }
+        }
+
+        let active_addrs: HashSet<String> =
+            st.active_miners.values().map(|m| m.addr_key()).collect();
+        for addr_key in &active_addrs {
+            if st.reconnect_states.remove(addr_key).is_some() {
+                info!(
+                    "Registry refresh reset reconnection backoff for {}",
+                    addr_key
+                );
+            }
+        }
+
+        for new_miner in new_by_hotkey.values() {
+            if let Some(old_miner) = st.active_miners.get(&new_miner.hotkey) {
+                let old_addr = old_miner.addr_key();
+                let new_addr = new_miner.addr_key();
+                if old_addr != new_addr {
+                    info!(
+                        "Miner {} changed address from {} to {}",
+                        new_miner.hotkey, old_addr, new_addr
+                    );
+                    st.deregister_miner(&new_miner.hotkey);
+                    if !st.addr_has_hotkeys(&old_addr) {
+                        if let Some(conn) = st.established_connections.remove(&old_addr) {
+                            conn.close(0u32.into(), b"miner_addr_changed");
+                        }
+                        st.reconnect_states.remove(&old_addr);
+                    }
+                }
+            }
+        }
+
+        let new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
+            .values()
+            .filter(|m| !st.active_miners.contains_key(&m.hotkey))
+            .cloned()
+            .collect();
+
+        let mut need_auth = Vec::new();
+        let mut need_connect: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
+        for miner in new_hotkeys {
+            let addr_key = miner.addr_key();
+            if st.established_connections.contains_key(&addr_key) {
+                need_auth.push(miner);
+            } else {
+                need_connect.entry(addr_key).or_default().push(miner);
+            }
+        }
+
+        let active_count = st.established_connections.len();
+        let remaining_capacity = config.max_connections.saturating_sub(active_count);
+        if need_connect.len() > remaining_capacity {
+            warn!(
+                "Connection limit ({}) reached with {} active, skipping {} of {} new addresses",
+                config.max_connections,
+                active_count,
+                need_connect.len() - remaining_capacity,
+                need_connect.len()
+            );
+        }
+
+        new_hotkeys_needing_auth = need_auth;
+        new_addrs_needing_connect = need_connect.into_iter().take(remaining_capacity).collect();
+    }
+
+    let timeout = config.connect_timeout;
+    let max_fp = config.max_frame_payload_bytes;
+
+    if !new_hotkeys_needing_auth.is_empty() {
+        let miners_with_conns: Vec<(QuicAxonInfo, Connection)> = {
+            let st = state.read().await;
+            new_hotkeys_needing_auth
+                .into_iter()
+                .filter_map(|miner| {
+                    let addr_key = miner.addr_key();
+                    st.established_connections
+                        .get(&addr_key)
+                        .cloned()
+                        .map(|conn| (miner, conn))
+                })
+                .collect()
+        };
+
+        let mut authenticated = Vec::new();
+        for (miner, conn) in &miners_with_conns {
+            let addr_key = miner.addr_key();
+            match tokio::time::timeout(
+                timeout,
+                authenticate_handshake(conn, &miner.hotkey, wallet_hotkey, signer, max_fp),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    info!(
+                        "Authenticated new miner {} on existing connection to {}",
+                        miner.hotkey, addr_key
+                    );
+                    authenticated.push(miner.clone());
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Handshake failed for new hotkey {} at {}: {}",
+                        miner.hotkey, addr_key, e
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "Handshake timed out for new hotkey {} at {}",
+                        miner.hotkey, addr_key
+                    );
+                }
+            }
+        }
+
+        let mut st = state.write().await;
+        for miner in authenticated {
+            st.register_miner(miner);
+        }
+    }
+
+    if !new_addrs_needing_connect.is_empty() {
+        let mut set = tokio::task::JoinSet::new();
+        for (addr_key, miners_at_addr) in new_addrs_needing_connect {
+            info!(
+                "New address detected, establishing QUIC connection: {}",
+                addr_key
+            );
+            let ep = endpoint.clone();
+            let wh = wallet_hotkey.to_string();
+            let s = signer.clone();
+            set.spawn(connect_and_authenticate_per_address(
+                ep,
+                wh,
+                s,
+                addr_key,
+                miners_at_addr,
+                timeout,
+                max_fp,
+            ));
+        }
+
+        let mut results = Vec::new();
+        while let Some(join_result) = set.join_next().await {
+            match join_result {
+                Ok((addr_key, conn_result, authenticated)) => {
+                    results.push((addr_key, conn_result, authenticated));
+                }
+                Err(e) => {
+                    error!("Connection task panicked: {}", e);
+                }
+            }
+        }
+
+        let mut st = state.write().await;
+        for (addr_key, conn_result, authenticated) in results {
+            match conn_result {
+                Ok(connection) => {
+                    if authenticated.is_empty() {
+                        warn!(
+                            "No hotkeys authenticated at {}, dropping connection",
+                            addr_key
+                        );
+                        connection.close(0u32.into(), b"no_authenticated_hotkeys");
+                    } else {
+                        for miner in authenticated {
+                            st.register_miner(miner);
+                        }
+                        st.established_connections.insert(addr_key, connection);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect to {}: {}", addr_key, e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn get_peer_cert_fingerprint(connection: &Connection) -> Option<[u8; 32]> {
@@ -838,6 +1085,7 @@ async fn connect_and_authenticate_per_address(
     addr_key: String,
     miners_at_addr: Vec<QuicAxonInfo>,
     timeout: Duration,
+    max_frame_payload: usize,
 ) -> (String, Result<Connection>, Vec<QuicAxonInfo>) {
     let first = match miners_at_addr.first() {
         Some(m) => m,
@@ -865,7 +1113,13 @@ async fn connect_and_authenticate_per_address(
     for miner in &miners_at_addr {
         match tokio::time::timeout(
             timeout,
-            authenticate_handshake(&conn, &miner.hotkey, &wallet_hotkey, &signer),
+            authenticate_handshake(
+                &conn,
+                &miner.hotkey,
+                &wallet_hotkey,
+                &signer,
+                max_frame_payload,
+            ),
         )
         .await
         {
@@ -893,6 +1147,7 @@ async fn authenticate_handshake(
     expected_hotkey: &str,
     wallet_hotkey: &str,
     signer: &Arc<dyn Signer>,
+    max_frame_payload: usize,
 ) -> Result<()> {
     let peer_cert_fp = get_peer_cert_fingerprint(connection).ok_or_else(|| {
         LightningError::Handshake("peer certificate not available for fingerprinting".to_string())
@@ -915,7 +1170,7 @@ async fn authenticate_handshake(
         signature: BASE64_STANDARD.encode(&signature_bytes),
     };
 
-    let response = send_handshake(connection, handshake_request).await?;
+    let response = send_handshake(connection, handshake_request, max_frame_payload).await?;
     if !response.accepted {
         return Err(LightningError::Handshake(
             "Handshake rejected by miner".into(),
@@ -948,9 +1203,17 @@ async fn connect_and_handshake(
     miner: QuicAxonInfo,
     wallet_hotkey: String,
     signer: Arc<dyn Signer>,
+    max_frame_payload: usize,
 ) -> Result<Connection> {
     let connection = quic_connect(&endpoint, &miner.addr_key(), &miner.ip).await?;
-    authenticate_handshake(&connection, &miner.hotkey, &wallet_hotkey, &signer).await?;
+    authenticate_handshake(
+        &connection,
+        &miner.hotkey,
+        &wallet_hotkey,
+        &signer,
+        max_frame_payload,
+    )
+    .await?;
     Ok(connection)
 }
 
@@ -1014,6 +1277,7 @@ async fn verify_miner_response_signature(
 async fn send_handshake(
     connection: &Connection,
     request: HandshakeRequest,
+    max_frame_payload: usize,
 ) -> Result<HandshakeResponse> {
     let (mut send, mut recv) = connection.open_bi().await.map_err(|e| {
         LightningError::Connection(format!("Failed to open bidirectional stream: {}", e))
@@ -1025,7 +1289,7 @@ async fn send_handshake(
 
     write_frame_and_finish(&mut send, MessageType::HandshakeRequest, &request_bytes).await?;
 
-    let (msg_type, payload) = read_frame(&mut recv).await?;
+    let (msg_type, payload) = read_frame(&mut recv, max_frame_payload).await?;
     if msg_type != MessageType::HandshakeResponse {
         return Err(LightningError::Handshake(format!(
             "Expected HandshakeResponse, got {:?}",
@@ -1057,6 +1321,7 @@ async fn send_synapse_frame(send: &mut quinn::SendStream, request: QuicRequest) 
 async fn send_synapse_packet(
     connection: &Connection,
     request: QuicRequest,
+    max_frame_payload: usize,
 ) -> Result<QuicResponse> {
     let (mut send, mut recv) = connection
         .open_bi()
@@ -1067,7 +1332,7 @@ async fn send_synapse_packet(
 
     send_synapse_frame(&mut send, request).await?;
 
-    let (msg_type, payload) = read_frame(&mut recv).await?;
+    let (msg_type, payload) = read_frame(&mut recv, max_frame_payload).await?;
 
     match msg_type {
         MessageType::SynapseResponse => {
@@ -1100,6 +1365,8 @@ async fn send_synapse_packet(
 async fn open_streaming_synapse(
     connection: &Connection,
     request: QuicRequest,
+    max_frame_payload: usize,
+    max_stream_payload: usize,
 ) -> Result<StreamingResponse> {
     let (mut send, recv) = connection
         .open_bi()
@@ -1108,7 +1375,11 @@ async fn open_streaming_synapse(
 
     send_synapse_frame(&mut send, request).await?;
 
-    Ok(StreamingResponse { recv })
+    Ok(StreamingResponse {
+        recv,
+        max_payload: max_frame_payload,
+        max_stream_payload,
+    })
 }
 
 fn generate_nonce() -> String {
@@ -1231,6 +1502,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
+    }
+
+    #[test]
+    fn with_config_rejects_frame_payload_below_minimum() {
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_frame_payload_bytes = 512;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_rejects_frame_payload_above_u32_max() {
+        let too_big: u128 = u32::MAX as u128 + 1;
+        let val = match usize::try_from(too_big) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_frame_payload_bytes = val;
+        cfg.max_stream_payload_bytes = val;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_rejects_stream_below_frame() {
+        let mut cfg = LightningClientConfig::default();
+        cfg.max_stream_payload_bytes = cfg.max_frame_payload_bytes - 1;
+        assert!(LightningClient::with_config("hk".into(), cfg).is_err());
+    }
+
+    #[test]
+    fn with_config_default_succeeds() {
+        assert!(
+            LightningClient::with_config("hk".into(), LightningClientConfig::default()).is_ok()
+        );
     }
 }
 

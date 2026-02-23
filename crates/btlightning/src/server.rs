@@ -6,6 +6,7 @@ use crate::types::{
     handshake_request_message, handshake_response_message, hashmap_to_rmpv_map, read_frame,
     serialize_to_rmpv_map, write_frame, write_frame_and_finish, HandshakeRequest,
     HandshakeResponse, MessageType, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
+    DEFAULT_MAX_FRAME_PAYLOAD,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -43,6 +44,7 @@ pub struct LightningServerConfig {
     pub validator_permit_refresh_secs: u64,
     pub max_tracked_rate_ips: usize,
     pub handler_timeout_secs: u64,
+    pub max_frame_payload_bytes: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -61,6 +63,7 @@ impl Default for LightningServerConfig {
             validator_permit_refresh_secs: 1800,
             max_tracked_rate_ips: 10_000,
             handler_timeout_secs: 30,
+            max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
         }
     }
 }
@@ -252,6 +255,19 @@ impl LightningServer {
             return Err(LightningError::Config(format!(
                 "handler_timeout_secs ({}) must be less than idle_timeout_secs ({})",
                 config.handler_timeout_secs, config.idle_timeout_secs
+            )));
+        }
+        if config.max_frame_payload_bytes < 1_048_576 {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
+                config.max_frame_payload_bytes
+            )));
+        }
+        if config.max_frame_payload_bytes > u32::MAX as usize {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must not exceed {} (u32::MAX)",
+                config.max_frame_payload_bytes,
+                u32::MAX
             )));
         }
         Ok(Self {
@@ -595,7 +611,7 @@ impl LightningServer {
         connection: Arc<quinn::Connection>,
         ctx: ServerContext,
     ) {
-        let frame = match read_frame(&mut recv).await {
+        let frame = match read_frame(&mut recv, ctx.config.max_frame_payload_bytes).await {
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to read frame: {}", e);

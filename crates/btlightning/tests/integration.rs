@@ -1911,7 +1911,8 @@ async fn max_connections_counts_addresses_not_hotkeys() {
             max_connections: 1,
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
     client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
     client.create_endpoint().await.unwrap();
 
