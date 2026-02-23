@@ -1229,9 +1229,14 @@ mod tests {
 
     #[test]
     fn with_config_rejects_frame_payload_above_u32_max() {
+        let too_big: u128 = u32::MAX as u128 + 1;
+        let val = match usize::try_from(too_big) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
         let mut cfg = LightningClientConfig::default();
-        cfg.max_frame_payload_bytes = u32::MAX as usize + 1;
-        cfg.max_stream_payload_bytes = u32::MAX as usize + 1;
+        cfg.max_frame_payload_bytes = val;
+        cfg.max_stream_payload_bytes = val;
         assert!(LightningClient::with_config("hk".into(), cfg).is_err());
     }
 
