@@ -1,5 +1,41 @@
 use crate::error::{LightningError, Result};
-use sp_core::{sr25519, Pair};
+use base64::{prelude::BASE64_STANDARD, Engine};
+use sp_core::{crypto::Ss58Codec, sr25519, Pair};
+
+pub(crate) async fn verify_sr25519_signature(
+    hotkey_ss58: &str,
+    signature_b64: &str,
+    message: &str,
+) -> Result<bool> {
+    let public_key = sr25519::Public::from_ss58check(hotkey_ss58)
+        .map_err(|e| LightningError::Handshake(format!("Invalid SS58 address: {}", e)))?;
+
+    let signature_bytes = BASE64_STANDARD
+        .decode(signature_b64)
+        .map_err(|e| LightningError::Handshake(format!("Failed to decode signature: {}", e)))?;
+
+    if signature_bytes.len() != 64 {
+        return Err(LightningError::Handshake(format!(
+            "Invalid signature length: {}",
+            signature_bytes.len()
+        )));
+    }
+
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(&signature_bytes);
+    let signature = sr25519::Signature::from_raw(sig_array);
+    let msg = message.to_owned();
+
+    tokio::task::spawn_blocking(move || {
+        Ok(sr25519::Pair::verify(
+            &signature,
+            msg.as_bytes(),
+            &public_key,
+        ))
+    })
+    .await
+    .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?
+}
 
 pub trait Signer: Send + Sync {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;

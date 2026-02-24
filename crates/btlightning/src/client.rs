@@ -11,7 +11,7 @@ use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig as RustlsClientConfig;
-use sp_core::{blake2_256, crypto::Ss58Codec, sr25519, Pair};
+use sp_core::blake2_256;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -175,7 +175,9 @@ impl StreamingResponse {
         let mut chunks = Vec::new();
         let mut total_size: usize = 0;
         while let Some(chunk) = self.next_chunk().await? {
-            total_size += chunk.len();
+            total_size = total_size.checked_add(chunk.len()).ok_or_else(|| {
+                LightningError::Stream("streaming response size overflow".to_string())
+            })?;
             if total_size > self.max_stream_payload {
                 return Err(LightningError::Stream(format!(
                     "streaming response exceeded {} byte aggregate limit",
@@ -1243,33 +1245,12 @@ async fn verify_miner_response_signature(
         cert_fp_b64,
     );
 
-    let public_key = sr25519::Public::from_ss58check(&response.miner_hotkey).map_err(|e| {
-        LightningError::Handshake(format!(
-            "Invalid miner SS58 address {}: {}",
-            response.miner_hotkey, e
-        ))
-    })?;
-
-    let signature_bytes = BASE64_STANDARD.decode(&response.signature).map_err(|e| {
-        LightningError::Handshake(format!("Failed to decode miner signature: {}", e))
-    })?;
-
-    if signature_bytes.len() != 64 {
-        return Err(LightningError::Handshake(format!(
-            "Invalid miner signature length: {}",
-            signature_bytes.len()
-        )));
-    }
-
-    let mut sig_array = [0u8; 64];
-    sig_array.copy_from_slice(&signature_bytes);
-    let signature = sr25519::Signature::from_raw(sig_array);
-
-    let valid = tokio::task::spawn_blocking(move || {
-        sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
-    })
-    .await
-    .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?;
+    let valid = crate::signing::verify_sr25519_signature(
+        &response.miner_hotkey,
+        &response.signature,
+        &expected_message,
+    )
+    .await?;
 
     if !valid {
         return Err(LightningError::Handshake(
@@ -1397,7 +1378,7 @@ fn generate_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sp_core::crypto::Ss58Codec;
+    use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 
     const MINER_SEED: [u8; 32] = [1u8; 32];
     const VALIDATOR_SEED: [u8; 32] = [2u8; 32];
@@ -1464,7 +1445,7 @@ mod tests {
         let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("decode miner signature"));
+        assert!(err.to_string().contains("Failed to decode signature"));
     }
 
     #[tokio::test]
@@ -1474,7 +1455,7 @@ mod tests {
         let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Invalid miner signature length"));
+        assert!(err.to_string().contains("Invalid signature length"));
     }
 
     #[tokio::test]
@@ -1484,7 +1465,7 @@ mod tests {
         let err = verify_miner_response_signature(&resp, &validator_hotkey(), "n", "fp")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Invalid miner SS58 address"));
+        assert!(err.to_string().contains("Invalid SS58 address"));
     }
 
     #[tokio::test]

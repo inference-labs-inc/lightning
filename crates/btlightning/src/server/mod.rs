@@ -730,7 +730,7 @@ mod tests {
         let request = HandshakeRequest {
             validator_hotkey: String::new(),
             timestamp: now.saturating_sub(max_signature_age),
-            nonce: "test-nonce".to_string(),
+            nonce: "00000000000000000000000000000000".to_string(),
             signature: String::new(),
         };
         let nonces = Arc::new(RwLock::new(IndexMap::new()));
@@ -861,38 +861,43 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn make_signed_request(nonce: &str, fp: &[u8; 32]) -> HandshakeRequest {
+        use crate::types::handshake_request_message;
+        let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
+        let hotkey = pair.public().to_ss58check();
+        let timestamp = unix_timestamp_secs();
+        let fp_b64 = BASE64_STANDARD.encode(fp);
+        let message = handshake_request_message(&hotkey, timestamp, nonce, &fp_b64);
+        let signature = pair.sign(message.as_bytes());
+        HandshakeRequest {
+            validator_hotkey: hotkey,
+            timestamp,
+            nonce: nonce.to_string(),
+            signature: BASE64_STANDARD.encode(signature.0),
+        }
+    }
+
     #[tokio::test]
     async fn verify_rejects_nonce_replay() {
         let nonces = Arc::new(RwLock::new(IndexMap::new()));
-        let request = HandshakeRequest {
-            validator_hotkey: String::new(),
-            timestamp: unix_timestamp_secs(),
-            nonce: "replay-test-nonce".to_string(),
-            signature: String::new(),
-        };
+        let fp = [0u8; 32];
+        let request = make_signed_request("00000000000000000000000000000001", &fp);
 
-        let _ = handshake::verify_validator_signature(
-            &request,
-            nonces.clone(),
-            &[0u8; 32],
-            300,
-            100_000,
-        )
-        .await;
-
+        let result =
+            handshake::verify_validator_signature(&request, nonces.clone(), &fp, 300, 100_000)
+                .await;
+        assert!(result, "first use of nonce must succeed");
         assert!(
-            nonces.read().await.contains_key("replay-test-nonce"),
-            "nonce must be consumed even when signature verification fails"
+            nonces
+                .read()
+                .await
+                .contains_key("00000000000000000000000000000001"),
+            "nonce must be consumed after successful verification"
         );
 
-        let result = handshake::verify_validator_signature(
-            &request,
-            nonces.clone(),
-            &[0u8; 32],
-            300,
-            100_000,
-        )
-        .await;
+        let result =
+            handshake::verify_validator_signature(&request, nonces.clone(), &fp, 300, 100_000)
+                .await;
         assert!(!result, "replayed nonce must be rejected");
     }
 
@@ -1077,15 +1082,10 @@ mod tests {
                 .insert(format!("nonce-{}", i), 1000 + i);
         }
 
-        let request = HandshakeRequest {
-            validator_hotkey: String::new(),
-            timestamp: unix_timestamp_secs(),
-            nonce: "trigger-eviction".to_string(),
-            signature: String::new(),
-        };
+        let fp = [0u8; 32];
+        let request = make_signed_request("00000000000000000000000000000002", &fp);
 
-        let _ = handshake::verify_validator_signature(&request, nonces.clone(), &[0u8; 32], 300, 3)
-            .await;
+        let _ = handshake::verify_validator_signature(&request, nonces.clone(), &fp, 300, 3).await;
 
         let nonces_guard = nonces.read().await;
         assert!(
@@ -1107,12 +1107,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_rejects_invalid_nonce_format() {
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "not-a-hex-nonce".to_string(),
+            signature: String::new(),
+        };
+        let result =
+            handshake::verify_validator_signature(&request, nonces, &[0u8; 32], 300, 100_000).await;
+        assert!(!result, "non-hex nonce must be rejected");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_short_nonce() {
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
+        let request = HandshakeRequest {
+            validator_hotkey: String::new(),
+            timestamp: unix_timestamp_secs(),
+            nonce: "abcdef".to_string(),
+            signature: String::new(),
+        };
+        let result =
+            handshake::verify_validator_signature(&request, nonces, &[0u8; 32], 300, 100_000).await;
+        assert!(!result, "short nonce must be rejected");
+    }
+
+    #[tokio::test]
     async fn verify_rejects_future_timestamp() {
         let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: String::new(),
             timestamp: unix_timestamp_secs() + 120,
-            nonce: "future-ts".to_string(),
+            nonce: "00000000000000000000000000000003".to_string(),
             signature: String::new(),
         };
         let result =
@@ -1126,7 +1154,7 @@ mod tests {
         let request = HandshakeRequest {
             validator_hotkey: "not_valid_ss58".to_string(),
             timestamp: unix_timestamp_secs(),
-            nonce: "ss58-test".to_string(),
+            nonce: "00000000000000000000000000000004".to_string(),
             signature: BASE64_STANDARD.encode([0u8; 64]),
         };
         let result =
@@ -1142,7 +1170,7 @@ mod tests {
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
-            nonce: "b64-test".to_string(),
+            nonce: "00000000000000000000000000000005".to_string(),
             signature: "not-valid-base64!!!".to_string(),
         };
         let result =
@@ -1158,7 +1186,7 @@ mod tests {
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
-            nonce: "len-test".to_string(),
+            nonce: "00000000000000000000000000000006".to_string(),
             signature: BASE64_STANDARD.encode([0u8; 32]),
         };
         let result =
@@ -1174,7 +1202,7 @@ mod tests {
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
-            nonce: "crypto-test".to_string(),
+            nonce: "00000000000000000000000000000007".to_string(),
             signature: BASE64_STANDARD.encode([0u8; 64]),
         };
         let result =
@@ -1189,7 +1217,7 @@ mod tests {
         let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
         let hotkey = pair.public().to_ss58check();
         let timestamp = unix_timestamp_secs();
-        let nonce = "valid-sig-test";
+        let nonce = "00000000000000000000000000000008";
         let fp = [0u8; 32];
         let fp_b64 = BASE64_STANDARD.encode(fp);
         let message = handshake_request_message(&hotkey, timestamp, nonce, &fp_b64);
