@@ -292,7 +292,7 @@ async fn handle_streaming_synapse_with_timeout(
         }
     };
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ctx.config.streaming_channel_buffer);
     let synapse_type = packet.synapse_type.clone();
 
     let handle = tokio::spawn(async move { handler.handle(&synapse_type, packet.data, tx).await });

@@ -53,7 +53,9 @@ pub(crate) fn hashmap_to_rmpv_map(data: HashMap<String, rmpv::Value>) -> rmpv::V
     )
 }
 
-pub fn serialize_to_rmpv_map<T: serde::Serialize>(val: &T) -> Result<HashMap<String, rmpv::Value>> {
+pub(crate) fn serialize_to_rmpv_map<T: serde::Serialize>(
+    val: &T,
+) -> Result<HashMap<String, rmpv::Value>> {
     let rmpv_val = val
         .serialize(NamedSerializer)
         .map_err(|e| LightningError::Serialization(e.to_string()))?;

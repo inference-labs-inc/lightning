@@ -23,6 +23,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 async-trait = "0.1"
 tracing = "0.1"
 base64 = "0.22"
+indexmap = "2"
 rand = "0.8"
 sp-core = "34.0"
 bittensor_wallet = { version = "4.0.1", package = "btwallet", default-features = false, optional = true }
