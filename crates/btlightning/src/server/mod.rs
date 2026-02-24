@@ -513,11 +513,19 @@ impl LightningServer {
             .collect();
 
         let mut addr_index = self.ctx.addr_to_hotkey.write().await;
-        for hotkey in &stale {
-            if let Some(conn) = remove_hotkey_from_maps(&mut connections, &mut addr_index, hotkey) {
-                conn.connection.close(0u32.into(), b"cleanup");
-                info!("Cleaned up stale connection from validator: {}", hotkey);
-            }
+        let removed: Vec<(String, ValidatorConnection)> = stale
+            .iter()
+            .filter_map(|hotkey| {
+                remove_hotkey_from_maps(&mut connections, &mut addr_index, hotkey)
+                    .map(|conn| (hotkey.clone(), conn))
+            })
+            .collect();
+        drop(addr_index);
+        drop(connections);
+
+        for (hotkey, conn) in removed {
+            conn.connection.close(0u32.into(), b"cleanup");
+            info!("Cleaned up stale connection from validator: {}", hotkey);
         }
 
         Ok(())
