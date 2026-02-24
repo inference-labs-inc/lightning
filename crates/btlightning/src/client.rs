@@ -767,6 +767,11 @@ impl LightningClient {
         let wallet_hotkey = self.wallet_hotkey.clone();
         let config = self.config.clone();
         let sync_interval = monitor_config.sync_interval;
+        if sync_interval.is_zero() {
+            return Err(LightningError::Config(
+                "sync_interval must be non-zero".into(),
+            ));
+        }
         let subtensor_url = monitor_config.subtensor_endpoint.clone();
 
         let handle = tokio::spawn(async move {

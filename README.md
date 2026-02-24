@@ -82,13 +82,15 @@ let result: MyResult = response.deserialize_data()?;
 Fan out to every QUIC miner on the subnet concurrently:
 
 ```rust,ignore
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
+let client = Arc::new(client);
 let miners = metagraph.quic_miners();
 let mut tasks = JoinSet::new();
 for miner in miners {
     let req = QuicRequest::from_typed("MyQuery", &MyQuery { prompt: "hello".into() })?;
-    let client = &client;
+    let client = Arc::clone(&client);
     tasks.spawn(async move {
         (miner.hotkey.clone(), client.query_axon(miner, req).await)
     });
