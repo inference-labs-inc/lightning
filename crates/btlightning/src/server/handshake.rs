@@ -1,14 +1,13 @@
 use super::response::rejected_handshake;
 use super::ServerContext;
 use crate::error::{LightningError, Result};
-use crate::signing::Signer;
+use crate::signing::{verify_sr25519_signature, Signer};
 use crate::types::{
     handshake_request_message, handshake_response_message, HandshakeRequest, HandshakeResponse,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
 use indexmap::IndexMap;
-use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -163,6 +162,37 @@ pub(super) async fn verify_validator_signature(
         return false;
     }
 
+    if !is_valid_nonce(&request.nonce) {
+        error!("Invalid nonce format");
+        return false;
+    }
+
+    let fp_b64 = BASE64_STANDARD.encode(cert_fingerprint);
+    let expected_message = handshake_request_message(
+        &request.validator_hotkey,
+        request.timestamp,
+        &request.nonce,
+        &fp_b64,
+    );
+
+    let sig_valid = match verify_sr25519_signature(
+        &request.validator_hotkey,
+        &request.signature,
+        &expected_message,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Signature verification failed: {}", e);
+            return false;
+        }
+    };
+
+    if !sig_valid {
+        return false;
+    }
+
     {
         let mut nonces = used_nonces.write().await;
         if nonces.contains_key(&request.nonce) {
@@ -179,50 +209,7 @@ pub(super) async fn verify_validator_signature(
         }
     }
 
-    let fp_b64 = BASE64_STANDARD.encode(cert_fingerprint);
-    let expected_message = handshake_request_message(
-        &request.validator_hotkey,
-        request.timestamp,
-        &request.nonce,
-        &fp_b64,
-    );
-
-    let public_key = match sr25519::Public::from_ss58check(&request.validator_hotkey) {
-        Ok(pk) => pk,
-        Err(e) => {
-            error!("Invalid SS58 address {}: {}", request.validator_hotkey, e);
-            return false;
-        }
-    };
-
-    let signature_bytes = match BASE64_STANDARD.decode(&request.signature) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to decode base64 signature: {}", e);
-            return false;
-        }
-    };
-
-    if signature_bytes.len() != 64 {
-        error!("Invalid signature length: {}", signature_bytes.len());
-        return false;
-    }
-
-    let mut signature_array = [0u8; 64];
-    signature_array.copy_from_slice(&signature_bytes);
-    let signature = sr25519::Signature::from_raw(signature_array);
-
-    match tokio::task::spawn_blocking(move || {
-        sr25519::Pair::verify(&signature, expected_message.as_bytes(), &public_key)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!("signature verification task failed: {}", e);
-            false
-        }
-    }
+    true
 }
 
 pub(super) async fn sign_handshake_response(
@@ -269,4 +256,8 @@ pub(super) async fn check_handshake_rate(ctx: &ServerContext, ip: IpAddr) -> boo
     }
     attempts.push(now);
     true
+}
+
+fn is_valid_nonce(nonce: &str) -> bool {
+    nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())
 }
