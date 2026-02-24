@@ -239,7 +239,7 @@ pub(super) async fn verify_synapse_auth(
     {
         let connections_guard = ctx.connections.read().await;
         if let Some(conn) = connections_guard.get(&validator_hotkey) {
-            if !conn.verified {
+            if !conn.is_verified() {
                 error!(
                     "Connection not verified for validator: {}",
                     validator_hotkey

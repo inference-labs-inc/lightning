@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 pub trait ValidatorPermitResolver: Send + Sync {
     fn resolve_permitted_validators(&self) -> Result<HashSet<String>>;
@@ -61,7 +61,7 @@ pub struct ValidatorConnection {
     pub connection_id: String,
     pub established_at: u64,
     pub last_activity: AtomicU64,
-    pub verified: bool,
+    verified: bool,
     pub connection: Arc<quinn::Connection>,
 }
 
@@ -85,6 +85,10 @@ impl ValidatorConnection {
     pub fn verify(&mut self) {
         self.verified = true;
         self.update_activity();
+    }
+
+    pub fn is_verified(&self) -> bool {
+        self.verified
     }
 
     pub fn update_activity(&self) {
@@ -403,13 +407,35 @@ impl LightningServer {
         while let Some(conn) = endpoint.accept().await {
             let ctx = self.ctx.clone();
 
-            tokio::spawn(async move {
-                match conn.await {
-                    Ok(connection) => {
-                        dispatch::handle_connection(connection, ctx).await;
+            {
+                let connections = ctx.connections.read().await;
+                if connections.len() >= ctx.config.max_connections {
+                    let addr_index = ctx.addr_to_hotkey.read().await;
+                    if !addr_index.contains_key(&conn.remote_address()) {
+                        warn!(
+                            "Connection limit reached ({}/{}), refusing incoming connection from {}",
+                            connections.len(),
+                            ctx.config.max_connections,
+                            conn.remote_address()
+                        );
+                        conn.refuse();
+                        continue;
                     }
+                }
+            }
+
+            tokio::spawn(async move {
+                match conn.accept() {
+                    Ok(connecting) => match connecting.await {
+                        Ok(connection) => {
+                            dispatch::handle_connection(connection, ctx).await;
+                        }
+                        Err(e) => {
+                            error!("Connection failed: {}", e);
+                        }
+                    },
                     Err(e) => {
-                        error!("Connection failed: {}", e);
+                        error!("Connection accept failed: {}", e);
                     }
                 }
             });
@@ -430,13 +456,13 @@ impl LightningServer {
             "verified_connections".to_string(),
             connections
                 .values()
-                .filter(|c| c.verified)
+                .filter(|c| c.is_verified())
                 .count()
                 .to_string(),
         );
 
         for (validator, connection) in connections.iter() {
-            if connection.verified {
+            if connection.is_verified() {
                 stats.insert(
                     format!("connection_{}", validator),
                     connection.connection_id.clone(),
@@ -524,6 +550,9 @@ impl Drop for LightningServer {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
+        }
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0u32.into(), b"dropped");
         }
     }
 }
