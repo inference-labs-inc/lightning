@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
+const MAX_FUTURE_CLOCK_SKEW_SECS: u64 = 60;
 
 pub(super) async fn process_handshake(
     request: HandshakeRequest,
@@ -154,7 +155,7 @@ pub(super) async fn verify_validator_signature(
         return false;
     }
 
-    if request.timestamp > current_time + 60 {
+    if request.timestamp > current_time + MAX_FUTURE_CLOCK_SKEW_SECS {
         error!(
             "Signature timestamp too far in future: {} (current: {})",
             request.timestamp, current_time

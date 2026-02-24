@@ -334,11 +334,13 @@ impl LightningServer {
         });
         *self.cleanup_handle.lock().await = Some(handle);
 
-        if self.ctx.config.require_validator_permit && self.ctx.permit_resolver.is_none() {
-            error!("require_validator_permit is enabled but no ValidatorPermitResolver is configured -- all handshakes will be rejected");
-        }
-
-        if !self.ctx.config.require_validator_permit {
+        if self.ctx.config.require_validator_permit {
+            if self.ctx.permit_resolver.is_none() {
+                return Err(LightningError::Config(
+                    "require_validator_permit is enabled but no ValidatorPermitResolver is configured".to_string(),
+                ));
+            }
+        } else {
             info!("Validator permit checking is disabled -- any hotkey with a valid signature can connect");
         }
 
