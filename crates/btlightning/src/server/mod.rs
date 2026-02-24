@@ -25,11 +25,22 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, instrument, warn};
 
+/// Resolves the set of validator hotkeys allowed to connect.
+///
+/// Called periodically by the server (interval controlled by
+/// [`LightningServerConfig::validator_permit_refresh_secs`]). Return the full set each
+/// time; the server replaces the cached set atomically.
 pub trait ValidatorPermitResolver: Send + Sync {
+    /// Returns the current set of permitted validator SS58 hotkeys.
     fn resolve_permitted_validators(&self) -> Result<HashSet<String>>;
 }
 
+/// Synchronous synapse request handler.
+///
+/// Runs on a blocking thread. Use [`AsyncSynapseHandler`] for async work or
+/// [`StreamingSynapseHandler`] for chunked responses.
 pub trait SynapseHandler: Send + Sync {
+    /// Processes the request and returns the response payload map.
     fn handle(
         &self,
         synapse_type: &str,
@@ -37,8 +48,12 @@ pub trait SynapseHandler: Send + Sync {
     ) -> Result<HashMap<String, rmpv::Value>>;
 }
 
+/// Async synapse request handler.
+///
+/// Preferred over [`SynapseHandler`] when the handler performs I/O or other async work.
 #[async_trait::async_trait]
 pub trait AsyncSynapseHandler: Send + Sync {
+    /// Processes the request asynchronously and returns the response payload map.
     async fn handle(
         &self,
         synapse_type: &str,
@@ -46,8 +61,13 @@ pub trait AsyncSynapseHandler: Send + Sync {
     ) -> Result<HashMap<String, rmpv::Value>>;
 }
 
+/// Streaming synapse handler that sends response chunks incrementally.
+///
+/// Send raw byte chunks through the `sender` channel. The server frames each chunk
+/// as a `StreamChunk` and sends a `StreamEnd` when the handler returns.
 #[async_trait::async_trait]
 pub trait StreamingSynapseHandler: Send + Sync {
+    /// Processes the request, writing response chunks to `sender`.
     async fn handle(
         &self,
         synapse_type: &str,
@@ -56,13 +76,19 @@ pub trait StreamingSynapseHandler: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Server-side state for an authenticated validator QUIC connection.
 #[derive(Debug)]
 pub struct ValidatorConnection {
+    /// SS58 hotkey of the connected validator.
     pub validator_hotkey: String,
+    /// Opaque connection identifier returned in the handshake response.
     pub connection_id: String,
+    /// UNIX timestamp when the connection was established.
     pub established_at: u64,
+    /// UNIX timestamp of last synapse activity (atomically updated).
     pub last_activity: AtomicU64,
     verified: bool,
+    /// Underlying QUIC connection handle.
     pub connection: Arc<quinn::Connection>,
 }
 
@@ -83,15 +109,18 @@ impl ValidatorConnection {
         }
     }
 
+    /// Marks this connection as handshake-verified and updates the activity timestamp.
     pub fn verify(&mut self) {
         self.verified = true;
         self.update_activity();
     }
 
+    /// Returns whether the handshake has been verified for this connection.
     pub fn is_verified(&self) -> bool {
         self.verified
     }
 
+    /// Bumps the `last_activity` timestamp to now.
     pub fn update_activity(&self) {
         self.last_activity
             .store(unix_timestamp_secs(), Ordering::Relaxed);
@@ -143,6 +172,10 @@ struct ServerContext {
     config: LightningServerConfig,
 }
 
+/// QUIC server that accepts validator connections and dispatches synapse requests to handlers.
+///
+/// Lifecycle: [`new`](Self::new) / [`with_config`](Self::with_config) -> register handlers ->
+/// [`start`](Self::start) -> [`serve_forever`](Self::serve_forever).
 pub struct LightningServer {
     host: String,
     port: u16,
@@ -168,10 +201,12 @@ macro_rules! register_handler {
 }
 
 impl LightningServer {
+    /// Creates a server with default configuration.
     pub fn new(miner_hotkey: String, host: String, port: u16) -> Result<Self> {
         Self::with_config(miner_hotkey, host, port, LightningServerConfig::default())
     }
 
+    /// Creates a server with the given configuration, validating constraints.
     pub fn with_config(
         miner_hotkey: String,
         host: String,
@@ -203,18 +238,22 @@ impl LightningServer {
         })
     }
 
+    /// Sets the miner signer from a raw 32-byte sr25519 seed.
     pub fn set_miner_keypair(&mut self, keypair_bytes: [u8; 32]) {
         self.ctx.miner_signer = Some(Arc::new(Sr25519Signer::from_seed(keypair_bytes)));
     }
 
+    /// Sets a custom [`Signer`] for handshake response signing.
     pub fn set_miner_signer(&mut self, signer: Box<dyn Signer>) {
         self.ctx.miner_signer = Some(Arc::from(signer));
     }
 
+    /// Sets the [`ValidatorPermitResolver`] used to gate incoming connections.
     pub fn set_validator_permit_resolver(&mut self, resolver: Box<dyn ValidatorPermitResolver>) {
         self.ctx.permit_resolver = Some(Arc::from(resolver));
     }
 
+    /// Loads the miner signer from a Bittensor wallet on disk. Requires the `btwallet` feature.
     #[cfg(feature = "btwallet")]
     pub fn set_miner_wallet(
         &mut self,
@@ -268,6 +307,7 @@ impl LightningServer {
         ))
     }
 
+    /// Returns the local socket address the server is bound to. Requires [`start`](Self::start).
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.endpoint
             .as_ref()
@@ -278,6 +318,8 @@ impl LightningServer {
             .map_err(|e| LightningError::Config(format!("failed to get local address: {}", e)))
     }
 
+    /// Creates the QUIC endpoint and TLS certificate. Does not accept connections yet;
+    /// call [`serve_forever`](Self::serve_forever) after this.
     #[instrument(skip(self), fields(host = %self.host, port = self.port))]
     pub async fn start(&mut self) -> Result<()> {
         info!(
@@ -329,6 +371,8 @@ impl LightningServer {
         Ok(())
     }
 
+    /// Enters the accept loop, handling incoming QUIC connections until the endpoint is closed.
+    /// Spawns nonce cleanup and validator permit refresh background tasks.
     #[instrument(skip(self))]
     pub async fn serve_forever(&self) -> Result<()> {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
@@ -469,6 +513,7 @@ impl LightningServer {
         Ok(())
     }
 
+    /// Returns a map of connection statistics (total, verified, per-validator).
     #[instrument(skip(self))]
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
         let connections = self.ctx.connections.read().await;
@@ -499,6 +544,7 @@ impl LightningServer {
         Ok(stats)
     }
 
+    /// Closes connections idle for longer than `max_idle_seconds`.
     #[instrument(skip(self))]
     pub async fn cleanup_stale_connections(&self, max_idle_seconds: u64) -> Result<()> {
         let mut connections = self.ctx.connections.write().await;
@@ -531,14 +577,17 @@ impl LightningServer {
         Ok(())
     }
 
+    /// Returns the number of nonces currently stored in the replay-protection set.
     pub async fn get_active_nonce_count(&self) -> usize {
         self.ctx.used_nonces.read().await.len()
     }
 
+    /// Returns the number of validators in the current permit set.
     pub async fn get_permitted_validator_count(&self) -> usize {
         self.ctx.permitted_validators.read().await.len()
     }
 
+    /// Manually evicts expired nonces from the replay-protection set.
     #[instrument(skip(self))]
     pub async fn cleanup_expired_nonces(&self) {
         let now = unix_timestamp_secs();
@@ -551,6 +600,8 @@ impl LightningServer {
         );
     }
 
+    /// Gracefully shuts down the server: aborts background tasks, closes all connections,
+    /// and closes the QUIC endpoint.
     #[instrument(skip(self))]
     pub async fn stop(&self) -> Result<()> {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
@@ -618,6 +669,10 @@ where
     }
 }
 
+/// Wraps a typed synchronous closure as a [`SynapseHandler`].
+///
+/// The closure receives a deserialized `Req` and returns `Result<Resp, E>`.
+/// Serialization to/from the MessagePack data map is handled automatically.
 pub fn typed_handler<Req, Resp, E, F>(f: F) -> Arc<dyn SynapseHandler>
 where
     Req: serde::de::DeserializeOwned + Send + 'static,
@@ -660,6 +715,10 @@ where
     }
 }
 
+/// Wraps a typed async closure as an [`AsyncSynapseHandler`].
+///
+/// The closure receives a deserialized `Req` and returns `Future<Output = Result<Resp, E>>`.
+/// Serialization to/from the MessagePack data map is handled automatically.
 pub fn typed_async_handler<Req, Resp, E, F, Fut>(f: F) -> Arc<dyn AsyncSynapseHandler>
 where
     Req: serde::de::DeserializeOwned + Send + 'static,

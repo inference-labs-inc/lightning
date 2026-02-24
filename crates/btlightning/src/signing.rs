@@ -37,15 +37,22 @@ pub(crate) async fn verify_sr25519_signature(
     .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?
 }
 
+/// Trait for signing handshake and authentication messages.
+///
+/// Implementations must produce sr25519-compatible 64-byte signatures.
+/// The signer is called from a blocking context via `spawn_blocking`.
 pub trait Signer: Send + Sync {
+    /// Signs `message` and returns the raw 64-byte sr25519 signature.
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// [`Signer`] backed by an in-memory sr25519 keypair derived from a 32-byte seed.
 pub struct Sr25519Signer {
     pair: sr25519::Pair,
 }
 
 impl Sr25519Signer {
+    /// Derives the keypair from a 32-byte seed.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         Self {
             pair: sr25519::Pair::from_seed(&seed),
@@ -60,6 +67,9 @@ impl Signer for Sr25519Signer {
     }
 }
 
+/// [`Signer`] that delegates to an arbitrary closure.
+///
+/// Useful for bridging to external signing backends (HSMs, Python callbacks, etc.).
 pub struct CallbackSigner<F: Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync> {
     callback: F,
 }
@@ -148,6 +158,9 @@ mod tests {
     }
 }
 
+/// [`Signer`] backed by a `btwallet` keypair loaded from the Bittensor wallet directory.
+///
+/// Requires the `btwallet` feature.
 #[cfg(feature = "btwallet")]
 pub struct BtWalletSigner {
     keypair: bittensor_wallet::Keypair,
@@ -155,10 +168,12 @@ pub struct BtWalletSigner {
 
 #[cfg(feature = "btwallet")]
 impl BtWalletSigner {
+    /// Wraps an existing `btwallet::Keypair`.
     pub fn new(keypair: bittensor_wallet::Keypair) -> Self {
         Self { keypair }
     }
 
+    /// Loads the hotkey keypair from `~/<path>/<name>/hotkeys/<hotkey_name>`.
     pub fn from_wallet(name: &str, path: &str, hotkey_name: &str) -> Result<Self> {
         let wallet = bittensor_wallet::Wallet::new(
             Some(name.to_string()),

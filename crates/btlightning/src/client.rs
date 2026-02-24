@@ -25,20 +25,33 @@ use crate::metagraph::{Metagraph, MetagraphMonitorConfig};
 #[cfg(feature = "subtensor")]
 use subxt::{OnlineClient, PolkadotConfig};
 
+/// Configuration for [`LightningClient`].
+///
+/// All timeouts use [`Duration`] and have sensible defaults via [`Default`].
 #[derive(Clone)]
 pub struct LightningClientConfig {
+    /// Timeout for QUIC connection establishment and handshake. Default: 10s.
     pub connect_timeout: Duration,
+    /// QUIC idle timeout before the connection is closed. Default: 150s.
     pub idle_timeout: Duration,
+    /// Interval for QUIC keep-alive pings. Default: 30s.
     pub keep_alive_interval: Duration,
+    /// Initial backoff delay after a failed reconnection attempt. Default: 1s.
     pub reconnect_initial_backoff: Duration,
+    /// Maximum backoff delay between reconnection attempts. Default: 60s.
     pub reconnect_max_backoff: Duration,
+    /// Maximum consecutive reconnection attempts before giving up. Default: 5.
     pub reconnect_max_retries: u32,
+    /// Maximum number of concurrent QUIC connections. Default: 1024.
     pub max_connections: usize,
+    /// Maximum single-frame payload size in bytes. Default: 64 MiB.
     pub max_frame_payload_bytes: usize,
     /// Aggregate byte limit for `collect_all()` across all chunks in a streaming response.
     /// Defaults to `DEFAULT_MAX_FRAME_PAYLOAD` (64 MiB). Increase for multi-chunk streams
     /// that exceed a single frame. Must be >= `max_frame_payload_bytes`.
     pub max_stream_payload_bytes: usize,
+    /// Metagraph monitor configuration. When set, `initialize_connections` starts
+    /// a background task that periodically re-syncs the subnet and updates connections.
     #[cfg(feature = "subtensor")]
     pub metagraph: Option<MetagraphMonitorConfig>,
 }
@@ -126,6 +139,10 @@ impl ClientState {
     }
 }
 
+/// Handle for reading a chunked streaming response from a miner.
+///
+/// Returned by [`LightningClient::query_axon_stream`]. Call [`next_chunk`](Self::next_chunk)
+/// in a loop or use [`collect_all`](Self::collect_all) to buffer the full response.
 pub struct StreamingResponse {
     recv: quinn::RecvStream,
     max_payload: usize,
@@ -133,6 +150,7 @@ pub struct StreamingResponse {
 }
 
 impl StreamingResponse {
+    /// Reads the next chunk from the stream. Returns `None` on successful completion.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         match read_frame(&mut self.recv, self.max_payload).await {
             Ok((MessageType::StreamChunk, payload)) => {
@@ -171,6 +189,7 @@ impl StreamingResponse {
         }
     }
 
+    /// Reads all remaining chunks into a `Vec`. Enforces `max_stream_payload_bytes`.
     pub async fn collect_all(&mut self) -> Result<Vec<Vec<u8>>> {
         let mut chunks = Vec::new();
         let mut total_size: usize = 0;
@@ -190,6 +209,11 @@ impl StreamingResponse {
     }
 }
 
+/// QUIC client for sending synapse requests to Bittensor miners.
+///
+/// Manages persistent, authenticated QUIC connections to one or more miners.
+/// Each connection is established with a mutual sr25519 handshake; subsequent
+/// synapse requests reuse the connection without re-authenticating.
 pub struct LightningClient {
     config: LightningClientConfig,
     wallet_hotkey: String,
@@ -199,11 +223,13 @@ pub struct LightningClient {
 }
 
 impl LightningClient {
+    /// Creates a client with default configuration. Panics only if defaults are invalid.
     pub fn new(wallet_hotkey: String) -> Self {
         Self::with_config(wallet_hotkey, LightningClientConfig::default())
             .expect("default config is always valid")
     }
 
+    /// Creates a client with the given configuration, validating constraints.
     pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Result<Self> {
         if config.max_frame_payload_bytes < 1_048_576 {
             return Err(LightningError::Config(format!(
@@ -242,11 +268,14 @@ impl LightningClient {
         })
     }
 
+    /// Sets the [`Signer`] used for handshake authentication. Must be called before
+    /// `initialize_connections`.
     pub fn set_signer(&mut self, signer: Box<dyn Signer>) {
         self.signer = Some(Arc::from(signer));
         info!("Signer configured");
     }
 
+    /// Loads the signer from a Bittensor wallet on disk. Requires the `btwallet` feature.
     #[cfg(feature = "btwallet")]
     pub fn set_wallet(
         &mut self,
@@ -260,6 +289,10 @@ impl LightningClient {
         Ok(())
     }
 
+    /// Opens QUIC connections and performs sr25519 handshakes with the given miners.
+    ///
+    /// Miners sharing an `ip:port` are multiplexed over a single QUIC connection.
+    /// If `metagraph` is configured, a background monitor is also started.
     #[instrument(skip(self, miners), fields(miner_count = miners.len()))]
     pub async fn initialize_connections(&mut self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         self.create_endpoint().await?;
@@ -363,6 +396,8 @@ impl LightningClient {
         Ok(())
     }
 
+    /// Creates the QUIC client endpoint bound to `0.0.0.0:0`. Called automatically by
+    /// `initialize_connections`; only call directly if you need the endpoint before connecting.
     #[instrument(skip(self))]
     pub async fn create_endpoint(&mut self) -> Result<()> {
         let mut tls_config = RustlsClientConfig::builder()
@@ -399,6 +434,9 @@ impl LightningClient {
         Ok(())
     }
 
+    /// Sends a synapse request to a miner and waits for the full response.
+    ///
+    /// Transparently reconnects if the underlying QUIC connection has died.
     #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon(
         &self,
@@ -424,6 +462,7 @@ impl LightningClient {
         }
     }
 
+    /// Like [`query_axon`](Self::query_axon) but aborts after `timeout`.
     #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port, timeout_ms = timeout.as_millis() as u64))]
     pub async fn query_axon_with_timeout(
         &self,
@@ -436,6 +475,7 @@ impl LightningClient {
             .map_err(|_| LightningError::Transport("query timed out".into()))?
     }
 
+    /// Sends a synapse request and returns a [`StreamingResponse`] for incremental chunk reading.
     #[instrument(skip(self, axon_info, request), fields(miner_ip = %axon_info.ip, miner_port = axon_info.port))]
     pub async fn query_axon_stream(
         &self,
@@ -623,6 +663,8 @@ impl LightningClient {
         }
     }
 
+    /// Reconciles the active miner set: adds new miners, removes stale ones,
+    /// and opens/closes QUIC connections as needed.
     #[instrument(skip(self, miners), fields(miner_count = miners.len()))]
     pub async fn update_miner_registry(&self, miners: Vec<QuicAxonInfo>) -> Result<()> {
         let endpoint = self
@@ -646,6 +688,7 @@ impl LightningClient {
         .await
     }
 
+    /// Returns a map of connection statistics (total connections, active miners, per-address status).
     #[instrument(skip(self))]
     pub async fn get_connection_stats(&self) -> Result<HashMap<String, String>> {
         let state = self.state.read().await;
@@ -667,6 +710,8 @@ impl LightningClient {
         Ok(stats)
     }
 
+    /// Starts a background task that periodically syncs the metagraph and updates connections.
+    /// Requires the `subtensor` feature.
     #[cfg(feature = "subtensor")]
     pub async fn start_metagraph_monitor(
         &self,
@@ -803,6 +848,7 @@ impl LightningClient {
         Ok(())
     }
 
+    /// Stops the metagraph monitor background task if running.
     #[cfg(feature = "subtensor")]
     pub async fn stop_metagraph_monitor(&self) {
         let (shutdown_tx, handle) = {
@@ -824,6 +870,7 @@ impl LightningClient {
         }
     }
 
+    /// Gracefully closes all QUIC connections and clears the miner registry.
     #[instrument(skip(self))]
     pub async fn close_all_connections(&self) -> Result<()> {
         #[cfg(feature = "subtensor")]

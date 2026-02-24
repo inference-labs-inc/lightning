@@ -3,15 +3,21 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Default maximum frame payload size (64 MiB).
 pub const DEFAULT_MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 const _: () = assert!(DEFAULT_MAX_FRAME_PAYLOAD >= 1_048_576);
 const _: () = assert!(DEFAULT_MAX_FRAME_PAYLOAD <= u32::MAX as usize);
 
+/// Network address and identity of a Bittensor miner's QUIC axon endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicAxonInfo {
+    /// SS58-encoded sr25519 public key of the miner.
     pub hotkey: String,
+    /// IPv4 address the miner advertises on-chain.
     pub ip: String,
+    /// QUIC port the miner listens on.
     pub port: u16,
+    /// Axon protocol identifier (4 = QUIC).
     pub protocol: u8,
 }
 
@@ -25,6 +31,7 @@ impl QuicAxonInfo {
         }
     }
 
+    /// Returns `"ip:port"` (or `"[ip]:port"` for IPv6) used as the connection map key.
     pub fn addr_key(&self) -> String {
         if self.ip.contains(':') {
             format!("[{}]:{}", self.ip, self.port)
@@ -447,9 +454,12 @@ impl serde::ser::SerializeStructVariant for SerializeStructVariant {
     }
 }
 
+/// Client-side request sent to a miner via [`LightningClient::query_axon`](crate::LightningClient::query_axon).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicRequest {
+    /// Handler name the server dispatches on (e.g. `"MyQuery"`).
     pub synapse_type: String,
+    /// Arbitrary MessagePack key-value payload deserialized by the handler.
     pub data: HashMap<String, rmpv::Value>,
 }
 
@@ -458,6 +468,7 @@ impl QuicRequest {
         Self { synapse_type, data }
     }
 
+    /// Constructs a request by serializing a typed struct into the data map.
     pub fn from_typed<T: serde::Serialize>(
         synapse_type: impl Into<String>,
         data: &T,
@@ -469,16 +480,22 @@ impl QuicRequest {
     }
 }
 
+/// Response returned from a miner after processing a synapse request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicResponse {
+    /// Whether the handler completed without error.
     pub success: bool,
+    /// Handler return payload as MessagePack key-value pairs.
     pub data: HashMap<String, rmpv::Value>,
+    /// Client-measured round-trip latency in milliseconds.
     pub latency_ms: f64,
+    /// Error message when `success` is false.
     #[serde(default)]
     pub error: Option<String>,
 }
 
 impl QuicResponse {
+    /// Converts to `Result`, returning `Err` when `success` is false.
     pub fn into_result(self) -> Result<Self> {
         if self.success {
             Ok(self)
@@ -489,31 +506,45 @@ impl QuicResponse {
         }
     }
 
+    /// Deserializes the `data` map into a typed struct `T`.
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         let map_value = hashmap_to_rmpv_map(self.data.clone());
         rmpv::ext::from_value(map_value).map_err(|e| LightningError::Serialization(e.to_string()))
     }
 }
 
+/// Validator-to-miner handshake initiation sent over a new QUIC stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
+    /// SS58 hotkey of the connecting validator.
     pub validator_hotkey: String,
+    /// UNIX epoch seconds at signing time.
     pub timestamp: u64,
+    /// 128-bit hex-encoded cryptographic nonce (replay protection).
     pub nonce: String,
+    /// Base64-encoded sr25519 signature over `handshake:<hotkey>:<ts>:<nonce>:<cert_fp>`.
     pub signature: String,
 }
 
+/// Miner-to-validator handshake reply confirming or rejecting authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeResponse {
+    /// SS58 hotkey of the miner.
     pub miner_hotkey: String,
+    /// UNIX epoch seconds at signing time.
     pub timestamp: u64,
+    /// Base64-encoded sr25519 signature over the response message.
     pub signature: String,
+    /// Whether the miner accepted the validator's handshake.
     pub accepted: bool,
+    /// Opaque identifier for this authenticated connection.
     pub connection_id: String,
+    /// Base64-encoded BLAKE2-256 hash of the TLS certificate DER bytes.
     #[serde(default)]
     pub cert_fingerprint: Option<String>,
 }
 
+/// Wire-level synapse request frame sent after handshake authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynapsePacket {
     pub synapse_type: String,
@@ -521,6 +552,7 @@ pub struct SynapsePacket {
     pub timestamp: u64,
 }
 
+/// Wire-level synapse response frame returned by the miner handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynapseResponse {
     pub success: bool,
@@ -541,6 +573,7 @@ pub struct StreamEnd {
     pub error: Option<String>,
 }
 
+/// Single-byte discriminant in the 5-byte frame header identifying the payload kind.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
@@ -596,6 +629,8 @@ async fn read_exact_from_recv(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(
 const INCREMENTAL_READ_THRESHOLD: usize = 1_048_576;
 const READ_CHUNK_SIZE: usize = 65_536;
 
+/// Parses the 5-byte frame header (`[msg_type, payload_len_be32]`) from a byte slice
+/// and returns the message type and payload sub-slice.
 pub fn parse_frame_header(data: &[u8], max_payload: usize) -> Result<(MessageType, &[u8])> {
     if data.len() < FRAME_HEADER_SIZE {
         return Err(LightningError::Transport(

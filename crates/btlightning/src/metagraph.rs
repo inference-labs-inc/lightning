@@ -29,7 +29,9 @@ fn format_ipv4(ip_raw: u128, ip_type: u8) -> String {
     )
 }
 
+/// WebSocket endpoint for the Bittensor Finney (mainnet) subtensor node.
 pub const FINNEY_ENDPOINT: &str = "wss://entrypoint-finney.opentensor.ai:443";
+/// WebSocket endpoint for the Bittensor testnet subtensor node.
 pub const TESTNET_ENDPOINT: &str = "wss://test.finney.opentensor.ai:443";
 
 #[derive(Decode)]
@@ -75,27 +77,44 @@ struct NeuronInfoLiteRaw {
     _pruning_score: Compact<u16>,
 }
 
+/// Decoded on-chain neuron metadata for a single UID in a subnet.
 #[derive(Debug, Clone)]
 pub struct NeuronInfo {
+    /// Neuron UID within the subnet.
     pub uid: u16,
+    /// SS58-encoded sr25519 hotkey.
     pub hotkey: String,
+    /// Total staked TAO (in RAO).
     pub stake: u64,
+    /// Whether the neuron is marked active on-chain.
     pub is_active: bool,
+    /// Advertised axon IPv4 address (empty if not set or IPv6).
     pub axon_ip: String,
+    /// Advertised axon port.
     pub axon_port: u16,
+    /// Axon protocol identifier (4 = QUIC, 0 = HTTP).
     pub axon_protocol: u8,
+    /// Whether this neuron holds a validator permit.
     pub validator_permit: bool,
 }
 
+/// In-memory snapshot of a Bittensor subnet's metagraph.
+///
+/// Call [`sync`](Self::sync) to fetch the latest state from a subtensor node.
 pub struct Metagraph {
+    /// Subnet network UID.
     pub netuid: u16,
+    /// All neurons in the subnet at the last sync point.
     pub neurons: Vec<NeuronInfo>,
+    /// Number of neurons in the subnet (`SubnetworkN`).
     pub n: u16,
+    /// Block number at which the metagraph was last synced.
     pub block: u64,
     hotkey_to_uid: HashMap<String, u16>,
 }
 
 impl Metagraph {
+    /// Creates an empty metagraph for the given subnet. Call [`sync`](Self::sync) to populate.
     pub fn new(netuid: u16) -> Self {
         Self {
             netuid,
@@ -106,6 +125,8 @@ impl Metagraph {
         }
     }
 
+    /// Fetches the latest metagraph from a subtensor node, replacing all neuron data.
+    /// Tries the runtime API first, falling back to individual storage queries.
     pub async fn sync(&mut self, client: &OnlineClient<PolkadotConfig>) -> Result<()> {
         let block_ref = client
             .blocks()
@@ -247,6 +268,8 @@ impl Metagraph {
         Ok(neurons.into_iter().flatten().collect())
     }
 
+    /// Returns axon info for active, non-validator neurons advertising QUIC (protocol 4)
+    /// on a globally routable IPv4 address.
     pub fn quic_miners(&self) -> Vec<QuicAxonInfo> {
         self.neurons
             .iter()
@@ -266,10 +289,12 @@ impl Metagraph {
             .collect()
     }
 
+    /// Looks up a neuron by UID.
     pub fn get_neuron(&self, uid: u16) -> Option<&NeuronInfo> {
         self.neurons.iter().find(|n| n.uid == uid)
     }
 
+    /// Looks up a neuron's UID by SS58 hotkey.
     pub fn get_uid_by_hotkey(&self, hotkey: &str) -> Option<u16> {
         self.hotkey_to_uid.get(hotkey).copied()
     }
@@ -327,10 +352,15 @@ pub fn is_valid_ip(ip_str: &str) -> bool {
     true
 }
 
+/// Configuration for the background metagraph sync task started by
+/// [`LightningClient::start_metagraph_monitor`](crate::LightningClient::start_metagraph_monitor).
 #[derive(Clone)]
 pub struct MetagraphMonitorConfig {
+    /// Subnet network UID to monitor.
     pub netuid: u16,
+    /// WebSocket URL of the subtensor node.
     pub subtensor_endpoint: String,
+    /// How often to re-sync the metagraph.
     pub sync_interval: Duration,
 }
 
@@ -343,6 +373,7 @@ impl MetagraphMonitorConfig {
         }
     }
 
+    /// Preset for Finney mainnet with a 10-minute sync interval.
     pub fn finney(netuid: u16) -> Self {
         Self {
             netuid,
@@ -351,6 +382,7 @@ impl MetagraphMonitorConfig {
         }
     }
 
+    /// Preset for the Bittensor testnet with a 10-minute sync interval.
     pub fn testnet(netuid: u16) -> Self {
         Self {
             netuid,

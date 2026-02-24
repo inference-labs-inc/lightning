@@ -1,14 +1,23 @@
 use std::fmt;
 
+/// Errors returned by Lightning operations.
 #[derive(Debug)]
 pub enum LightningError {
+    /// QUIC connection establishment or reconnection failure.
     Connection(String),
+    /// sr25519 handshake authentication failure between validator and miner.
     Handshake(String),
+    /// Cryptographic signing operation failure.
     Signing(String),
+    /// MessagePack serialization or deserialization failure.
     Serialization(String),
+    /// QUIC stream-level I/O or framing error.
     Transport(String),
+    /// Synapse handler returned an application-level error.
     Handler(String),
+    /// Invalid configuration parameter.
     Config(String),
+    /// Streaming response error (chunk read failure or server-side abort).
     Stream(String),
 }
 
@@ -30,11 +39,13 @@ impl fmt::Display for LightningError {
 impl std::error::Error for LightningError {}
 
 impl LightningError {
+    /// Shorthand for `LightningError::Handler(e.to_string())`.
     pub fn handler(e: impl std::fmt::Display) -> Self {
         LightningError::Handler(e.to_string())
     }
 }
 
+/// Convenience alias for `std::result::Result<T, LightningError>`.
 pub type Result<T> = std::result::Result<T, LightningError>;
 
 #[cfg(test)]

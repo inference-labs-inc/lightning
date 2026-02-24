@@ -1,23 +1,42 @@
 use crate::error::{LightningError, Result};
 use crate::types::DEFAULT_MAX_FRAME_PAYLOAD;
 
+/// Configuration for [`LightningServer`](super::LightningServer).
+///
+/// All fields have sensible defaults via [`Default`]. The server validates constraints
+/// (e.g. `keep_alive_interval_secs < idle_timeout_secs`) at construction time.
 #[derive(Debug, Copy, Clone)]
 #[non_exhaustive]
 pub struct LightningServerConfig {
+    /// Maximum age of a handshake signature before rejection. Default: 300s. Max: 3600s.
     pub max_signature_age_secs: u64,
+    /// QUIC idle timeout. Default: 150s.
     pub idle_timeout_secs: u64,
+    /// QUIC keep-alive interval. Must be less than `idle_timeout_secs`. Default: 30s.
     pub keep_alive_interval_secs: u64,
+    /// Interval for automatic nonce eviction. Default: 60s.
     pub nonce_cleanup_interval_secs: u64,
+    /// Maximum concurrent validator connections. Default: 128.
     pub max_connections: usize,
+    /// Hard cap on stored nonces (oldest evicted first). Default: 100,000.
     pub max_nonce_entries: usize,
+    /// Per-stream handshake timeout. Must be less than `idle_timeout_secs`. Default: 10s.
     pub handshake_timeout_secs: u64,
+    /// Per-IP handshake rate limit (attempts per 60-second window). Default: 30.
     pub max_handshake_attempts_per_minute: u32,
+    /// Maximum concurrent bidirectional QUIC streams per connection. Default: 128.
     pub max_concurrent_bidi_streams: u32,
+    /// When true, only validators returned by [`ValidatorPermitResolver`](super::ValidatorPermitResolver) can connect. Default: false.
     pub require_validator_permit: bool,
+    /// Interval for refreshing the validator permit cache. Default: 1800s.
     pub validator_permit_refresh_secs: u64,
+    /// Maximum number of distinct IPs tracked for handshake rate limiting. Default: 10,000.
     pub max_tracked_rate_ips: usize,
+    /// Per-request handler timeout. Must be less than `idle_timeout_secs`. Default: 30s.
     pub handler_timeout_secs: u64,
+    /// Maximum single-frame payload size in bytes. Default: 64 MiB. Minimum: 1 MiB.
     pub max_frame_payload_bytes: usize,
+    /// Capacity of the `mpsc` channel between streaming handlers and the frame writer. Default: 32.
     pub streaming_channel_buffer: usize,
 }
 
