@@ -36,13 +36,13 @@ response = client.query_axon(
 btlightning = "0.1"
 ```
 
-```rust
-use btlightning::{LightningClient, Sr25519Signer, QuicAxonInfo, QuicRequest};
+```rust,ignore
+use btlightning::{LightningClient, Sr25519Signer, QuicAxonInfo};
 
 let mut client = LightningClient::new("5GrwvaEF...".into());
 client.set_signer(Box::new(Sr25519Signer::from_seed(seed)));
 client.initialize_connections(vec![
-    QuicAxonInfo::new("5FHneW46...".into(), "192.168.1.1".into(), 8443, 4, 0, 0)
+    QuicAxonInfo::new("5FHneW46...".into(), "192.168.1.1".into(), 8443, 4)
 ]).await?;
 ```
 
