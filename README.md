@@ -2,6 +2,11 @@
     <h2>Ligh𝞽ning</h2>
     <p><strong>Rust QUIC transport layer for Bittensor</strong></p>
     <p>Persistent QUIC connections with sr25519 handshake authentication for validator-miner communication.</p>
+    <p>
+        <a href="https://crates.io/crates/btlightning"><img src="https://img.shields.io/crates/v/btlightning" alt="crates.io"></a>
+        <a href="https://docs.rs/btlightning/latest/btlightning/"><img src="https://img.shields.io/docsrs/btlightning" alt="docs.rs"></a>
+        <a href="https://pypi.org/project/btlightning/"><img src="https://img.shields.io/pypi/v/btlightning" alt="PyPI"></a>
+    </p>
 </div>
 
 ## Python
