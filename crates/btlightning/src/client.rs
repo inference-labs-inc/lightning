@@ -1184,10 +1184,16 @@ async fn authenticate_handshake(
         )));
     }
 
-    if let Some(ref resp_fp) = response.cert_fingerprint {
-        if *resp_fp != peer_cert_fp_b64 {
+    match response.cert_fingerprint {
+        Some(ref resp_fp) if *resp_fp == peer_cert_fp_b64 => {}
+        Some(_) => {
             return Err(LightningError::Handshake(
                 "Cert fingerprint mismatch between TLS session and handshake response".to_string(),
+            ));
+        }
+        None => {
+            return Err(LightningError::Handshake(
+                "Miner handshake response omitted required cert fingerprint".to_string(),
             ));
         }
     }
