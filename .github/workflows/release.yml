@@ -22,7 +22,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: inference-labs-inc/set-toml-version@v1
+      - uses: inference-labs-inc/set-toml-version@main
         with:
           version: ${{ github.event.release.tag_name }}
           files: crates/btlightning/Cargo.toml
@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: inference-labs-inc/set-toml-version@v1
+      - uses: inference-labs-inc/set-toml-version@main
         with:
           version: ${{ github.event.release.tag_name }}
           files: |
@@ -86,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: inference-labs-inc/set-toml-version@v1
+      - uses: inference-labs-inc/set-toml-version@main
         with:
           version: ${{ github.event.release.tag_name }}
           files: |
