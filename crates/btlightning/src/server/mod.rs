@@ -105,7 +105,7 @@ pub(super) fn evict_stale_nonces(
     hard_cap: Option<usize>,
 ) {
     let cutoff = now.saturating_sub(max_age);
-    nonces.retain(|_, ts| *ts >= cutoff);
+    nonces.retain(|_, ts| *ts > cutoff);
     if let Some(cap) = hard_cap {
         while nonces.len() > cap {
             nonces.shift_remove_index(0);
