@@ -1446,6 +1446,7 @@ dependencies = [
  "base64 0.22.1",
  "btwallet",
  "futures-util",
+ "indexmap 2.13.0",
  "parity-scale-codec",
  "proptest",
  "quinn",

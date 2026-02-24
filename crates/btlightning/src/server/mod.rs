@@ -11,6 +11,7 @@ use crate::signing::BtWalletSigner;
 use crate::signing::{Signer, Sr25519Signer};
 use crate::types::{hashmap_to_rmpv_map, serialize_to_rmpv_map};
 use crate::util::unix_timestamp_secs;
+use indexmap::IndexMap;
 use quinn::{Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
@@ -104,7 +105,7 @@ struct ServerContext {
     synapse_handlers: Arc<RwLock<HashMap<String, Arc<dyn SynapseHandler>>>>,
     async_handlers: Arc<RwLock<HashMap<String, Arc<dyn AsyncSynapseHandler>>>>,
     streaming_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamingSynapseHandler>>>>,
-    used_nonces: Arc<RwLock<HashMap<String, u64>>>,
+    used_nonces: Arc<RwLock<IndexMap<String, u64>>>,
     handshake_rate: Arc<RwLock<HashMap<IpAddr, Vec<u64>>>>,
     permit_resolver: Option<Arc<dyn ValidatorPermitResolver>>,
     permitted_validators: Arc<RwLock<HashSet<String>>>,
@@ -144,7 +145,7 @@ impl LightningServer {
                 synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
                 async_handlers: Arc::new(RwLock::new(HashMap::new())),
                 streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
-                used_nonces: Arc::new(RwLock::new(HashMap::new())),
+                used_nonces: Arc::new(RwLock::new(IndexMap::new())),
                 handshake_rate: Arc::new(RwLock::new(HashMap::new())),
                 permit_resolver: None,
                 permitted_validators: Arc::new(RwLock::new(HashSet::new())),
@@ -651,7 +652,7 @@ mod tests {
             synapse_handlers: Arc::new(RwLock::new(HashMap::new())),
             async_handlers: Arc::new(RwLock::new(HashMap::new())),
             streaming_handlers: Arc::new(RwLock::new(HashMap::new())),
-            used_nonces: Arc::new(RwLock::new(HashMap::new())),
+            used_nonces: Arc::new(RwLock::new(IndexMap::new())),
             handshake_rate: Arc::new(RwLock::new(HashMap::new())),
             permit_resolver: None,
             permitted_validators: Arc::new(RwLock::new(HashSet::new())),
@@ -732,7 +733,7 @@ mod tests {
             nonce: "test-nonce".to_string(),
             signature: String::new(),
         };
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let result = handshake::verify_validator_signature(
             &request,
             nonces,
@@ -862,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_rejects_nonce_replay() {
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: String::new(),
             timestamp: unix_timestamp_secs(),
@@ -1068,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn nonce_hard_cap_evicts_oldest() {
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         for i in 0..5u64 {
             nonces
                 .write()
@@ -1107,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_rejects_future_timestamp() {
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: String::new(),
             timestamp: unix_timestamp_secs() + 120,
@@ -1121,7 +1122,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_rejects_invalid_ss58() {
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: "not_valid_ss58".to_string(),
             timestamp: unix_timestamp_secs(),
@@ -1137,7 +1138,7 @@ mod tests {
     async fn verify_rejects_invalid_base64_signature() {
         let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
         let hotkey = pair.public().to_ss58check();
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
@@ -1153,7 +1154,7 @@ mod tests {
     async fn verify_rejects_wrong_signature_length() {
         let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
         let hotkey = pair.public().to_ss58check();
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
@@ -1169,7 +1170,7 @@ mod tests {
     async fn verify_rejects_cryptographically_invalid_signature() {
         let pair = sp_core::sr25519::Pair::from_seed(&[1u8; 32]);
         let hotkey = pair.public().to_ss58check();
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp: unix_timestamp_secs(),
@@ -1194,7 +1195,7 @@ mod tests {
         let message = handshake_request_message(&hotkey, timestamp, nonce, &fp_b64);
         let signature = pair.sign(message.as_bytes());
 
-        let nonces = Arc::new(RwLock::new(HashMap::new()));
+        let nonces = Arc::new(RwLock::new(IndexMap::new()));
         let request = HandshakeRequest {
             validator_hotkey: hotkey,
             timestamp,

@@ -18,6 +18,7 @@ pub struct LightningServerConfig {
     pub max_tracked_rate_ips: usize,
     pub handler_timeout_secs: u64,
     pub max_frame_payload_bytes: usize,
+    pub streaming_channel_buffer: usize,
 }
 
 impl Default for LightningServerConfig {
@@ -37,6 +38,7 @@ impl Default for LightningServerConfig {
             max_tracked_rate_ips: 10_000,
             handler_timeout_secs: 30,
             max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            streaming_channel_buffer: 32,
         }
     }
 }
@@ -88,6 +90,7 @@ impl LightningServerConfig {
         require_nonzero!(self, max_tracked_rate_ips);
         require_nonzero!(self, handler_timeout_secs);
         require_less_than!(self, handler_timeout_secs < idle_timeout_secs);
+        require_nonzero!(self, streaming_channel_buffer);
         if self.max_frame_payload_bytes < 1_048_576 {
             return Err(LightningError::Config(format!(
                 "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",

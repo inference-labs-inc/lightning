@@ -7,8 +7,8 @@ use crate::types::{
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
+use indexmap::IndexMap;
 use sp_core::{crypto::Ss58Codec, sr25519, Pair};
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -140,7 +140,7 @@ pub(super) async fn process_handshake(
 
 pub(super) async fn verify_validator_signature(
     request: &HandshakeRequest,
-    used_nonces: Arc<RwLock<HashMap<String, u64>>>,
+    used_nonces: Arc<RwLock<IndexMap<String, u64>>>,
     cert_fingerprint: &[u8; 32],
     max_signature_age: u64,
     max_nonce_entries: usize,
@@ -173,11 +173,8 @@ pub(super) async fn verify_validator_signature(
         if nonces.len() > max_nonce_entries {
             let cutoff = current_time.saturating_sub(max_signature_age);
             nonces.retain(|_, ts| *ts >= cutoff);
-            if nonces.len() > max_nonce_entries {
-                let mut entries: Vec<(String, u64)> = nonces.drain().collect();
-                entries.sort_by_key(|(_, ts)| *ts);
-                let keep_from = entries.len().saturating_sub(max_nonce_entries);
-                *nonces = entries.into_iter().skip(keep_from).collect();
+            while nonces.len() > max_nonce_entries {
+                nonces.shift_remove_index(0);
             }
         }
     }
