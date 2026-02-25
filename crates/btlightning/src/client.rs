@@ -238,9 +238,15 @@ impl StreamingResponse {
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         let frame_result = match self.chunk_timeout {
             Some(timeout) => {
-                tokio::time::timeout(timeout, read_frame(&mut self.recv, self.max_payload))
+                match tokio::time::timeout(timeout, read_frame(&mut self.recv, self.max_payload))
                     .await
-                    .map_err(|_| LightningError::Stream("chunk read timed out".to_string()))?
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        self.recv.stop(0u32.into()).ok();
+                        return Err(LightningError::Stream("chunk read timed out".to_string()));
+                    }
+                }
             }
             None => read_frame(&mut self.recv, self.max_payload).await,
         };
