@@ -88,6 +88,11 @@ impl LightningClientConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.connect_timeout.is_zero() {
+            return Err(LightningError::Config(
+                "connect_timeout must be non-zero".into(),
+            ));
+        }
         if self.idle_timeout.is_zero() {
             return Err(LightningError::Config(
                 "idle_timeout must be non-zero".into(),
@@ -119,6 +124,11 @@ impl LightningClientConfig {
                 "reconnect_initial_backoff ({:?}) must be <= reconnect_max_backoff ({:?})",
                 self.reconnect_initial_backoff, self.reconnect_max_backoff
             )));
+        }
+        if self.max_connections == 0 {
+            return Err(LightningError::Config(
+                "max_connections must be at least 1".into(),
+            ));
         }
         if self.max_frame_payload_bytes < 1_048_576 {
             return Err(LightningError::Config(format!(

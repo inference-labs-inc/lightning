@@ -239,7 +239,8 @@ mod tests {
         }
 
         #[test]
-        fn addr_key_roundtrips(ip in "[1-9][0-9]{0,2}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[1-9]", port in 1024u16..65535) {
+        fn addr_key_roundtrips((a, b, c, d) in (0u8..=255, 0u8..=255, 0u8..=255, 0u8..=255), port in 1024u16..65535) {
+            let ip = format!("{}.{}.{}.{}", a, b, c, d);
             let addr = PeerAddr::new(&ip, port);
             let s: &str = addr.as_ref();
             prop_assert!(s.contains(&port.to_string()));

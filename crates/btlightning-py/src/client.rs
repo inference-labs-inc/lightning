@@ -191,10 +191,12 @@ impl RustLightning {
                     let client = self.client.read().await;
                     match timeout_secs {
                         Some(t) => {
-                            const MAX_TIMEOUT_SECS: f64 = u64::MAX as f64;
-                            if !t.is_finite() || !(0.0..=MAX_TIMEOUT_SECS).contains(&t) {
+                            const MAX_TIMEOUT_SECS: f64 = 315_360_000.0;
+                            if !t.is_finite()
+                                || !(f64::MIN_POSITIVE..=MAX_TIMEOUT_SECS).contains(&t)
+                            {
                                 return Err(btlightning::LightningError::Config(format!(
-                                    "timeout_secs must be a finite non-negative number, got {t}"
+                                    "timeout_secs must be a finite positive number, got {t}"
                                 )));
                             }
                             client
