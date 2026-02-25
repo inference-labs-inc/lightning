@@ -9,6 +9,22 @@ pub(crate) struct ReconnectState {
     pub in_progress: bool,
 }
 
+impl ReconnectState {
+    pub fn new() -> Self {
+        Self {
+            attempts: 0,
+            next_retry_at: Instant::now(),
+            in_progress: false,
+        }
+    }
+}
+
+pub(crate) enum ReconnectRejection {
+    InProgress,
+    Exhausted { attempts: u32 },
+    Backoff { next: Instant },
+}
+
 #[derive(Default)]
 pub(crate) struct MinerRegistry {
     active_miners: HashMap<String, QuicAxonInfo>,
@@ -116,37 +132,38 @@ impl MinerRegistry {
     pub fn reconnect_state_or_insert(&mut self, addr: PeerAddr) -> &mut ReconnectState {
         self.reconnect_states
             .entry(addr)
-            .or_insert_with(|| ReconnectState {
-                attempts: 0,
-                next_retry_at: Instant::now(),
-                in_progress: false,
-            })
+            .or_insert_with(ReconnectState::new)
     }
 
     pub fn try_start_reconnect(
         &mut self,
         addr: PeerAddr,
         max_retries: u32,
-    ) -> std::result::Result<(), (u32, Option<Instant>)> {
+    ) -> std::result::Result<(), ReconnectRejection> {
         let rs = self
             .reconnect_states
             .entry(addr)
-            .or_insert_with(|| ReconnectState {
-                attempts: 0,
-                next_retry_at: Instant::now(),
-                in_progress: false,
-            });
+            .or_insert_with(ReconnectState::new);
         if rs.in_progress {
-            return Err((rs.attempts, None));
+            return Err(ReconnectRejection::InProgress);
         }
         if rs.attempts >= max_retries {
-            return Err((rs.attempts, None));
+            return Err(ReconnectRejection::Exhausted {
+                attempts: rs.attempts,
+            });
         }
         if Instant::now() < rs.next_retry_at {
-            return Err((rs.attempts, Some(rs.next_retry_at)));
+            return Err(ReconnectRejection::Backoff {
+                next: rs.next_retry_at,
+            });
         }
         rs.in_progress = true;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn reconnect_state_count(&self) -> usize {
+        self.reconnect_states.len()
     }
 
     pub fn remove_reconnect_state(&mut self, addr: &PeerAddr) -> bool {
@@ -154,7 +171,6 @@ impl MinerRegistry {
     }
 
     pub fn drain_connections(&mut self) -> impl Iterator<Item = (PeerAddr, Connection)> + '_ {
-        self.reconnect_states.clear();
         self.established_connections.drain()
     }
 
@@ -290,9 +306,13 @@ mod tests {
         let mut reg = MinerRegistry::new();
         reg.register(QuicAxonInfo::new("hk1".into(), "1.2.3.4".into(), 8080, 4));
         reg.register(QuicAxonInfo::new("hk2".into(), "5.6.7.8".into(), 9090, 4));
+        let addr = PeerAddr::new("1.2.3.4", 8080);
+        reg.reconnect_state_or_insert(addr);
         assert_eq!(reg.active_miner_count(), 2);
+        assert!(reg.reconnect_state_count() > 0);
         reg.clear();
         assert_eq!(reg.active_miner_count(), 0);
+        assert_eq!(reg.reconnect_state_count(), 0);
         reg.assert_invariants();
     }
 }

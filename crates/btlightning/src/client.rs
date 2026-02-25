@@ -125,6 +125,11 @@ impl LightningClientConfig {
                 self.reconnect_initial_backoff, self.reconnect_max_backoff
             )));
         }
+        if self.reconnect_max_retries == 0 {
+            return Err(LightningError::Config(
+                "reconnect_max_retries must be at least 1".into(),
+            ));
+        }
         if self.max_connections == 0 {
             return Err(LightningError::Config(
                 "max_connections must be at least 1".into(),
@@ -631,26 +636,31 @@ impl LightningClient {
 
         {
             let mut state = self.state.write().await;
-            if let Err((attempts, next_retry)) = state
+            if let Err(rejection) = state
                 .registry
                 .try_start_reconnect(addr_key.clone(), self.config.reconnect_max_retries)
             {
-                return match next_retry {
-                    Some(at) => Err(LightningError::Connection(format!(
-                        "Reconnection to {} in backoff, next retry in {:?}",
-                        addr_key,
-                        at - Instant::now()
-                    ))),
-                    None if attempts >= self.config.reconnect_max_retries => {
+                use crate::registry::ReconnectRejection;
+                return match rejection {
+                    ReconnectRejection::Backoff { next } => {
+                        Err(LightningError::Connection(format!(
+                            "Reconnection to {} in backoff, next retry in {:?}",
+                            addr_key,
+                            next.saturating_duration_since(Instant::now())
+                        )))
+                    }
+                    ReconnectRejection::Exhausted { attempts } => {
                         Err(LightningError::Connection(format!(
                             "Reconnection attempts exhausted for {} ({}/{}), awaiting registry refresh",
                             addr_key, attempts, self.config.reconnect_max_retries
                         )))
                     }
-                    None => Err(LightningError::Connection(format!(
-                        "Reconnection to {} already in progress",
-                        addr_key
-                    ))),
+                    ReconnectRejection::InProgress => {
+                        Err(LightningError::Connection(format!(
+                            "Reconnection to {} already in progress",
+                            addr_key
+                        )))
+                    }
                 };
             }
         }
