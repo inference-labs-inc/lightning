@@ -4,12 +4,15 @@ pub mod client;
 pub mod error;
 #[cfg(feature = "subtensor")]
 pub mod metagraph;
+pub(crate) mod registry;
 pub mod server;
 pub mod signing;
 pub mod types;
 pub mod util;
 
-pub use client::{LightningClient, LightningClientConfig, StreamingResponse};
+pub use client::{
+    LightningClient, LightningClientConfig, LightningClientConfigBuilder, StreamingResponse,
+};
 pub use error::{LightningError, Result};
 #[cfg(feature = "subtensor")]
 pub use metagraph::{
@@ -17,12 +20,13 @@ pub use metagraph::{
 };
 pub use server::{
     typed_async_handler, typed_handler, AsyncSynapseHandler, LightningServer,
-    LightningServerConfig, StreamingSynapseHandler, SynapseHandler, ValidatorPermitResolver,
+    LightningServerConfig, LightningServerConfigBuilder, StreamingSynapseHandler, SynapseHandler,
+    ValidatorPermitResolver,
 };
 #[cfg(feature = "btwallet")]
 pub use signing::BtWalletSigner;
 pub use signing::{CallbackSigner, Signer, Sr25519Signer};
 pub use types::{
-    parse_frame_header, HandshakeRequest, HandshakeResponse, MessageType, QuicAxonInfo,
+    parse_frame_header, HandshakeRequest, HandshakeResponse, MessageType, PeerAddr, QuicAxonInfo,
     QuicRequest, QuicResponse, SynapsePacket, SynapseResponse, DEFAULT_MAX_FRAME_PAYLOAD,
 };

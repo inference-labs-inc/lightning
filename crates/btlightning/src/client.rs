@@ -1,9 +1,11 @@
 use crate::error::{LightningError, Result};
+use crate::registry::MinerRegistry;
 use crate::signing::Signer;
 use crate::types::{
     handshake_request_message, handshake_response_message, read_frame, write_frame_and_finish,
-    HandshakeRequest, HandshakeResponse, MessageType, QuicAxonInfo, QuicRequest, QuicResponse,
-    StreamChunk, StreamEnd, SynapsePacket, SynapseResponse, DEFAULT_MAX_FRAME_PAYLOAD,
+    HandshakeRequest, HandshakeResponse, MessageType, PeerAddr, QuicAxonInfo, QuicRequest,
+    QuicResponse, StreamChunk, StreamEnd, SynapsePacket, SynapseResponse,
+    DEFAULT_MAX_FRAME_PAYLOAD,
 };
 use crate::util::unix_timestamp_secs;
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -12,7 +14,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig as RustlsClientConfig;
 use sp_core::blake2_256;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +52,9 @@ pub struct LightningClientConfig {
     /// Defaults to `DEFAULT_MAX_FRAME_PAYLOAD` (64 MiB). Increase for multi-chunk streams
     /// that exceed a single frame. Must be >= `max_frame_payload_bytes`.
     pub max_stream_payload_bytes: usize,
+    /// Per-chunk read timeout for streaming responses. When set, each `next_chunk()` call
+    /// aborts if no data arrives within this duration. Default: `None` (no timeout).
+    pub stream_chunk_timeout: Option<Duration>,
     /// Metagraph monitor configuration. When set, `initialize_connections` starts
     /// a background task that periodically re-syncs the subnet and updates connections.
     #[cfg(feature = "subtensor")]
@@ -68,75 +73,106 @@ impl Default for LightningClientConfig {
             max_connections: 1024,
             max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
             max_stream_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD,
+            stream_chunk_timeout: None,
             #[cfg(feature = "subtensor")]
             metagraph: None,
         }
     }
 }
 
-struct ReconnectState {
-    attempts: u32,
-    next_retry_at: Instant,
+impl LightningClientConfig {
+    pub fn builder() -> LightningClientConfigBuilder {
+        LightningClientConfigBuilder {
+            config: Self::default(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_frame_payload_bytes < 1_048_576 {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
+                self.max_frame_payload_bytes
+            )));
+        }
+        if self.max_frame_payload_bytes > u32::MAX as usize {
+            return Err(LightningError::Config(format!(
+                "max_frame_payload_bytes ({}) must not exceed {} (u32::MAX)",
+                self.max_frame_payload_bytes,
+                u32::MAX
+            )));
+        }
+        if self.max_stream_payload_bytes < self.max_frame_payload_bytes {
+            return Err(LightningError::Config(format!(
+                "max_stream_payload_bytes ({}) must be >= max_frame_payload_bytes ({})",
+                self.max_stream_payload_bytes, self.max_frame_payload_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub struct LightningClientConfigBuilder {
+    config: LightningClientConfig,
+}
+
+impl LightningClientConfigBuilder {
+    pub fn connect_timeout(mut self, val: Duration) -> Self {
+        self.config.connect_timeout = val;
+        self
+    }
+    pub fn idle_timeout(mut self, val: Duration) -> Self {
+        self.config.idle_timeout = val;
+        self
+    }
+    pub fn keep_alive_interval(mut self, val: Duration) -> Self {
+        self.config.keep_alive_interval = val;
+        self
+    }
+    pub fn reconnect_initial_backoff(mut self, val: Duration) -> Self {
+        self.config.reconnect_initial_backoff = val;
+        self
+    }
+    pub fn reconnect_max_backoff(mut self, val: Duration) -> Self {
+        self.config.reconnect_max_backoff = val;
+        self
+    }
+    pub fn reconnect_max_retries(mut self, val: u32) -> Self {
+        self.config.reconnect_max_retries = val;
+        self
+    }
+    pub fn max_connections(mut self, val: usize) -> Self {
+        self.config.max_connections = val;
+        self
+    }
+    pub fn max_frame_payload_bytes(mut self, val: usize) -> Self {
+        self.config.max_frame_payload_bytes = val;
+        self
+    }
+    pub fn max_stream_payload_bytes(mut self, val: usize) -> Self {
+        self.config.max_stream_payload_bytes = val;
+        self
+    }
+    pub fn stream_chunk_timeout(mut self, val: Duration) -> Self {
+        self.config.stream_chunk_timeout = Some(val);
+        self
+    }
+    #[cfg(feature = "subtensor")]
+    pub fn metagraph(mut self, val: MetagraphMonitorConfig) -> Self {
+        self.config.metagraph = Some(val);
+        self
+    }
+    pub fn build(self) -> Result<LightningClientConfig> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
 }
 
 struct ClientState {
-    active_miners: HashMap<String, QuicAxonInfo>,
-    established_connections: HashMap<String, Connection>,
-    reconnect_states: HashMap<String, ReconnectState>,
-    addr_to_hotkeys: HashMap<String, HashSet<String>>,
+    registry: MinerRegistry,
     #[cfg(feature = "subtensor")]
     metagraph_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     #[cfg(feature = "subtensor")]
     metagraph_handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl ClientState {
-    fn register_miner(&mut self, miner: QuicAxonInfo) {
-        let new_addr_key = miner.addr_key();
-        let hotkey = miner.hotkey.clone();
-        if let Some(old) = self.active_miners.get(&hotkey) {
-            let old_addr_key = old.addr_key();
-            if old_addr_key != new_addr_key {
-                if let Some(hotkeys) = self.addr_to_hotkeys.get_mut(&old_addr_key) {
-                    hotkeys.remove(&hotkey);
-                    if hotkeys.is_empty() {
-                        self.addr_to_hotkeys.remove(&old_addr_key);
-                    }
-                }
-            }
-        }
-        self.active_miners.insert(hotkey.clone(), miner);
-        self.addr_to_hotkeys
-            .entry(new_addr_key)
-            .or_default()
-            .insert(hotkey);
-    }
-
-    fn deregister_miner(&mut self, hotkey: &str) -> Option<QuicAxonInfo> {
-        if let Some(miner) = self.active_miners.remove(hotkey) {
-            let addr_key = miner.addr_key();
-            if let Some(hotkeys) = self.addr_to_hotkeys.get_mut(&addr_key) {
-                hotkeys.remove(hotkey);
-                if hotkeys.is_empty() {
-                    self.addr_to_hotkeys.remove(&addr_key);
-                }
-            }
-            Some(miner)
-        } else {
-            None
-        }
-    }
-
-    fn addr_has_hotkeys(&self, addr_key: &str) -> bool {
-        self.addr_to_hotkeys.contains_key(addr_key)
-    }
-
-    fn hotkeys_at_addr(&self, addr_key: &str) -> Vec<String> {
-        self.addr_to_hotkeys
-            .get(addr_key)
-            .map(|hs| hs.iter().cloned().collect())
-            .unwrap_or_default()
-    }
 }
 
 /// Handle for reading a chunked streaming response from a miner.
@@ -147,12 +183,21 @@ pub struct StreamingResponse {
     recv: quinn::RecvStream,
     max_payload: usize,
     max_stream_payload: usize,
+    chunk_timeout: Option<Duration>,
 }
 
 impl StreamingResponse {
     /// Reads the next chunk from the stream. Returns `None` on successful completion.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        match read_frame(&mut self.recv, self.max_payload).await {
+        let frame_result = match self.chunk_timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, read_frame(&mut self.recv, self.max_payload))
+                    .await
+                    .map_err(|_| LightningError::Stream("chunk read timed out".to_string()))?
+            }
+            None => read_frame(&mut self.recv, self.max_payload).await,
+        };
+        match frame_result {
             Ok((MessageType::StreamChunk, payload)) => {
                 let chunk: StreamChunk = rmp_serde::from_slice(&payload).map_err(|e| {
                     LightningError::Serialization(format!("Failed to parse stream chunk: {}", e))
@@ -231,34 +276,13 @@ impl LightningClient {
 
     /// Creates a client with the given configuration, validating constraints.
     pub fn with_config(wallet_hotkey: String, config: LightningClientConfig) -> Result<Self> {
-        if config.max_frame_payload_bytes < 1_048_576 {
-            return Err(LightningError::Config(format!(
-                "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
-                config.max_frame_payload_bytes
-            )));
-        }
-        if config.max_frame_payload_bytes > u32::MAX as usize {
-            return Err(LightningError::Config(format!(
-                "max_frame_payload_bytes ({}) must not exceed {} (u32::MAX)",
-                config.max_frame_payload_bytes,
-                u32::MAX
-            )));
-        }
-        if config.max_stream_payload_bytes < config.max_frame_payload_bytes {
-            return Err(LightningError::Config(format!(
-                "max_stream_payload_bytes ({}) must be >= max_frame_payload_bytes ({})",
-                config.max_stream_payload_bytes, config.max_frame_payload_bytes
-            )));
-        }
+        config.validate()?;
         Ok(Self {
             config,
             wallet_hotkey,
             signer: None,
             state: Arc::new(RwLock::new(ClientState {
-                active_miners: HashMap::new(),
-                established_connections: HashMap::new(),
-                reconnect_states: HashMap::new(),
-                addr_to_hotkeys: HashMap::new(),
+                registry: MinerRegistry::new(),
                 #[cfg(feature = "subtensor")]
                 metagraph_shutdown: None,
                 #[cfg(feature = "subtensor")]
@@ -310,18 +334,18 @@ impl LightningClient {
             .clone();
         let timeout = self.config.connect_timeout;
 
-        let mut addr_groups: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
+        let mut addr_groups: HashMap<PeerAddr, Vec<QuicAxonInfo>> = HashMap::new();
         for miner in miners {
             addr_groups.entry(miner.addr_key()).or_default().push(miner);
         }
 
         let (active_count, remaining_capacity) = {
             let state = self.state.read().await;
-            let active = state.established_connections.len();
+            let active = state.registry.connection_count();
             (active, self.config.max_connections.saturating_sub(active))
         };
 
-        let addr_groups: Vec<(String, Vec<QuicAxonInfo>)> =
+        let addr_groups: Vec<(PeerAddr, Vec<QuicAxonInfo>)> =
             if addr_groups.len() > remaining_capacity {
                 warn!(
                     "Connection limit ({}) reached with {} active, skipping {} of {} new addresses",
@@ -377,9 +401,9 @@ impl LightningClient {
                     } else {
                         for miner in authenticated {
                             info!("Authenticated miner {} at {}", miner.hotkey, addr_key);
-                            state.register_miner(miner);
+                            state.registry.register(miner);
                         }
-                        state.established_connections.insert(addr_key, connection);
+                        state.registry.set_connection(addr_key, connection);
                     }
                 }
                 Err(e) => {
@@ -447,7 +471,7 @@ impl LightningClient {
 
         let connection = {
             let state = self.state.read().await;
-            state.established_connections.get(&addr_key).cloned()
+            state.registry.get_connection(&addr_key)
         };
 
         let max_fp = self.config.max_frame_payload_bytes;
@@ -486,14 +510,21 @@ impl LightningClient {
 
         let connection = {
             let state = self.state.read().await;
-            state.established_connections.get(&addr_key).cloned()
+            state.registry.get_connection(&addr_key)
         };
 
         let max_fp = self.config.max_frame_payload_bytes;
         let max_sp = self.config.max_stream_payload_bytes;
         match connection {
             Some(conn) if conn.close_reason().is_none() => {
-                open_streaming_synapse(&conn, request, max_fp, max_sp).await
+                open_streaming_synapse(
+                    &conn,
+                    request,
+                    max_fp,
+                    max_sp,
+                    self.config.stream_chunk_timeout,
+                )
+                .await
             }
             _ => {
                 self.try_reconnect_and_stream(&addr_key, &axon_info, request)
@@ -504,7 +535,7 @@ impl LightningClient {
 
     async fn try_reconnect_and_query(
         &self,
-        addr_key: &str,
+        addr_key: &PeerAddr,
         axon_info: &QuicAxonInfo,
         request: QuicRequest,
     ) -> Result<QuicResponse> {
@@ -514,7 +545,7 @@ impl LightningClient {
 
     async fn try_reconnect_and_stream(
         &self,
-        addr_key: &str,
+        addr_key: &PeerAddr,
         axon_info: &QuicAxonInfo,
         request: QuicRequest,
     ) -> Result<StreamingResponse> {
@@ -524,14 +555,19 @@ impl LightningClient {
             request,
             self.config.max_frame_payload_bytes,
             self.config.max_stream_payload_bytes,
+            self.config.stream_chunk_timeout,
         )
         .await
     }
 
-    async fn try_reconnect(&self, addr_key: &str, axon_info: &QuicAxonInfo) -> Result<Connection> {
+    async fn try_reconnect(
+        &self,
+        addr_key: &PeerAddr,
+        axon_info: &QuicAxonInfo,
+    ) -> Result<Connection> {
         {
             let state = self.state.read().await;
-            if let Some(rs) = state.reconnect_states.get(addr_key) {
+            if let Some(rs) = state.registry.reconnect_state(addr_key) {
                 if rs.attempts >= self.config.reconnect_max_retries {
                     return Err(LightningError::Connection(format!(
                         "Reconnection attempts exhausted for {} ({}/{}), awaiting registry refresh",
@@ -586,6 +622,7 @@ impl LightningClient {
                 let co_located: Vec<String> = {
                     let state = self.state.read().await;
                     state
+                        .registry
                         .hotkeys_at_addr(addr_key)
                         .into_iter()
                         .filter(|hk| *hk != axon_info.hotkey)
@@ -630,25 +667,19 @@ impl LightningClient {
 
                 let mut state = self.state.write().await;
                 for hk in &failed_hotkeys {
-                    state.deregister_miner(hk);
+                    state.registry.deregister(hk);
                 }
-                state.register_miner(axon_info.clone());
+                state.registry.register(axon_info.clone());
                 state
-                    .established_connections
-                    .insert(addr_key.to_string(), connection.clone());
-                state.reconnect_states.remove(addr_key);
+                    .registry
+                    .set_connection(addr_key.clone(), connection.clone());
+                state.registry.remove_reconnect_state(addr_key);
                 info!("Reconnected to {}", addr_key);
                 Ok(connection)
             }
             Err(e) => {
                 let mut state = self.state.write().await;
-                let rs = state
-                    .reconnect_states
-                    .entry(addr_key.to_string())
-                    .or_insert_with(|| ReconnectState {
-                        attempts: 0,
-                        next_retry_at: Instant::now(),
-                    });
+                let rs = state.registry.reconnect_state_or_insert(addr_key.clone());
                 rs.attempts += 1;
                 let shift = rs.attempts.min(20);
                 let backoff = (self.config.reconnect_initial_backoff * 2u32.pow(shift))
@@ -696,14 +727,14 @@ impl LightningClient {
         let mut stats = HashMap::new();
         stats.insert(
             "total_connections".to_string(),
-            state.established_connections.len().to_string(),
+            state.registry.connection_count().to_string(),
         );
         stats.insert(
             "active_miners".to_string(),
-            state.active_miners.len().to_string(),
+            state.registry.active_miner_count().to_string(),
         );
 
-        for addr_key in state.established_connections.keys() {
+        for addr_key in state.registry.connection_addrs() {
             stats.insert(format!("connection_{}", addr_key), "active".to_string());
         }
 
@@ -884,13 +915,11 @@ impl LightningClient {
 
         let mut state = self.state.write().await;
 
-        for (_, connection) in state.established_connections.drain() {
+        for (_, connection) in state.registry.drain_connections() {
             connection.close(0u32.into(), b"client_shutdown");
         }
 
-        state.active_miners.clear();
-        state.reconnect_states.clear();
-        state.addr_to_hotkeys.clear();
+        state.registry.clear();
 
         info!("All Lightning QUIC connections closed");
         Ok(())
@@ -911,30 +940,29 @@ async fn update_miner_registry_inner(
         .collect();
 
     let new_hotkeys_needing_auth: Vec<QuicAxonInfo>;
-    let new_addrs_needing_connect: HashMap<String, Vec<QuicAxonInfo>>;
+    let new_addrs_needing_connect: HashMap<PeerAddr, Vec<QuicAxonInfo>>;
     {
         let mut st = state.write().await;
 
-        let active_hotkeys: Vec<String> = st.active_miners.keys().cloned().collect();
+        let active_hotkeys = st.registry.active_hotkeys();
         for hotkey in active_hotkeys {
             if !new_by_hotkey.contains_key(&hotkey) {
-                if let Some(miner) = st.deregister_miner(&hotkey) {
+                if let Some(miner) = st.registry.deregister(&hotkey) {
                     let addr_key = miner.addr_key();
                     info!("Miner {} deregistered from {}", hotkey, addr_key);
-                    if !st.addr_has_hotkeys(&addr_key) {
-                        if let Some(connection) = st.established_connections.remove(&addr_key) {
+                    if !st.registry.addr_has_hotkeys(&addr_key) {
+                        if let Some(connection) = st.registry.remove_connection(&addr_key) {
                             connection.close(0u32.into(), b"miner_deregistered");
                         }
-                        st.reconnect_states.remove(&addr_key);
+                        st.registry.remove_reconnect_state(&addr_key);
                     }
                 }
             }
         }
 
-        let active_addrs: HashSet<String> =
-            st.active_miners.values().map(|m| m.addr_key()).collect();
+        let active_addrs = st.registry.active_addrs();
         for addr_key in &active_addrs {
-            if st.reconnect_states.remove(addr_key).is_some() {
+            if st.registry.remove_reconnect_state(addr_key) {
                 info!(
                     "Registry refresh reset reconnection backoff for {}",
                     addr_key
@@ -943,7 +971,7 @@ async fn update_miner_registry_inner(
         }
 
         for new_miner in new_by_hotkey.values() {
-            if let Some(old_miner) = st.active_miners.get(&new_miner.hotkey) {
+            if let Some(old_miner) = st.registry.active_miner(&new_miner.hotkey) {
                 let old_addr = old_miner.addr_key();
                 let new_addr = new_miner.addr_key();
                 if old_addr != new_addr {
@@ -951,12 +979,12 @@ async fn update_miner_registry_inner(
                         "Miner {} changed address from {} to {}",
                         new_miner.hotkey, old_addr, new_addr
                     );
-                    st.deregister_miner(&new_miner.hotkey);
-                    if !st.addr_has_hotkeys(&old_addr) {
-                        if let Some(conn) = st.established_connections.remove(&old_addr) {
+                    st.registry.deregister(&new_miner.hotkey);
+                    if !st.registry.addr_has_hotkeys(&old_addr) {
+                        if let Some(conn) = st.registry.remove_connection(&old_addr) {
                             conn.close(0u32.into(), b"miner_addr_changed");
                         }
-                        st.reconnect_states.remove(&old_addr);
+                        st.registry.remove_reconnect_state(&old_addr);
                     }
                 }
             }
@@ -964,22 +992,22 @@ async fn update_miner_registry_inner(
 
         let new_hotkeys: Vec<QuicAxonInfo> = new_by_hotkey
             .values()
-            .filter(|m| !st.active_miners.contains_key(&m.hotkey))
+            .filter(|m| !st.registry.contains_active_miner(&m.hotkey))
             .cloned()
             .collect();
 
         let mut need_auth = Vec::new();
-        let mut need_connect: HashMap<String, Vec<QuicAxonInfo>> = HashMap::new();
+        let mut need_connect: HashMap<PeerAddr, Vec<QuicAxonInfo>> = HashMap::new();
         for miner in new_hotkeys {
             let addr_key = miner.addr_key();
-            if st.established_connections.contains_key(&addr_key) {
+            if st.registry.contains_connection(&addr_key) {
                 need_auth.push(miner);
             } else {
                 need_connect.entry(addr_key).or_default().push(miner);
             }
         }
 
-        let active_count = st.established_connections.len();
+        let active_count = st.registry.connection_count();
         let remaining_capacity = config.max_connections.saturating_sub(active_count);
         if need_connect.len() > remaining_capacity {
             warn!(
@@ -1005,9 +1033,8 @@ async fn update_miner_registry_inner(
                 .into_iter()
                 .filter_map(|miner| {
                     let addr_key = miner.addr_key();
-                    st.established_connections
-                        .get(&addr_key)
-                        .cloned()
+                    st.registry
+                        .get_connection(&addr_key)
                         .map(|conn| (miner, conn))
                 })
                 .collect()
@@ -1046,7 +1073,7 @@ async fn update_miner_registry_inner(
 
         let mut st = state.write().await;
         for miner in authenticated {
-            st.register_miner(miner);
+            st.registry.register(miner);
         }
     }
 
@@ -1095,9 +1122,9 @@ async fn update_miner_registry_inner(
                         connection.close(0u32.into(), b"no_authenticated_hotkeys");
                     } else {
                         for miner in authenticated {
-                            st.register_miner(miner);
+                            st.registry.register(miner);
                         }
-                        st.established_connections.insert(addr_key, connection);
+                        st.registry.set_connection(addr_key, connection);
                     }
                 }
                 Err(e) => {
@@ -1119,10 +1146,11 @@ fn get_peer_cert_fingerprint(connection: &Connection) -> Option<[u8; 32]> {
 
 async fn quic_connect(
     endpoint: &Endpoint,
-    addr_key: &str,
+    addr_key: &PeerAddr,
     server_name: &str,
 ) -> Result<Connection> {
     let addr: SocketAddr = addr_key
+        .as_ref()
         .parse()
         .map_err(|e| LightningError::Connection(format!("Invalid address: {}", e)))?;
 
@@ -1137,11 +1165,11 @@ async fn connect_and_authenticate_per_address(
     endpoint: Endpoint,
     wallet_hotkey: String,
     signer: Arc<dyn Signer>,
-    addr_key: String,
+    addr_key: PeerAddr,
     miners_at_addr: Vec<QuicAxonInfo>,
     timeout: Duration,
     max_frame_payload: usize,
-) -> (String, Result<Connection>, Vec<QuicAxonInfo>) {
+) -> (PeerAddr, Result<Connection>, Vec<QuicAxonInfo>) {
     let first = match miners_at_addr.first() {
         Some(m) => m,
         None => {
@@ -1266,7 +1294,8 @@ async fn connect_and_handshake(
     signer: Arc<dyn Signer>,
     max_frame_payload: usize,
 ) -> Result<Connection> {
-    let connection = quic_connect(&endpoint, &miner.addr_key(), &miner.ip).await?;
+    let addr_key = miner.addr_key();
+    let connection = quic_connect(&endpoint, &addr_key, &miner.ip).await?;
     authenticate_handshake(
         &connection,
         &miner.hotkey,
@@ -1407,6 +1436,7 @@ async fn open_streaming_synapse(
     request: QuicRequest,
     max_frame_payload: usize,
     max_stream_payload: usize,
+    chunk_timeout: Option<Duration>,
 ) -> Result<StreamingResponse> {
     let (mut send, recv) = connection
         .open_bi()
@@ -1419,6 +1449,7 @@ async fn open_streaming_synapse(
         recv,
         max_payload: max_frame_payload,
         max_stream_payload,
+        chunk_timeout,
     })
 }
 

@@ -88,7 +88,13 @@ macro_rules! require_less_than {
 }
 
 impl LightningServerConfig {
-    pub(super) fn validate(&self) -> Result<()> {
+    pub fn builder() -> LightningServerConfigBuilder {
+        LightningServerConfigBuilder {
+            config: Self::default(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
         require_nonzero!(self, max_signature_age_secs);
         if self.max_signature_age_secs > 3600 {
             return Err(LightningError::Config(
@@ -124,5 +130,76 @@ impl LightningServerConfig {
             )));
         }
         Ok(())
+    }
+}
+
+pub struct LightningServerConfigBuilder {
+    config: LightningServerConfig,
+}
+
+impl LightningServerConfigBuilder {
+    pub fn max_signature_age_secs(mut self, val: u64) -> Self {
+        self.config.max_signature_age_secs = val;
+        self
+    }
+    pub fn idle_timeout_secs(mut self, val: u64) -> Self {
+        self.config.idle_timeout_secs = val;
+        self
+    }
+    pub fn keep_alive_interval_secs(mut self, val: u64) -> Self {
+        self.config.keep_alive_interval_secs = val;
+        self
+    }
+    pub fn nonce_cleanup_interval_secs(mut self, val: u64) -> Self {
+        self.config.nonce_cleanup_interval_secs = val;
+        self
+    }
+    pub fn max_connections(mut self, val: usize) -> Self {
+        self.config.max_connections = val;
+        self
+    }
+    pub fn max_nonce_entries(mut self, val: usize) -> Self {
+        self.config.max_nonce_entries = val;
+        self
+    }
+    pub fn handshake_timeout_secs(mut self, val: u64) -> Self {
+        self.config.handshake_timeout_secs = val;
+        self
+    }
+    pub fn max_handshake_attempts_per_minute(mut self, val: u32) -> Self {
+        self.config.max_handshake_attempts_per_minute = val;
+        self
+    }
+    pub fn max_concurrent_bidi_streams(mut self, val: u32) -> Self {
+        self.config.max_concurrent_bidi_streams = val;
+        self
+    }
+    pub fn require_validator_permit(mut self, val: bool) -> Self {
+        self.config.require_validator_permit = val;
+        self
+    }
+    pub fn validator_permit_refresh_secs(mut self, val: u64) -> Self {
+        self.config.validator_permit_refresh_secs = val;
+        self
+    }
+    pub fn max_tracked_rate_ips(mut self, val: usize) -> Self {
+        self.config.max_tracked_rate_ips = val;
+        self
+    }
+    pub fn handler_timeout_secs(mut self, val: u64) -> Self {
+        self.config.handler_timeout_secs = val;
+        self
+    }
+    pub fn max_frame_payload_bytes(mut self, val: usize) -> Self {
+        self.config.max_frame_payload_bytes = val;
+        self
+    }
+    pub fn streaming_channel_buffer(mut self, val: usize) -> Self {
+        self.config.streaming_channel_buffer = val;
+        self
+    }
+    pub fn build(self) -> Result<LightningServerConfig> {
+        self.config.validate()?;
+        Ok(self.config)
     }
 }
