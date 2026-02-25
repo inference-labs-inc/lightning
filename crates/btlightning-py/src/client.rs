@@ -60,6 +60,7 @@ impl RustLightning {
         max_connections=None,
         max_frame_payload_bytes=None,
         max_stream_payload_bytes=None,
+        stream_chunk_timeout_secs=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -73,6 +74,7 @@ impl RustLightning {
         max_connections: Option<usize>,
         max_frame_payload_bytes: Option<usize>,
         max_stream_payload_bytes: Option<usize>,
+        stream_chunk_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -101,6 +103,9 @@ impl RustLightning {
         set_opt!(config, max_connections, max_connections);
         set_opt!(config, max_frame_payload_bytes, max_frame_payload_bytes);
         set_opt!(config, max_stream_payload_bytes, max_stream_payload_bytes);
+        if let Some(v) = stream_chunk_timeout_secs {
+            config.stream_chunk_timeout = Some(Duration::from_secs(v));
+        }
 
         let client = btlightning::LightningClient::with_config(wallet_hotkey, config)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

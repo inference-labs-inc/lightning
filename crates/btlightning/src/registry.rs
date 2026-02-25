@@ -8,6 +8,7 @@ pub(crate) struct ReconnectState {
     pub next_retry_at: Instant,
 }
 
+#[derive(Default)]
 pub(crate) struct MinerRegistry {
     active_miners: HashMap<String, QuicAxonInfo>,
     established_connections: HashMap<PeerAddr, Connection>,
@@ -17,12 +18,7 @@ pub(crate) struct MinerRegistry {
 
 impl MinerRegistry {
     pub fn new() -> Self {
-        Self {
-            active_miners: HashMap::new(),
-            established_connections: HashMap::new(),
-            reconnect_states: HashMap::new(),
-            addr_to_hotkeys: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn register(&mut self, miner: QuicAxonInfo) {
@@ -134,6 +130,7 @@ impl MinerRegistry {
     }
 
     pub fn drain_connections(&mut self) -> impl Iterator<Item = (PeerAddr, Connection)> + '_ {
+        self.reconnect_states.clear();
         self.established_connections.drain()
     }
 
@@ -179,10 +176,13 @@ mod tests {
     fn arb_miner() -> impl Strategy<Value = QuicAxonInfo> {
         (
             "[a-z]{4,8}",
-            "([1-9][0-9]{0,2})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([1-9][0-9]{0,2})",
+            (1u8..=254, 0u8..=255, 0u8..=255, 1u8..=254),
             1024u16..65535,
         )
-            .prop_map(|(hotkey, ip, port)| QuicAxonInfo::new(hotkey, ip, port, 4))
+            .prop_map(|(hotkey, (a, b, c, d), port)| {
+                let ip = format!("{}.{}.{}.{}", a, b, c, d);
+                QuicAxonInfo::new(hotkey, ip, port, 4)
+            })
     }
 
     #[derive(Debug, Clone)]

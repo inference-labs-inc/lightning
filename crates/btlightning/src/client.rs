@@ -88,6 +88,38 @@ impl LightningClientConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.idle_timeout.is_zero() {
+            return Err(LightningError::Config(
+                "idle_timeout must be non-zero".into(),
+            ));
+        }
+        if self.keep_alive_interval.is_zero() {
+            return Err(LightningError::Config(
+                "keep_alive_interval must be non-zero".into(),
+            ));
+        }
+        if self.keep_alive_interval >= self.idle_timeout {
+            return Err(LightningError::Config(format!(
+                "keep_alive_interval ({:?}) must be less than idle_timeout ({:?})",
+                self.keep_alive_interval, self.idle_timeout
+            )));
+        }
+        if self.reconnect_initial_backoff.is_zero() {
+            return Err(LightningError::Config(
+                "reconnect_initial_backoff must be non-zero".into(),
+            ));
+        }
+        if self.reconnect_max_backoff.is_zero() {
+            return Err(LightningError::Config(
+                "reconnect_max_backoff must be non-zero".into(),
+            ));
+        }
+        if self.reconnect_initial_backoff > self.reconnect_max_backoff {
+            return Err(LightningError::Config(format!(
+                "reconnect_initial_backoff ({:?}) must be <= reconnect_max_backoff ({:?})",
+                self.reconnect_initial_backoff, self.reconnect_max_backoff
+            )));
+        }
         if self.max_frame_payload_bytes < 1_048_576 {
             return Err(LightningError::Config(format!(
                 "max_frame_payload_bytes ({}) must be at least 1048576 (1 MB)",
@@ -680,8 +712,8 @@ impl LightningClient {
             Err(e) => {
                 let mut state = self.state.write().await;
                 let rs = state.registry.reconnect_state_or_insert(addr_key.clone());
-                rs.attempts += 1;
                 let shift = rs.attempts.min(20);
+                rs.attempts += 1;
                 let backoff = (self.config.reconnect_initial_backoff * 2u32.pow(shift))
                     .min(self.config.reconnect_max_backoff);
                 rs.next_retry_at = Instant::now() + backoff;
