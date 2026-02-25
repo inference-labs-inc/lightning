@@ -262,7 +262,7 @@ mod tests {
             hotkey in "[a-z]{4,8}",
             ip1 in "1\\.0\\.0\\.[1-9]",
             ip2 in "2\\.0\\.0\\.[1-9]",
-            port in 1024u16..65535,
+            port in 1024u16..=65535,
         ) {
             let mut reg = MinerRegistry::new();
             let m1 = QuicAxonInfo::new(hotkey.clone(), ip1, port, 4);
@@ -285,7 +285,7 @@ mod tests {
         }
 
         #[test]
-        fn addr_key_roundtrips((a, b, c, d) in (0u8..=255, 0u8..=255, 0u8..=255, 0u8..=255), port in 1024u16..65535) {
+        fn addr_key_roundtrips((a, b, c, d) in (0u8..=255, 0u8..=255, 0u8..=255, 0u8..=255), port in 1024u16..=65535) {
             let ip = format!("{}.{}.{}.{}", a, b, c, d);
             let addr = PeerAddr::new(&ip, port);
             let s: &str = addr.as_ref();
