@@ -285,18 +285,22 @@ mod tests {
             let s: &str = addr.as_ref();
             prop_assert!(s.contains(&port.to_string()));
             prop_assert!(s.contains(&ip));
+            prop_assert!(s.parse::<std::net::SocketAddr>().is_ok());
         }
 
         #[test]
         fn backoff_never_exceeds_max(
             initial_ms in 100u64..5000,
             max_ms in 5000u64..120_000,
-            attempts in 0u32..30,
+            attempts in 0u32..63,
         ) {
             let initial = std::time::Duration::from_millis(initial_ms);
             let max = std::time::Duration::from_millis(max_ms);
             let shift = attempts.min(20);
-            let backoff = (initial * 2u32.pow(shift)).min(max);
+            let backoff = initial
+                .checked_mul(2u32.pow(shift))
+                .map(|d| d.min(max))
+                .unwrap_or(max);
             prop_assert!(backoff <= max);
         }
     }
