@@ -45,8 +45,6 @@ async fn connect_client(port: u16) -> (LightningClient, QuicAxonInfo) {
         ip: "127.0.0.1".into(),
         port,
         protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
     };
     client
         .initialize_connections(vec![axon.clone()])
@@ -186,9 +184,18 @@ async fn query_zk_proof_all_fields_none() {
         .unwrap();
     assert!(resp.success);
     let result: serde_json::Value = resp.deserialize_data().unwrap();
-    assert!(result.get("model_id").is_none() || result["model_id"].is_null());
-    assert!(result.get("query_input").is_none() || result["query_input"].is_null());
-    assert!(result.get("query_output").is_none() || result["query_output"].is_null());
+    assert!(
+        result.get("model_id").is_none(),
+        "model_id must be absent when None with skip_serializing_if"
+    );
+    assert!(
+        result.get("query_input").is_none(),
+        "query_input must be absent when None with skip_serializing_if"
+    );
+    assert!(
+        result.get("query_output").is_none(),
+        "query_output must be absent when None with skip_serializing_if"
+    );
 
     env.shutdown().await;
 }
@@ -355,7 +362,10 @@ async fn competition_full_roundtrip() {
     assert_eq!(result["file_name"], "circuit.bin");
     assert_eq!(result["file_content"], "circuit_bytes_here");
     assert_eq!(result["commitment"], "0xabc");
-    assert!(result.get("error").is_none() || result["error"].is_null());
+    assert!(
+        result.get("error").is_none(),
+        "error must be absent when None with skip_serializing_if"
+    );
 
     env.shutdown().await;
 }
@@ -439,14 +449,14 @@ async fn skip_serializing_if_none_omits_fields() {
         query_output: None,
     };
 
-    let rmpv_map = btlightning::serialize_to_rmpv_map(&proof).unwrap();
-    assert!(rmpv_map.contains_key("model_id"));
+    let req = QuicRequest::from_typed("query-zk-proof", &proof).unwrap();
+    assert!(req.data.contains_key("model_id"));
     assert!(
-        !rmpv_map.contains_key("query_input"),
+        !req.data.contains_key("query_input"),
         "None field with skip_serializing_if should be absent from serialized map"
     );
     assert!(
-        !rmpv_map.contains_key("query_output"),
+        !req.data.contains_key("query_output"),
         "None field with skip_serializing_if should be absent from serialized map"
     );
 }
@@ -473,6 +483,10 @@ async fn skip_serializing_if_none_deserializes_back_to_none() {
         .await
         .unwrap();
     assert!(resp.success);
+    let roundtripped: QueryZkProof = resp.deserialize_data().unwrap();
+    assert_eq!(roundtripped.model_id.as_deref(), Some("test"));
+    assert!(roundtripped.query_input.is_none());
+    assert!(roundtripped.query_output.is_none());
 
     env.shutdown().await;
 }

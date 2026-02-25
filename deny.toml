@@ -4,7 +4,7 @@ all-features = false
 
 [advisories]
 yanked = "warn"
-unmaintained = "none"
+unmaintained = "workspace"
 ignore = []
 
 [licenses]
@@ -44,4 +44,4 @@ wildcards = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/opentensor/btwallet"]
+allow-git = []

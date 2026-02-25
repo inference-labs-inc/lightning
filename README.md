@@ -2,6 +2,11 @@
     <h2>Ligh𝞽ning</h2>
     <p><strong>Rust QUIC transport layer for Bittensor</strong></p>
     <p>Persistent QUIC connections with sr25519 handshake authentication for validator-miner communication.</p>
+    <p>
+        <a href="https://crates.io/crates/btlightning"><img src="https://img.shields.io/crates/v/btlightning" alt="crates.io"></a>
+        <a href="https://docs.rs/btlightning/latest/btlightning/"><img src="https://img.shields.io/docsrs/btlightning" alt="docs.rs"></a>
+        <a href="https://pypi.org/project/btlightning/"><img src="https://img.shields.io/pypi/v/btlightning" alt="PyPI"></a>
+    </p>
 </div>
 
 ## Python
@@ -28,17 +33,74 @@ response = client.query_axon(
 
 ```toml
 [dependencies]
-btlightning = "0.1"
+btlightning = { version = "0.1", features = ["subtensor"] }
 ```
 
-```rust
-use btlightning::{LightningClient, Sr25519Signer, QuicAxonInfo, QuicRequest};
+With the `subtensor` feature, the client discovers miners from the metagraph and keeps connections in sync automatically:
+
+```rust,ignore
+use btlightning::{LightningClient, LightningClientConfig, Sr25519Signer, MetagraphMonitorConfig};
+
+let config = LightningClientConfig {
+    metagraph: Some(MetagraphMonitorConfig::finney(YOUR_NETUID)),
+    ..Default::default()
+};
+let mut client = LightningClient::with_config("5GrwvaEF...".into(), config)?;
+client.set_signer(Box::new(Sr25519Signer::from_seed(seed)));
+client.initialize_connections(vec![]).await?;
+```
+
+Without `subtensor`, pass miner addresses directly:
+
+```rust,ignore
+use btlightning::{LightningClient, Sr25519Signer, QuicAxonInfo};
 
 let mut client = LightningClient::new("5GrwvaEF...".into());
 client.set_signer(Box::new(Sr25519Signer::from_seed(seed)));
 client.initialize_connections(vec![
-    QuicAxonInfo::new("5FHneW46...".into(), "192.168.1.1".into(), 8443, 4, 0, 0)
+    QuicAxonInfo::new("5FHneW46...".into(), "192.168.1.1".into(), 8443, 4)
 ]).await?;
+```
+
+Query a single miner by axon info and deserialize the response:
+
+```rust,ignore
+use btlightning::QuicRequest;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize)]
+struct MyQuery { prompt: String }
+
+#[derive(Deserialize)]
+struct MyResult { answer: String }
+
+let request = QuicRequest::from_typed("MyQuery", &MyQuery { prompt: "hello".into() })?;
+let response = client.query_axon(axon_info, request).await?.into_result()?;
+let result: MyResult = response.deserialize_data()?;
+```
+
+Fan out to every QUIC miner on the subnet concurrently:
+
+```rust,ignore
+use std::sync::Arc;
+use tokio::task::JoinSet;
+
+let client = Arc::new(client);
+let miners = metagraph.quic_miners();
+let mut tasks = JoinSet::new();
+for miner in miners {
+    let req = QuicRequest::from_typed("MyQuery", &MyQuery { prompt: "hello".into() })?;
+    let client = Arc::clone(&client);
+    tasks.spawn(async move {
+        (miner.hotkey.clone(), client.query_axon(miner, req).await)
+    });
+}
+while let Some(Ok((hotkey, result))) = tasks.join_next().await {
+    match result {
+        Ok(resp) => { /* handle response from hotkey */ }
+        Err(e) => { /* miner failed */ }
+    }
+}
 ```
 
 ## Build from source

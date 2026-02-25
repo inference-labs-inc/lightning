@@ -18,8 +18,6 @@ class AxonInfo(TypedDict):
     ip: str
     port: int
     protocol: NotRequired[int]  # IP protocol version (default 4 = IPv4)
-    placeholder1: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
-    placeholder2: NotRequired[int]  # Reserved, Bittensor metagraph field (default 0)
 
 
 class SynapseRequest(TypedDict):

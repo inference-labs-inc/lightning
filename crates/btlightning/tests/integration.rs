@@ -127,8 +127,6 @@ async fn connect_client(port: u16) -> (LightningClient, QuicAxonInfo) {
         ip: "127.0.0.1".into(),
         port,
         protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
     };
     client
         .initialize_connections(vec![axon.clone()])
@@ -1755,16 +1753,12 @@ async fn multiple_hotkeys_same_address_authenticates_matching_only() {
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
             QuicAxonInfo {
                 hotkey: fake_hotkey,
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
         ])
         .await
@@ -1810,8 +1804,6 @@ async fn fake_hotkey_only_at_address_no_connection_retained() {
             ip: "127.0.0.1".into(),
             port,
             protocol: 4,
-            placeholder1: 0,
-            placeholder2: 0,
         }])
         .await
         .unwrap();
@@ -1864,8 +1856,6 @@ async fn update_registry_adds_fake_hotkey_at_existing_address() {
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
         ])
         .await
@@ -1923,24 +1913,18 @@ async fn max_connections_counts_addresses_not_hotkeys() {
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
             QuicAxonInfo {
                 hotkey: fake1,
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
             QuicAxonInfo {
                 hotkey: fake2,
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
         ])
         .await
@@ -1965,8 +1949,6 @@ async fn max_connections_counts_addresses_not_hotkeys() {
                 ip: "127.0.0.1".into(),
                 port,
                 protocol: 4,
-                placeholder1: 0,
-                placeholder2: 0,
             },
             build_request("echo"),
         )

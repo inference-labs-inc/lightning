@@ -1,15 +1,58 @@
 use crate::error::{LightningError, Result};
-use sp_core::{sr25519, Pair};
+use base64::{prelude::BASE64_STANDARD, Engine};
+use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 
+pub(crate) async fn verify_sr25519_signature(
+    hotkey_ss58: &str,
+    signature_b64: &str,
+    message: &str,
+) -> Result<bool> {
+    let public_key = sr25519::Public::from_ss58check(hotkey_ss58)
+        .map_err(|e| LightningError::Handshake(format!("Invalid SS58 address: {}", e)))?;
+
+    let signature_bytes = BASE64_STANDARD
+        .decode(signature_b64)
+        .map_err(|e| LightningError::Handshake(format!("Failed to decode signature: {}", e)))?;
+
+    if signature_bytes.len() != 64 {
+        return Err(LightningError::Handshake(format!(
+            "Invalid signature length: {}",
+            signature_bytes.len()
+        )));
+    }
+
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(&signature_bytes);
+    let signature = sr25519::Signature::from_raw(sig_array);
+    let msg = message.to_owned();
+
+    tokio::task::spawn_blocking(move || {
+        Ok(sr25519::Pair::verify(
+            &signature,
+            msg.as_bytes(),
+            &public_key,
+        ))
+    })
+    .await
+    .map_err(|e| LightningError::Handshake(format!("signature verification task failed: {}", e)))?
+}
+
+/// Trait for signing handshake and authentication messages.
+///
+/// Implementations must produce sr25519-compatible 64-byte signatures.
+/// The signer is called from a blocking context via `spawn_blocking`.
 pub trait Signer: Send + Sync {
+    /// Signs `message` and returns the raw 64-byte sr25519 signature.
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// [`Signer`] backed by an in-memory sr25519 keypair derived from a 32-byte seed.
 pub struct Sr25519Signer {
     pair: sr25519::Pair,
 }
 
 impl Sr25519Signer {
+    /// Derives the keypair from a 32-byte seed.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         Self {
             pair: sr25519::Pair::from_seed(&seed),
@@ -24,6 +67,9 @@ impl Signer for Sr25519Signer {
     }
 }
 
+/// [`Signer`] that delegates to an arbitrary closure.
+///
+/// Useful for bridging to external signing backends (HSMs, Python callbacks, etc.).
 pub struct CallbackSigner<F: Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync> {
     callback: F,
 }
@@ -112,6 +158,9 @@ mod tests {
     }
 }
 
+/// [`Signer`] backed by a `btwallet` keypair loaded from the Bittensor wallet directory.
+///
+/// Requires the `btwallet` feature.
 #[cfg(feature = "btwallet")]
 pub struct BtWalletSigner {
     keypair: bittensor_wallet::Keypair,
@@ -119,10 +168,12 @@ pub struct BtWalletSigner {
 
 #[cfg(feature = "btwallet")]
 impl BtWalletSigner {
+    /// Wraps an existing `btwallet::Keypair`.
     pub fn new(keypair: bittensor_wallet::Keypair) -> Self {
         Self { keypair }
     }
 
+    /// Loads the hotkey keypair from `~/<path>/<name>/hotkeys/<hotkey_name>`.
     pub fn from_wallet(name: &str, path: &str, hotkey_name: &str) -> Result<Self> {
         let wallet = bittensor_wallet::Wallet::new(
             Some(name.to_string()),

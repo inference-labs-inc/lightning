@@ -107,8 +107,6 @@ async fn make_client(
         ip: "127.0.0.1".into(),
         port,
         protocol: 4,
-        placeholder1: 0,
-        placeholder2: 0,
     };
     client
         .initialize_connections(vec![axon.clone()])

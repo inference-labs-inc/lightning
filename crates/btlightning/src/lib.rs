@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 pub mod client;
 pub mod error;
 #[cfg(feature = "subtensor")]
@@ -21,7 +23,6 @@ pub use server::{
 pub use signing::BtWalletSigner;
 pub use signing::{CallbackSigner, Signer, Sr25519Signer};
 pub use types::{
-    parse_frame_header, serialize_to_rmpv_map, HandshakeRequest, HandshakeResponse, MessageType,
-    QuicAxonInfo, QuicRequest, QuicResponse, SynapsePacket, SynapseResponse,
-    DEFAULT_MAX_FRAME_PAYLOAD,
+    parse_frame_header, HandshakeRequest, HandshakeResponse, MessageType, QuicAxonInfo,
+    QuicRequest, QuicResponse, SynapsePacket, SynapseResponse, DEFAULT_MAX_FRAME_PAYLOAD,
 };

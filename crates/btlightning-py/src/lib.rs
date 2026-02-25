@@ -15,6 +15,19 @@ use handler::{
 use signer::{PythonPermitResolver, PythonSigner};
 use types::PyQuicAxonInfo;
 
+macro_rules! set_opt {
+    ($config:expr, $field:ident, $opt:expr) => {
+        if let Some(v) = $opt {
+            $config.$field = v;
+        }
+    };
+    ($config:expr, $field:ident, $opt:expr, secs) => {
+        if let Some(v) = $opt {
+            $config.$field = Duration::from_secs(v);
+        }
+    };
+}
+
 fn to_pyerr(err: btlightning::LightningError) -> PyErr {
     match err {
         btlightning::LightningError::Connection(msg) => {
@@ -124,33 +137,25 @@ impl RustLightning {
         })?);
 
         let mut config = btlightning::LightningClientConfig::default();
-        if let Some(v) = connect_timeout_secs {
-            config.connect_timeout = Duration::from_secs(v);
-        }
-        if let Some(v) = idle_timeout_secs {
-            config.idle_timeout = Duration::from_secs(v);
-        }
-        if let Some(v) = keep_alive_interval_secs {
-            config.keep_alive_interval = Duration::from_secs(v);
-        }
-        if let Some(v) = reconnect_initial_backoff_secs {
-            config.reconnect_initial_backoff = Duration::from_secs(v);
-        }
-        if let Some(v) = reconnect_max_backoff_secs {
-            config.reconnect_max_backoff = Duration::from_secs(v);
-        }
-        if let Some(v) = reconnect_max_retries {
-            config.reconnect_max_retries = v;
-        }
-        if let Some(v) = max_connections {
-            config.max_connections = v;
-        }
-        if let Some(v) = max_frame_payload_bytes {
-            config.max_frame_payload_bytes = v;
-        }
-        if let Some(v) = max_stream_payload_bytes {
-            config.max_stream_payload_bytes = v;
-        }
+        set_opt!(config, connect_timeout, connect_timeout_secs, secs);
+        set_opt!(config, idle_timeout, idle_timeout_secs, secs);
+        set_opt!(config, keep_alive_interval, keep_alive_interval_secs, secs);
+        set_opt!(
+            config,
+            reconnect_initial_backoff,
+            reconnect_initial_backoff_secs,
+            secs
+        );
+        set_opt!(
+            config,
+            reconnect_max_backoff,
+            reconnect_max_backoff_secs,
+            secs
+        );
+        set_opt!(config, reconnect_max_retries, reconnect_max_retries);
+        set_opt!(config, max_connections, max_connections);
+        set_opt!(config, max_frame_payload_bytes, max_frame_payload_bytes);
+        set_opt!(config, max_stream_payload_bytes, max_stream_payload_bytes);
 
         let client = btlightning::LightningClient::with_config(wallet_hotkey, config)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -398,45 +403,35 @@ impl RustLightningServer {
         })?);
 
         let mut config = btlightning::LightningServerConfig::default();
-        if let Some(v) = max_signature_age_secs {
-            config.max_signature_age_secs = v;
-        }
-        if let Some(v) = idle_timeout_secs {
-            config.idle_timeout_secs = v;
-        }
-        if let Some(v) = keep_alive_interval_secs {
-            config.keep_alive_interval_secs = v;
-        }
-        if let Some(v) = nonce_cleanup_interval_secs {
-            config.nonce_cleanup_interval_secs = v;
-        }
-        if let Some(v) = max_connections {
-            config.max_connections = v;
-        }
-        if let Some(v) = max_nonce_entries {
-            config.max_nonce_entries = v;
-        }
-        if let Some(v) = handshake_timeout_secs {
-            config.handshake_timeout_secs = v;
-        }
-        if let Some(v) = max_handshake_attempts_per_minute {
-            config.max_handshake_attempts_per_minute = v;
-        }
-        if let Some(v) = max_concurrent_bidi_streams {
-            config.max_concurrent_bidi_streams = v;
-        }
-        if let Some(v) = require_validator_permit {
-            config.require_validator_permit = v;
-        }
-        if let Some(v) = validator_permit_refresh_secs {
-            config.validator_permit_refresh_secs = v;
-        }
-        if let Some(v) = handler_timeout_secs {
-            config.handler_timeout_secs = v;
-        }
-        if let Some(v) = max_frame_payload_bytes {
-            config.max_frame_payload_bytes = v;
-        }
+        set_opt!(config, max_signature_age_secs, max_signature_age_secs);
+        set_opt!(config, idle_timeout_secs, idle_timeout_secs);
+        set_opt!(config, keep_alive_interval_secs, keep_alive_interval_secs);
+        set_opt!(
+            config,
+            nonce_cleanup_interval_secs,
+            nonce_cleanup_interval_secs
+        );
+        set_opt!(config, max_connections, max_connections);
+        set_opt!(config, max_nonce_entries, max_nonce_entries);
+        set_opt!(config, handshake_timeout_secs, handshake_timeout_secs);
+        set_opt!(
+            config,
+            max_handshake_attempts_per_minute,
+            max_handshake_attempts_per_minute
+        );
+        set_opt!(
+            config,
+            max_concurrent_bidi_streams,
+            max_concurrent_bidi_streams
+        );
+        set_opt!(config, require_validator_permit, require_validator_permit);
+        set_opt!(
+            config,
+            validator_permit_refresh_secs,
+            validator_permit_refresh_secs
+        );
+        set_opt!(config, handler_timeout_secs, handler_timeout_secs);
+        set_opt!(config, max_frame_payload_bytes, max_frame_payload_bytes);
 
         let server = btlightning::LightningServer::with_config(miner_hotkey, host, port, config)
             .map_err(to_pyerr)?;
@@ -654,25 +649,7 @@ fn extract_quic_axon_info(
         .map(|p| p.extract::<u8>(py))
         .transpose()?
         .unwrap_or(4);
-    let placeholder1 = miner_dict
-        .get("placeholder1")
-        .map(|p| p.extract::<u8>(py))
-        .transpose()?
-        .unwrap_or(0);
-    let placeholder2 = miner_dict
-        .get("placeholder2")
-        .map(|p| p.extract::<u8>(py))
-        .transpose()?
-        .unwrap_or(0);
-
-    Ok(btlightning::QuicAxonInfo::new(
-        hotkey,
-        ip,
-        port,
-        protocol,
-        placeholder1,
-        placeholder2,
-    ))
+    Ok(btlightning::QuicAxonInfo::new(hotkey, ip, port, protocol))
 }
 
 #[pymodule]
