@@ -17,6 +17,13 @@ classifiers = [
 ]
 dependencies = ["typing_extensions~=4.0"]
 
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-timeout>=2.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
+
 [tool.maturin]
 python-source = "python"
 module-name = "btlightning._native"

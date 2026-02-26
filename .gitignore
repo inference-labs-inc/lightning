@@ -209,6 +209,8 @@ benchmarks/uv.lock
 *.gif
 plots/
 
-# Test files
-test_*.py
-*_test.py
+# Ad-hoc test scripts (not in test suites)
+/test_*.py
+/*_test.py
+/benchmarks/test_*.py
+/benchmarks/*_test.py

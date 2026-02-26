@@ -1,0 +1,165 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    name: Benchmark comparison
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'bench')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Build benchmark (PR)
+        run: cargo build --release -p lightning-bench
+
+      - name: Copy PR binary
+        run: cp target/release/lightning-bench /tmp/lightning-bench-pr
+
+      - name: Checkout main
+        run: git checkout origin/main
+
+      - name: Build benchmark (main)
+        id: build-main
+        continue-on-error: true
+        run: cargo build --release -p lightning-bench
+
+      - name: Copy main binary
+        if: steps.build-main.outcome == 'success'
+        run: cp target/release/lightning-bench /tmp/lightning-bench-main
+
+      - name: Run main benchmark
+        if: steps.build-main.outcome == 'success'
+        run: /tmp/lightning-bench-main > /tmp/bench-main.json 2>/dev/null
+
+      - name: Run PR benchmark
+        run: /tmp/lightning-bench-pr > /tmp/bench-pr.json 2>/dev/null
+
+      - name: Post comparison comment
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = JSON.parse(fs.readFileSync('/tmp/bench-pr.json', 'utf8'));
+
+            let hasMain = false;
+            let main = {};
+            try {
+              main = JSON.parse(fs.readFileSync('/tmp/bench-main.json', 'utf8'));
+              hasMain = true;
+            } catch {}
+
+            function fmt(v) {
+              return typeof v === 'number' ? v.toFixed(2) : String(v);
+            }
+
+            function pctChange(oldVal, newVal, lowerIsBetter) {
+              if (!oldVal || oldVal === 0) return '';
+              const pct = ((newVal - oldVal) / oldVal) * 100;
+              const sign = pct > 0 ? '+' : '';
+              const tag = lowerIsBetter
+                ? (pct > 15 ? ' !!!' : pct < -15 ? ' +++' : '')
+                : (pct < -15 ? ' !!!' : pct > 15 ? ' +++' : '');
+              return ` (${sign}${pct.toFixed(1)}%${tag})`;
+            }
+
+            let body = '<!-- bench-results -->\n## Benchmark Results\n\n';
+
+            body += '### Connection Setup (ms)\n\n';
+            body += '| Percentile | PR |' + (hasMain ? ' main | change |' : '') + '\n';
+            body += '|---|---|' + (hasMain ? '---|---|' : '') + '\n';
+            for (const p of ['p50', 'p95', 'p99']) {
+              const prVal = pr.connection_setup_ms[p];
+              if (hasMain) {
+                const mainVal = main.connection_setup_ms[p];
+                body += `| ${p} | ${fmt(prVal)} | ${fmt(mainVal)} | ${pctChange(mainVal, prVal, true)} |\n`;
+              } else {
+                body += `| ${p} | ${fmt(prVal)} |\n`;
+              }
+            }
+
+            const sizes = Object.keys(pr.latency_ms).sort((a, b) => {
+              const order = {'256B': 0, '1KB': 1, '10KB': 2, '100KB': 3, '1MB': 4};
+              return (order[a] ?? 99) - (order[b] ?? 99);
+            });
+
+            body += '\n### Latency (ms)\n\n';
+            body += '| Size | Percentile | PR |' + (hasMain ? ' main | change |' : '') + '\n';
+            body += '|---|---|---|' + (hasMain ? '---|---|' : '') + '\n';
+            for (const size of sizes) {
+              for (const p of ['p50', 'p95', 'p99']) {
+                const prVal = pr.latency_ms[size][p];
+                if (hasMain && main.latency_ms?.[size]) {
+                  const mainVal = main.latency_ms[size][p];
+                  body += `| ${size} | ${p} | ${fmt(prVal)} | ${fmt(mainVal)} | ${pctChange(mainVal, prVal, true)} |\n`;
+                } else {
+                  body += `| ${size} | ${p} | ${fmt(prVal)} |\n`;
+                }
+              }
+            }
+
+            body += '\n### Throughput (req/s)\n\n';
+            body += '| Size | PR |' + (hasMain ? ' main | change |' : '') + '\n';
+            body += '|---|---|' + (hasMain ? '---|---|' : '') + '\n';
+            for (const size of sizes) {
+              const prVal = pr.throughput_rps[size];
+              if (hasMain && main.throughput_rps?.[size] != null) {
+                const mainVal = main.throughput_rps[size];
+                body += `| ${size} | ${fmt(prVal)} | ${fmt(mainVal)} | ${pctChange(mainVal, prVal, false)} |\n`;
+              } else {
+                body += `| ${size} | ${fmt(prVal)} |\n`;
+              }
+            }
+
+            if (pr.wire_bytes) {
+              body += '\n### Wire Bytes\n\n';
+              body += '| Size | PR |' + (hasMain ? ' main | change |' : '') + '\n';
+              body += '|---|---|' + (hasMain ? '---|---|' : '') + '\n';
+              for (const size of sizes) {
+                const prVal = pr.wire_bytes[size];
+                if (hasMain && main.wire_bytes?.[size] != null) {
+                  const mainVal = main.wire_bytes[size];
+                  body += `| ${size} | ${prVal} | ${mainVal} | ${pctChange(mainVal, prVal, true)} |\n`;
+                } else {
+                  body += `| ${size} | ${prVal} |\n`;
+                }
+              }
+            }
+
+            const marker = '<!-- bench-results -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

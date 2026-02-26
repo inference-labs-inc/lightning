@@ -125,6 +125,19 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  python-test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+      - run: uv venv && uv pip install maturin pytest pytest-timeout && uv run maturin develop --release && uv run pytest tests/ -v --timeout=30
+        working-directory: crates/btlightning-py
+
   subtensor:
     name: Subtensor integration
     runs-on: ubuntu-latest
