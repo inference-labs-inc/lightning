@@ -31,10 +31,12 @@ def test_missing_port(client_and_axon):
 
 def test_query_without_signer():
     client = Lightning(wallet_hotkey=VALIDATOR_HOTKEY)
-    axon = {"hotkey": MINER_HOTKEY, "ip": "127.0.0.1", "port": 9999}
-    with pytest.raises(ConnectionError, match="endpoint not initialized"):
-        client.query_axon(axon, {"synapse_type": "echo", "data": {}})
-    client.close()
+    try:
+        axon = {"hotkey": MINER_HOTKEY, "ip": "127.0.0.1", "port": 9999}
+        with pytest.raises(ConnectionError, match="endpoint not initialized"):
+            client.query_axon(axon, {"synapse_type": "echo", "data": {}})
+    finally:
+        client.close()
 
 
 def test_invalid_timeout(client_and_axon):
