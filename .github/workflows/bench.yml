@@ -72,8 +72,8 @@ jobs:
               const pct = ((newVal - oldVal) / oldVal) * 100;
               const sign = pct > 0 ? '+' : '';
               const tag = lowerIsBetter
-                ? (pct > 10 ? ' !!!' : pct < -10 ? ' +++' : '')
-                : (pct < -10 ? ' !!!' : pct > 10 ? ' +++' : '');
+                ? (pct > 15 ? ' !!!' : pct < -15 ? ' +++' : '')
+                : (pct < -15 ? ' !!!' : pct > 15 ? ' +++' : '');
               return ` (${sign}${pct.toFixed(1)}%${tag})`;
             }
 

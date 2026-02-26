@@ -18,11 +18,11 @@ def test_constructor_custom_config():
         host="127.0.0.1",
         port=0,
         max_signature_age_secs=60,
-        idle_timeout_secs=30,
+        idle_timeout_secs=120,
         keep_alive_interval_secs=10,
-        nonce_cleanup_interval_secs=120,
+        nonce_cleanup_interval_secs=300,
         max_nonce_entries=5000,
-        max_frame_payload_bytes=65536,
+        max_frame_payload_bytes=2097152,
     )
     server.stop()
 

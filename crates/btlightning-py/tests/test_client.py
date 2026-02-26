@@ -18,8 +18,8 @@ def test_constructor_custom_config():
         reconnect_initial_backoff_secs=1,
         reconnect_max_backoff_secs=60,
         reconnect_max_retries=3,
-        max_frame_payload_bytes=65536,
-        max_stream_payload_bytes=1048576,
+        max_frame_payload_bytes=2097152,
+        max_stream_payload_bytes=10485760,
     )
     assert client.wallet_hotkey == VALIDATOR_HOTKEY
     client.close()
