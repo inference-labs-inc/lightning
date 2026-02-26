@@ -3,7 +3,7 @@ mod dispatch;
 mod handshake;
 mod response;
 
-pub use config::LightningServerConfig;
+pub use config::{LightningServerConfig, LightningServerConfigBuilder};
 
 use crate::error::{LightningError, Result};
 #[cfg(feature = "btwallet")]

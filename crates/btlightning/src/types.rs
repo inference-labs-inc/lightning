@@ -31,13 +31,33 @@ impl QuicAxonInfo {
         }
     }
 
-    /// Returns `"ip:port"` (or `"[ip]:port"` for IPv6) used as the connection map key.
-    pub fn addr_key(&self) -> String {
-        if self.ip.contains(':') {
-            format!("[{}]:{}", self.ip, self.port)
+    pub fn addr_key(&self) -> PeerAddr {
+        PeerAddr::new(&self.ip, self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PeerAddr(String);
+
+impl PeerAddr {
+    pub fn new(ip: &str, port: u16) -> Self {
+        if ip.contains(':') {
+            Self(format!("[{}]:{}", ip, port))
         } else {
-            format!("{}:{}", self.ip, self.port)
+            Self(format!("{}:{}", ip, port))
         }
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for PeerAddr {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
