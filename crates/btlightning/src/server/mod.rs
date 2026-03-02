@@ -331,10 +331,14 @@ impl LightningServer {
 
         *self.ctx.cert_fingerprint.write().await = Some(fingerprint);
 
-        let mut server_config = RustlsServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
+        let mut server_config = RustlsServerConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .map_err(|e| LightningError::Config(format!("Failed to set TLS versions: {}", e)))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| LightningError::Config(format!("Failed to configure TLS: {}", e)))?;
 
         server_config.alpn_protocols = vec![b"btlightning".to_vec()];
         let mut transport_config = TransportConfig::default();
@@ -782,10 +786,14 @@ mod tests {
     async fn remove_hotkey_from_maps_cleans_both() {
         let (server_endpoint, server_addr) = {
             let (certs, key, _) = LightningServer::create_self_signed_cert().unwrap();
-            let server_crypto = RustlsServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .unwrap();
+            let server_crypto = RustlsServerConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
             let quic_crypto =
                 quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap();
             let server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -842,10 +850,14 @@ mod tests {
                 }
             }
 
-            let tls = RustlsClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
-                .with_no_client_auth();
+            let tls = RustlsClientConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+            .with_no_client_auth();
             let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
             let mut ep = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
             ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));

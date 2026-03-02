@@ -482,10 +482,14 @@ impl LightningClient {
     /// `initialize_connections`; only call directly if you need the endpoint before connecting.
     #[instrument(skip(self))]
     pub async fn create_endpoint(&mut self) -> Result<()> {
-        let mut tls_config = RustlsClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertVerifier))
-            .with_no_client_auth();
+        let mut tls_config = RustlsClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .map_err(|e| LightningError::Config(format!("Failed to set TLS versions: {}", e)))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertVerifier))
+        .with_no_client_auth();
 
         tls_config.alpn_protocols = vec![b"btlightning".to_vec()];
 
