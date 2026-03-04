@@ -78,7 +78,8 @@ async fn query_total_networks(api: &OnlineClient<PolkadotConfig>) -> u16 {
         .to_value()
         .unwrap()
         .as_u128()
-        .unwrap() as u16
+        .and_then(|v| u16::try_from(v).ok())
+        .expect("TotalNetworks exceeds u16::MAX")
 }
 
 #[tokio::test]
