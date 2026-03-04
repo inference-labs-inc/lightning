@@ -139,6 +139,19 @@ async fn localnet_full_integration() {
     .await;
     eprintln!("registered validator hotkey={validator_ss58}");
 
+    let miner_signer = subxt_signer::sr25519::Keypair::from_secret_key(MINER_SEED).unwrap();
+
+    let fund_miner = subxt::dynamic::tx(
+        "Balances",
+        "transfer_allow_death",
+        vec![
+            Value::unnamed_variant("Id", vec![Value::from_bytes(miner_bytes)]),
+            Value::u128(1_000_000_000_000),
+        ],
+    );
+    submit_extrinsic(&api, fund_miner, &alice, "fund_miner").await;
+    eprintln!("funded miner hotkey for serve_axon tx fees");
+
     // --- Phase B: Start miner Lightning server ---
 
     let request_counter = Arc::new(AtomicU64::new(0));
@@ -186,7 +199,7 @@ async fn localnet_full_integration() {
             Value::u128(0),
         ],
     );
-    submit_extrinsic(&api, serve_axon, &alice, "serve_axon").await;
+    submit_extrinsic(&api, serve_axon, &miner_signer, "serve_axon").await;
     eprintln!("served axon: 127.0.0.1:{actual_port} protocol=4");
 
     // --- Phase C: Metagraph verification ---
