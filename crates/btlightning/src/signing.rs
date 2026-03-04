@@ -105,8 +105,8 @@ impl BtWalletSigner {
     pub fn from_wallet(name: &str, path: &str, hotkey_name: &str) -> Result<Self> {
         let wallet = bittensor_wallet::Wallet::new(
             Some(name.to_string()),
-            Some(path.to_string()),
             Some(hotkey_name.to_string()),
+            Some(path.to_string()),
             None,
         );
         let keypair = wallet
@@ -130,6 +130,40 @@ impl Signer for BtWalletSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "btwallet")]
+    #[test]
+    fn from_wallet_resolves_hotkey_with_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_name = "testwallet";
+        let hotkey_name = "testhk";
+
+        let mut wallet = bittensor_wallet::Wallet::new(
+            Some(wallet_name.to_string()),
+            Some(hotkey_name.to_string()),
+            Some(dir.path().to_string_lossy().into_owned()),
+            None,
+        );
+        wallet
+            .new_hotkey(12, false, true, true, false, None)
+            .unwrap();
+
+        let expected_ss58 = wallet.get_hotkey(None).unwrap().ss58_address().unwrap();
+
+        let signer =
+            BtWalletSigner::from_wallet(wallet_name, &dir.path().to_string_lossy(), hotkey_name)
+                .unwrap();
+
+        let message = b"regression check";
+        let sig_bytes = signer.sign(message).unwrap();
+        assert_eq!(sig_bytes.len(), 64);
+
+        let loaded_ss58 = signer.keypair.ss58_address().unwrap();
+        assert_eq!(
+            loaded_ss58, expected_ss58,
+            "from_wallet loaded a different keypair than the one written to disk"
+        );
+    }
 
     #[test]
     fn sr25519_signer_produces_valid_signature() {

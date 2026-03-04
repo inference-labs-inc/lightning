@@ -1469,6 +1469,7 @@ dependencies = [
  "sp-core",
  "subxt",
  "subxt-signer",
+ "tempfile",
  "tokio",
  "tracing",
 ]
