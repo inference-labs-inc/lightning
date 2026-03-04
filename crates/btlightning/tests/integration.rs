@@ -1959,3 +1959,153 @@ async fn max_connections_counts_addresses_not_hotkeys() {
     client.close_all_connections().await.unwrap();
     env.shutdown().await;
 }
+
+#[tokio::test]
+async fn query_works_via_update_miner_registry() {
+    let env = setup_with_async_handler("echo", AsyncEchoHandler).await;
+    let port = env.server.local_addr().unwrap().port();
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+    };
+    client
+        .update_miner_registry(vec![axon.clone()])
+        .await
+        .unwrap();
+
+    let resp = client
+        .query_axon_with_timeout(axon.clone(), build_request("echo"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn query_works_via_update_miner_registry_after_delay() {
+    let env = setup_with_async_handler("echo", AsyncEchoHandler).await;
+    let port = env.server.local_addr().unwrap().port();
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+    };
+    client
+        .update_miner_registry(vec![axon.clone()])
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let resp = client
+        .query_axon_with_timeout(axon.clone(), build_request("echo"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn query_works_after_repeated_registry_updates() {
+    let env = setup_with_async_handler("echo", AsyncEchoHandler).await;
+    let port = env.server.local_addr().unwrap().port();
+
+    let mut client = LightningClient::new(validator_hotkey());
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+    };
+
+    for _ in 0..5 {
+        client
+            .update_miner_registry(vec![axon.clone()])
+            .await
+            .unwrap();
+    }
+
+    let resp = client
+        .query_axon_with_timeout(axon.clone(), build_request("echo"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn query_works_after_registry_update_with_unreachable_peers() {
+    let env = setup_with_async_handler("echo", AsyncEchoHandler).await;
+    let port = env.server.local_addr().unwrap().port();
+
+    let mut client = LightningClient::with_config(
+        validator_hotkey(),
+        btlightning::LightningClientConfig {
+            connect_timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    client.set_signer(Box::new(Sr25519Signer::from_seed(VALIDATOR_SEED)));
+    client.create_endpoint().await.unwrap();
+
+    let real_axon = QuicAxonInfo {
+        hotkey: miner_hotkey(),
+        ip: "127.0.0.1".into(),
+        port,
+        protocol: 4,
+    };
+
+    let fake_hotkey = sr25519::Pair::from_seed(&[99u8; 32])
+        .public()
+        .to_ss58check();
+    let unreachable_axon = QuicAxonInfo {
+        hotkey: fake_hotkey,
+        ip: "192.0.2.1".into(),
+        port: 9999,
+        protocol: 4,
+    };
+
+    client
+        .update_miner_registry(vec![real_axon.clone(), unreachable_axon])
+        .await
+        .unwrap();
+
+    let stats = client.get_connection_stats().await.unwrap();
+    assert_eq!(stats.get("total_connections").unwrap(), "1");
+
+    let resp = client
+        .query_axon_with_timeout(
+            real_axon.clone(),
+            build_request("echo"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    client.close_all_connections().await.unwrap();
+    env.shutdown().await;
+}
