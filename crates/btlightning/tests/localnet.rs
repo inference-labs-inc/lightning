@@ -191,7 +191,7 @@ async fn localnet_full_integration() {
         vec![
             Value::u128(netuid as u128),
             Value::u128(0),
-            Value::u128(ip_to_int(127, 0, 0, 1)),
+            Value::u128(ip_to_int(127, 0, 0, 2)),
             Value::u128(actual_port as u128),
             Value::u128(4),
             Value::u128(4),
@@ -200,7 +200,7 @@ async fn localnet_full_integration() {
         ],
     );
     submit_extrinsic(&api, serve_axon, &miner_signer, "serve_axon").await;
-    eprintln!("served axon: 127.0.0.1:{actual_port} protocol=4");
+    eprintln!("served axon: 127.0.0.2:{actual_port} protocol=4");
 
     // --- Phase C: Metagraph verification ---
 
@@ -217,7 +217,7 @@ async fn localnet_full_integration() {
         .get_uid_by_hotkey(&miner_ss58)
         .expect("miner must be in metagraph");
     let miner_neuron = metagraph.get_neuron(miner_uid).unwrap();
-    assert_eq!(miner_neuron.axon_ip, "127.0.0.1");
+    assert_eq!(miner_neuron.axon_ip, "127.0.0.2");
     assert_eq!(miner_neuron.axon_port, actual_port);
     assert_eq!(miner_neuron.axon_protocol, 4);
     eprintln!(
