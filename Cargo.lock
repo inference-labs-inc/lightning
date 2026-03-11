@@ -1458,6 +1458,7 @@ dependencies = [
  "parity-scale-codec",
  "proptest",
  "quinn",
+ "quinn-proto",
  "rand 0.8.5",
  "rcgen",
  "rmp-serde",
